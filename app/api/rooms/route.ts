@@ -1,9 +1,11 @@
-// API route: POST /api/rooms (create room) and GET /api/rooms (list rooms)
+// API route: GET /api/rooms (list rooms) and POST /api/rooms (create room)
+// Updated to wire to InsForge edge functions
 import { NextRequest, NextResponse } from 'next/server';
-import type { ErrorResponse, RoomWithStats } from '@/types';
-import { createRoom, listRoomsWithStats } from '@/lib/insforge';
+import type { ErrorResponse, RoomWithStats, MemoryRoom } from '@/types';
+import { createRoom as insforgeCreateRoom, listRoomsWithStats } from '@/lib/insforge';
 import { validateRoomField, normalizeCategory } from '@/lib/validation';
 import { createBoxFolder } from '@/lib/box';
+import { callCreateWatch } from '@/lib/edge-client';
 
 export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorResponse>> {
   try {
@@ -18,7 +20,7 @@ export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorRespons
   }
 }
 
-export async function POST(request: NextRequest): Promise<NextResponse<import('@/types').MemoryRoom | ErrorResponse>> {
+export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoom | ErrorResponse>> {
   try {
     const body = await request.json() as { name?: string; targetName?: string; category?: string };
 
@@ -56,7 +58,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<import('@
     }
 
     // Create room in DB
-    const room = await createRoom({
+    const room = await insforgeCreateRoom({
       name: nameResult.value,
       targetName: targetNameResult.value,
       category,

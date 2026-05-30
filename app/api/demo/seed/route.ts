@@ -4,7 +4,7 @@ import type { ErrorResponse } from '@/types';
 import { seedDemo } from '@/lib/seed';
 import { hasInsforgeCreds } from '@/lib/env';
 
-export async function POST(): Promise<NextResponse<{ roomId: string } | ErrorResponse>> {
+export async function POST(): Promise<NextResponse<{ projectId: string } | ErrorResponse>> {
   try {
     if (!hasInsforgeCreds()) {
       // In demo mode, seed is still allowed
@@ -13,7 +13,7 @@ export async function POST(): Promise<NextResponse<{ roomId: string } | ErrorRes
 
     const result = await seedDemo();
 
-    return NextResponse.json({ roomId: result.roomIds[0] });
+    return NextResponse.json({ projectId: result.projectIds[0] });
   } catch (error) {
     console.error('Demo seed failed:', error);
     return NextResponse.json(

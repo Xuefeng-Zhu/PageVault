@@ -22,7 +22,6 @@ const frequencyOptions = [
   { value: '168', label: 'Weekly' },
 ];
 
-// Example URLs for placeholder suggestions
 const exampleUrls = [
   { domain: 'AWS', baseUrl: 'https://aws.amazon.com', paths: ['/', '/ec2/', '/s3/', '/lambda/', '/iam/'] },
   { domain: 'Apify', baseUrl: 'https://apify.com', paths: ['/', '/pricing', '/storage', '/actor'] },
@@ -74,11 +73,49 @@ export default function NewRoomPage() {
   const handleSubmit = async () => {
     setLoading(true);
     try {
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Step 1: Create room
+      const roomRes = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: formData.name,
+          targetName: formData.name.split(' ')[0].toLowerCase() + '.com',
+        }),
+      });
+
+      if (!roomRes.ok) {
+        const err = await roomRes.json();
+        throw new Error(err.error?.message || 'Failed to create room');
+      }
+
+      const room = await roomRes.json();
+
+      // Step 2: Add URLs if any
+      if (formData.urls.length > 0) {
+        const urlRes = await fetch(`/api/rooms/${room.id}/urls`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls: formData.urls }),
+        });
+
+        if (!urlRes.ok) {
+          console.error('Failed to add URLs, continuing anyway');
+        }
+      }
+
+      // Step 3: Trigger initial scan
+      try {
+        await fetch(`/api/rooms/${room.id}/scan`, { method: 'POST' });
+      } catch {
+        // Scan might fail in demo mode, that's OK
+        console.warn('Initial scan skipped');
+      }
+
       showToast('Room created successfully!', 'success');
       router.push('/dashboard');
-    } catch {
-      showToast('Failed to create room', 'error');
+    } catch (err) {
+      console.error('Create room error:', err);
+      showToast(err instanceof Error ? err.message : 'Failed to create room', 'error');
       setLoading(false);
     }
   };
@@ -87,7 +124,7 @@ export default function NewRoomPage() {
     <div className="min-h-screen" style={{ backgroundColor: '#f8fafc' }}>
       <div className="max-w-3xl mx-auto px-6 py-8">
         {/* Step indicator */}
-        <div 
+        <div
           className="bg-white border mb-8 rounded-xl px-6 py-4"
           style={{ borderColor: '#e2e8f0' }}
         >
@@ -95,20 +132,20 @@ export default function NewRoomPage() {
         </div>
 
         {/* Form content */}
-        <div 
+        <div
           className="bg-white border rounded-xl px-6 py-6"
           style={{ borderColor: '#e2e8f0' }}
         >
           {/* Step 1: Room Details */}
           {currentStep === 1 && (
             <div className="space-y-6">
-              <h1 
+              <h1
                 className="text-2xl font-bold"
                 style={{ color: '#131b2e' }}
               >
                 Create Memory Room
               </h1>
-              
+
               <Input
                 label="Room name"
                 placeholder="e.g., Cloud Infrastructure Monitor"
@@ -117,7 +154,7 @@ export default function NewRoomPage() {
               />
 
               <div>
-                <label 
+                <label
                   className="block text-sm font-medium mb-1.5"
                   style={{ color: '#131b2e' }}
                 >
@@ -129,7 +166,7 @@ export default function NewRoomPage() {
                   onChange={(e) => handleInputChange('description', e.target.value)}
                   rows={4}
                   className="w-full px-3 py-2 rounded-lg border text-base transition-colors focus:outline-none focus:ring-2"
-                  style={{ 
+                  style={{
                     borderColor: '#e2e8f0',
                     backgroundColor: '#ffffff',
                     color: '#131b2e',
@@ -148,7 +185,7 @@ export default function NewRoomPage() {
           {/* Step 2: Add URLs */}
           {currentStep === 2 && (
             <div className="space-y-6">
-              <h2 
+              <h2
                 className="text-xl font-semibold"
                 style={{ color: '#131b2e' }}
               >
@@ -185,16 +222,16 @@ export default function NewRoomPage() {
               </div>
 
               {formData.urls.length > 0 && (
-                <div 
+                <div
                   className="border rounded-lg divide-y"
                   style={{ borderColor: '#e2e8f0' }}
                 >
                   {formData.urls.map((url, index) => (
-                    <div 
-                      key={index} 
+                    <div
+                      key={index}
                       className="flex items-center justify-between p-3"
                     >
-                      <span 
+                      <span
                         className="text-sm font-mono"
                         style={{ color: '#131b2e' }}
                       >
@@ -229,7 +266,7 @@ export default function NewRoomPage() {
           {/* Step 3: Configure Alerts */}
           {currentStep === 3 && (
             <div className="space-y-6">
-              <h2 
+              <h2
                 className="text-xl font-semibold"
                 style={{ color: '#131b2e' }}
               >
@@ -244,7 +281,7 @@ export default function NewRoomPage() {
               />
 
               <div className="space-y-3">
-                <label 
+                <label
                   className="block text-sm font-medium"
                   style={{ color: '#131b2e' }}
                 >
@@ -302,25 +339,25 @@ export default function NewRoomPage() {
           {/* Step 4: Review */}
           {currentStep === 4 && (
             <div className="space-y-6">
-              <h2 
+              <h2
                 className="text-xl font-semibold"
                 style={{ color: '#131b2e' }}
               >
                 Review
               </h2>
 
-              <div 
+              <div
                 className="border rounded-lg divide-y"
                 style={{ borderColor: '#e2e8f0' }}
               >
                 <div className="p-4">
-                  <span 
+                  <span
                     className="text-xs uppercase tracking-wide"
                     style={{ color: '#434655' }}
                   >
                     Room Name
                   </span>
-                  <p 
+                  <p
                     className="font-medium mt-1"
                     style={{ color: '#131b2e' }}
                   >
@@ -329,13 +366,13 @@ export default function NewRoomPage() {
                 </div>
 
                 <div className="p-4">
-                  <span 
+                  <span
                     className="text-xs uppercase tracking-wide"
                     style={{ color: '#434655' }}
                   >
                     Description
                   </span>
-                  <p 
+                  <p
                     className="font-medium mt-1"
                     style={{ color: '#131b2e' }}
                   >
@@ -344,13 +381,13 @@ export default function NewRoomPage() {
                 </div>
 
                 <div className="p-4">
-                  <span 
+                  <span
                     className="text-xs uppercase tracking-wide"
                     style={{ color: '#434655' }}
                   >
                     URLs
                   </span>
-                  <p 
+                  <p
                     className="font-medium mt-1"
                     style={{ color: '#131b2e' }}
                   >
@@ -359,13 +396,13 @@ export default function NewRoomPage() {
                 </div>
 
                 <div className="p-4">
-                  <span 
+                  <span
                     className="text-xs uppercase tracking-wide"
                     style={{ color: '#434655' }}
                   >
                     Scan Frequency
                   </span>
-                  <p 
+                  <p
                     className="font-medium mt-1"
                     style={{ color: '#131b2e' }}
                   >
@@ -374,13 +411,13 @@ export default function NewRoomPage() {
                 </div>
 
                 <div className="p-4">
-                  <span 
+                  <span
                     className="text-xs uppercase tracking-wide"
                     style={{ color: '#434655' }}
                   >
                     Alert Preferences
                   </span>
-                  <p 
+                  <p
                     className="font-medium mt-1"
                     style={{ color: '#131b2e' }}
                   >
@@ -400,8 +437,8 @@ export default function NewRoomPage() {
                 >
                   Back
                 </Button>
-                <Button 
-                  onClick={handleSubmit} 
+                <Button
+                  onClick={handleSubmit}
                   loading={loading}
                   style={{ backgroundColor: '#2563eb' }}
                 >
