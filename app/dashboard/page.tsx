@@ -5,24 +5,22 @@ import { Plus, Activity, Calendar, TrendingUp, LayoutDashboard, Globe, GitCompar
 import { Button } from '@/components/ui/Button';
 
 const demoRooms = [
-  { id: 'room-1', name: 'DemoCo Website', targetName: 'demo.co', urls: 12, lastScanAt: '2024-05-22T10:30:00Z', changes: 17, status: 'Active' },
-  { id: 'room-2', name: 'Acme AI', targetName: 'acme.ai', urls: 8, lastScanAt: '2024-05-21T14:20:00Z', changes: 8, status: 'Active' },
-  { id: 'room-3', name: 'VendorWatch', targetName: 'vendorwatch.io', urls: 15, lastScanAt: '2024-05-20T09:15:00Z', changes: 12, status: 'Paused' },
-  { id: 'room-4', name: 'Policy Monitor', targetName: 'govtracker.gov', urls: 6, lastScanAt: '2024-05-19T16:45:00Z', changes: 7, status: 'Active' },
+  { id: 'room-1', name: 'Cloud Infrastructure Monitor', targetName: 'aws.amazon.com', urls: 5, lastScanAt: '2024-05-28T10:30:00Z', changes: 1, status: 'Active' },
+  { id: 'room-2', name: 'Automation Tools Tracker', targetName: 'apify.com', urls: 4, lastScanAt: '2024-05-27T14:20:00Z', changes: 1, status: 'Active' },
+  { id: 'room-3', name: 'Enterprise SaaS Watch', targetName: 'box.com', urls: 5, lastScanAt: '2024-05-26T09:15:00Z', changes: 1, status: 'Paused' },
 ];
 
 const recentActivity = [
-  { id: '1', action: 'Scan completed', room: 'DemoCo Website', time: '5 min ago' },
-  { id: '2', action: 'New change detected', room: 'Acme AI', time: '2 hours ago' },
-  { id: '3', action: 'Report generated', room: 'VendorWatch', time: '4 hours ago' },
-  { id: '4', action: 'Alert sent', room: 'Policy Monitor', time: '6 hours ago' },
+  { id: '1', action: 'Scan completed', room: 'Cloud Infrastructure Monitor', time: '2 hours ago' },
+  { id: '2', action: 'High severity change detected', room: 'Automation Tools Tracker', time: '5 hours ago' },
+  { id: '3', action: 'Report generated', room: 'Enterprise SaaS Watch', time: '1 day ago' },
 ];
 
 const stats = [
-  { label: 'Total Rooms', value: 12, icon: LayoutDashboard, trend: '+2 this month' },
-  { label: 'Active URLs', value: 347, icon: Globe, trend: '+28 this week' },
-  { label: 'Changes Detected', value: 89, icon: GitCompare, trend: '+12 today' },
-  { label: 'AI Insights', value: 156, icon: Sparkles, trend: '+8 this week' },
+  { label: 'Total Rooms', value: 3, icon: LayoutDashboard, trend: 'Demo mode' },
+  { label: 'Active URLs', value: 14, icon: Globe, trend: '3 sites tracked' },
+  { label: 'Changes Detected', value: 3, icon: GitCompare, trend: '+3 this week' },
+  { label: 'AI Insights', value: 3, icon: Sparkles, trend: 'Generated' },
 ];
 
 export default function DashboardPage() {
@@ -142,10 +140,9 @@ export default function DashboardPage() {
             </h3>
             <div className="space-y-3">
               {[
-                { name: 'DemoCo Website', time: 'In 2 hours' },
-                { name: 'Acme AI', time: 'Tomorrow' },
-                { name: 'VendorWatch', time: 'Tomorrow' },
-                { name: 'Policy Monitor', time: 'In 3 days' },
+                { name: 'Cloud Infrastructure Monitor', time: 'In 2 hours' },
+                { name: 'Automation Tools Tracker', time: 'Tomorrow' },
+                { name: 'Enterprise SaaS Watch', time: 'Paused' },
               ].map((scan) => (
                 <div key={scan.name} className="flex items-center justify-between py-2">
                   <span className="text-sm text-[#131b2e]">{scan.name}</span>
@@ -163,10 +160,9 @@ export default function DashboardPage() {
             </h3>
             <div className="space-y-4">
               {[
-                { label: 'Pricing', count: 89, percentage: 38 },
-                { label: 'Positioning', count: 56, percentage: 24 },
-                { label: 'Features', count: 45, percentage: 19 },
-                { label: 'Hiring', count: 34, percentage: 14 },
+                { label: 'Pricing', count: 2, percentage: 67 },
+                { label: 'Feature', count: 1, percentage: 33 },
+                { label: 'Security', count: 0, percentage: 0 },
               ].map((area) => (
                 <div key={area.label}>
                   <div className="flex items-center justify-between mb-1">

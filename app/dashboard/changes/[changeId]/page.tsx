@@ -12,41 +12,119 @@ import { Badge } from '@/components/ui/Badge';
 import { showToast } from '@/components/ui/Toast';
 import { useState } from 'react';
 
-const demoChange = {
-  id: 'change-1',
-  roomId: 'room-1',
-  watchedUrlId: 'url-1',
-  severity: 'high' as const,
-  changeType: 'pricing',
-  summary: 'Pricing page: Starter plan increased from $99 to $149 per month',
-  createdAt: '2024-05-22T10:30:00Z',
-  confidence: 93,
-  evidence: [
-    { before: '$99/mo • Starter Plan\n- 5 projects\n- 10GB storage\n- Email support', after: '$149/mo • Starter Plan\n- 5 projects\n- 10GB storage\n- Priority email support\n- New: Advanced analytics', explanation: 'Price increased by 50% while adding minimal value' },
-    { before: '**Popular** Save 20% with annual billing', after: 'Enterprise tier now available with custom pricing', explanation: 'Removed discount and added enterprise tier' },
-  ],
-  aiInsights: [
-    'DemoCo removed the "Save 20%" discount banner that was visible last month',
-    'The new pricing aligns with enterprise-focused positioning shift',
-    'This is the first price increase in 18 months for this tier',
-    'Competitor added basic analytics to justify the price increase',
-  ],
-  businessInterpretation: 'DemoCo appears to be moving upmarket, targeting larger customers with higher ACV. The price increase signals confidence in product value and likely reflects recent funding.',
-  recommendedActions: [
-    'Review your own pricing strategy and consider similar adjustments',
-    'Update competitive analysis with new price points',
-    'Monitor for follow-up changes to enterprise tier pricing',
-    'Share findings with revenue team for account planning',
-  ],
-  impactScore: 8,
-  affectedPages: ['/pricing', '/features'],
-  reportBoxFileId: '987654321',
+const demoChanges: Record<string, {
+  id: string;
+  roomId: string;
+  watchedUrlId: string;
+  severity: 'high' | 'medium' | 'low';
+  changeType: string;
+  summary: string;
+  createdAt: string;
+  confidence: number;
+  evidence: Array<{ before: string; after: string; explanation: string }>;
+  aiInsights: string[];
+  businessInterpretation: string;
+  recommendedActions: string[];
+  impactScore: number;
+  affectedPages: string[];
+  reportBoxFileId: string;
+}> = {
+  'change-1': {
+    id: 'change-1',
+    roomId: 'room-1',
+    watchedUrlId: 'url-4',
+    severity: 'high',
+    changeType: 'pricing',
+    summary: 'AWS Lambda Pricing Update',
+    createdAt: '2024-05-28T10:30:00Z',
+    confidence: 95,
+    evidence: [
+      { before: '$0.20 per 1M requests (x86)\n$0.0000166667 per GB-second', after: '$0.20 per 1M requests (x86)\n$0.17 per 1M requests (ARM) — NEW\n$0.0000166667 per GB-second (x86)\n$0.0000133334 per GB-second (ARM) — NEW 15% reduction', explanation: 'New ARM-based pricing tiers with 15% reduction' },
+      { before: 'ARM-based functions: 20% cheaper', after: 'ARM-based functions now 20% cheaper (increased from 20%) — UPDATED', explanation: 'ARM discount increased' },
+    ],
+    aiInsights: [
+      'AWS announced a 15% reduction in Lambda pricing for ARM-based functions, effective June 1',
+      'This follows Google\'s similar move in March and could signal a broader price war in serverless computing',
+      'The new Graviton2-based pricing makes ARM the more attractive option for cost-conscious workloads',
+      'Competitor pricing pressure from Google Cloud Functions appears to be driving this adjustment',
+    ],
+    businessInterpretation: 'AWS announced a 15% reduction in Lambda pricing for ARM-based functions, effective June 1. This follows Google\'s similar move in March and could signal a broader price war in serverless computing.',
+    recommendedActions: [
+      'Update competitive battlecards with new Lambda ARM pricing',
+      'Monitor Google Cloud Functions for similar price adjustments',
+      'Review serverless cost projections for Q3',
+      'Share findings with infrastructure team for architecture decisions',
+    ],
+    impactScore: 8,
+    affectedPages: ['/lambda/', '/pricing/'],
+    reportBoxFileId: 'mock-aws-lambda-report',
+  },
+  'change-2': {
+    id: 'change-2',
+    roomId: 'room-2',
+    watchedUrlId: 'url-3',
+    severity: 'medium',
+    changeType: 'feature',
+    summary: 'Apify Storage Limits Changed',
+    createdAt: '2024-05-27T14:20:00Z',
+    confidence: 92,
+    evidence: [
+      { before: 'Free Tier\n- 2TB storage included', after: 'Free Tier — UPDATED\n- 5TB storage included (was 2TB)', explanation: 'Free tier storage expanded 2.5x' },
+      { before: 'Team Plan - $49/month\n- 5TB storage', after: 'Team Plan - $49/month\n- 10TB storage (was 5TB)', explanation: 'Paid tier storage doubled' },
+    ],
+    aiInsights: [
+      'Apify expanded its free storage tier from 2TB to 5TB',
+      'This is the first capacity increase since 2023',
+      'Likely a response to competitor Playwright\'s enterprise push',
+      'The 2.5x increase in free storage may indicate a shift in their freemium strategy',
+    ],
+    businessInterpretation: 'Apify expanded its free storage tier from 2TB to 5TB. This is the first capacity increase since 2023, likely a response to competitor Playwright\'s enterprise push.',
+    recommendedActions: [
+      'Update competitive analysis with new Apify storage limits',
+      'Review Playwright\'s recent enterprise features for context',
+      'Consider impact on customers using Apify for large-scale crawling',
+      'Monitor for follow-up pricing changes',
+    ],
+    impactScore: 6,
+    affectedPages: ['/storage/', '/pricing/'],
+    reportBoxFileId: 'mock-apify-storage-report',
+  },
+  'change-3': {
+    id: 'change-3',
+    roomId: 'room-3',
+    watchedUrlId: 'url-2',
+    severity: 'low',
+    changeType: 'security',
+    summary: 'Box Security Whitepaper Updated',
+    createdAt: '2024-05-26T09:15:00Z',
+    confidence: 88,
+    evidence: [
+      { before: 'ISO 27001:2013 certified', after: 'ISO 27001:2022 certified — UPDATED', explanation: 'Certification updated to latest standard' },
+      { before: '45 control objectives', after: '57 control objectives (was 45)\n12 new AI data handling controls — NEW', explanation: 'Significantly expanded control framework' },
+    ],
+    aiInsights: [
+      'Box updated their SOC 2 compliance certification',
+      'The new report covers ISO 27001:2022 requirements',
+      'Adds 12 new control objectives for AI data handling',
+      'This appears to be a proactive compliance update ahead of incoming AI regulations',
+    ],
+    businessInterpretation: 'Box updated their SOC 2 compliance certification. The new report covers ISO 27001:2022 requirements and adds 12 new control objectives for AI data handling.',
+    recommendedActions: [
+      'Update security/compliance documentation',
+      'Review AI data handling controls for relevance to your use case',
+      'Monitor competitor compliance updates',
+      'Share with legal/compliance team',
+    ],
+    impactScore: 4,
+    affectedPages: ['/security/'],
+    reportBoxFileId: 'mock-box-security-report',
+  },
 };
 
-const demoRoom = {
-  id: 'room-1',
-  name: 'DemoCo Website',
-  targetName: 'demo.co',
+const demoRooms: Record<string, { id: string; name: string; targetName: string }> = {
+  'room-1': { id: 'room-1', name: 'Cloud Infrastructure Monitor', targetName: 'aws.amazon.com' },
+  'room-2': { id: 'room-2', name: 'Automation Tools Tracker', targetName: 'apify.com' },
+  'room-3': { id: 'room-3', name: 'Enterprise SaaS Watch', targetName: 'box.com' },
 };
 
 type TabType = 'overview' | 'diff' | 'evidence';
@@ -57,7 +135,10 @@ export default function ChangeDetailPage() {
   const [activeTab, setActiveTab] = useState<TabType>('overview');
   const [reviewed, setReviewed] = useState(false);
 
-  if (changeId !== 'change-1') {
+  const demoChange = demoChanges[changeId];
+  const demoRoom = demoChange ? demoRooms[demoChange.roomId] : null;
+
+  if (!demoChange || !demoRoom) {
     return (
       <div className="max-w-5xl mx-auto">
         <Card className="text-center py-12">
@@ -82,15 +163,15 @@ export default function ChangeDetailPage() {
       <nav className="flex items-center gap-2 text-body-md mb-6 pt-6 text-slate-600">
         <Link href="/dashboard" className="hover:text-blue-600 transition-colors text-blue-600">Dashboard</Link>
         <ChevronRight className="w-4 h-4" />
-        <Link href={`/dashboard/rooms/${demoRoom.id}`} className="hover:text-blue-600 transition-colors text-blue-600">Changes</Link>
+        <Link href={`/dashboard/rooms/${demoRoom.id}`} className="hover:text-blue-600 transition-colors text-blue-600">{demoRoom.name}</Link>
         <ChevronRight className="w-4 h-4" />
-        <span className="font-semibold text-slate-900">{demoChange.summary.split(':')[0]}</span>
+        <span className="font-semibold text-slate-900">{demoChange.summary}</span>
       </nav>
 
       {/* Header */}
       <div className="flex items-start justify-between mb-8">
         <div>
-          <h1 className="text-2xl font-bold mb-3 text-slate-900">{demoChange.summary.split(':')[0]}</h1>
+          <h1 className="text-2xl font-bold mb-3 text-slate-900">{demoChange.summary}</h1>
           <div className="flex items-center gap-3">
             <SeverityBadge severity={demoChange.severity} />
             <span className="text-body-md text-slate-600">
@@ -188,7 +269,7 @@ export default function ChangeDetailPage() {
                 <div className="border border-slate-200 rounded-xl p-4 bg-slate-50">
                   <div className="text-label-sm font-medium mb-2 text-slate-600">After</div>
                   <div className="rounded-xl h-48 flex items-center justify-center bg-slate-200">
-                    <span className="text-slate-500">May 22, 2024</span>
+                    <span className="text-slate-500">May 28, 2024</span>
                   </div>
                 </div>
               </div>
@@ -201,8 +282,8 @@ export default function ChangeDetailPage() {
                 <a href="#" className="flex items-center gap-3 p-4 rounded-xl transition-colors hover:bg-slate-100 bg-slate-50 border border-slate-200">
                   <FileText className="w-5 h-5 text-blue-600" />
                   <div className="flex-1">
-                    <div className="text-body-md font-medium text-slate-900">Box Report: DemoCo Pricing Analysis</div>
-                    <div className="text-label-sm text-slate-600">box.com/file/987654321 • 2.4 MB</div>
+                    <div className="text-body-md font-medium text-slate-900">Box Report: {demoChange.summary}</div>
+                    <div className="text-label-sm text-slate-600">{demoRoom.targetName} • AI Analysis</div>
                   </div>
                   <ExternalLink className="w-4 h-4 text-slate-600" />
                 </a>

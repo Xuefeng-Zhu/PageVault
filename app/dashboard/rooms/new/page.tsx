@@ -22,6 +22,13 @@ const frequencyOptions = [
   { value: '168', label: 'Weekly' },
 ];
 
+// Example URLs for placeholder suggestions
+const exampleUrls = [
+  { domain: 'AWS', baseUrl: 'https://aws.amazon.com', paths: ['/', '/ec2/', '/s3/', '/lambda/', '/iam/'] },
+  { domain: 'Apify', baseUrl: 'https://apify.com', paths: ['/', '/pricing', '/storage', '/actor'] },
+  { domain: 'Box', baseUrl: 'https://www.box.com', paths: ['/', '/security', '/integrations', '/developers'] },
+];
+
 export default function NewRoomPage() {
   const router = useRouter();
   const [currentStep, setCurrentStep] = useState(1);
@@ -104,7 +111,7 @@ export default function NewRoomPage() {
               
               <Input
                 label="Room name"
-                placeholder="e.g., DemoCo Website"
+                placeholder="e.g., Cloud Infrastructure Monitor"
                 value={formData.name}
                 onChange={(e) => handleInputChange('name', e.target.value)}
               />
@@ -117,7 +124,7 @@ export default function NewRoomPage() {
                   Description
                 </label>
                 <textarea
-                  placeholder="What are you monitoring and why?"
+                  placeholder="What are you monitoring and why? e.g., Track AWS service updates and pricing changes"
                   value={formData.description}
                   onChange={(e) => handleInputChange('description', e.target.value)}
                   rows={4}
@@ -150,7 +157,7 @@ export default function NewRoomPage() {
 
               <div className="flex gap-3">
                 <Input
-                  placeholder="https://example.com/pricing"
+                  placeholder="https://aws.amazon.com/lambda/"
                   value={newUrl}
                   onChange={(e) => setNewUrl(e.target.value)}
                   className="flex-1"
@@ -158,6 +165,23 @@ export default function NewRoomPage() {
                 <Button variant="secondary" onClick={handleAddUrl}>
                   Add URL
                 </Button>
+              </div>
+
+              {/* Example URLs */}
+              <div className="text-sm" style={{ color: '#434655' }}>
+                <p className="mb-2 font-medium">Example URLs:</p>
+                {exampleUrls.map((example) => (
+                  <div key={example.domain} className="mb-2">
+                    <span className="font-medium">{example.domain}:</span>
+                    <div className="ml-4 mt-1 space-y-1">
+                      {example.paths.map((path) => (
+                        <code key={path} className="block text-xs bg-slate-100 px-2 py-1 rounded">
+                          {example.baseUrl}{path}
+                        </code>
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </div>
 
               {formData.urls.length > 0 && (

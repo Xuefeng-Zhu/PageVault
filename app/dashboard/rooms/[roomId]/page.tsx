@@ -1,36 +1,99 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { ChevronRight, ExternalLink, Box, Globe, Calendar, CheckCircle, AlertTriangle } from 'lucide-react';
 import { SeverityBadge } from '@/components/dashboard/SeverityBadge';
 import { Button } from '@/components/ui/Button';
 
-const demoRoom = {
-  id: 'room-1',
-  name: 'DemoCo Website',
-  targetName: 'demo.co',
-  category: 'competitor',
-  boxFolderId: '123456789',
-  lastScanAt: '2024-05-22T10:30:00Z',
+const demoRoomsData: Record<string, {
+  id: string;
+  name: string;
+  targetName: string;
+  category: string;
+  boxFolderId: string;
+  lastScanAt: string;
+  status: string;
+}> = {
+  'room-1': {
+    id: 'room-1',
+    name: 'Cloud Infrastructure Monitor',
+    targetName: 'aws.amazon.com',
+    category: 'competitor',
+    boxFolderId: 'mock-folder-aws',
+    lastScanAt: '2024-05-28T10:30:00Z',
+    status: 'Active',
+  },
+  'room-2': {
+    id: 'room-2',
+    name: 'Automation Tools Tracker',
+    targetName: 'apify.com',
+    category: 'competitor',
+    boxFolderId: 'mock-folder-apify',
+    lastScanAt: '2024-05-27T14:20:00Z',
+    status: 'Active',
+  },
+  'room-3': {
+    id: 'room-3',
+    name: 'Enterprise SaaS Watch',
+    targetName: 'box.com',
+    category: 'competitor',
+    boxFolderId: 'mock-folder-box',
+    lastScanAt: '2024-05-26T09:15:00Z',
+    status: 'Paused',
+  },
 };
 
-const demoChanges = [
-  { id: 'change-1', summary: 'Pricing page: Starter plan increased from $99 to $149 per month', severity: 'high' as const, changeType: 'pricing', createdAt: '2024-05-22T10:30:00Z', roomId: 'room-1', watchedUrlId: 'url-1' },
-  { id: 'change-2', summary: 'Homepage hero: New messaging around "AI-first enterprise" positioning', severity: 'medium' as const, changeType: 'positioning', createdAt: '2024-05-21T14:20:00Z', roomId: 'room-1', watchedUrlId: 'url-2' },
-  { id: 'change-3', summary: 'Features page: Added new "AI Assistant" feature section', severity: 'medium' as const, changeType: 'feature', createdAt: '2024-05-20T09:15:00Z', roomId: 'room-1', watchedUrlId: 'url-3' },
-  { id: 'change-4', summary: 'Pricing page: Added new "Enterprise" tier with custom pricing', severity: 'high' as const, changeType: 'pricing', createdAt: '2024-05-19T11:00:00Z', roomId: 'room-1', watchedUrlId: 'url-1' },
-  { id: 'change-5', summary: 'About page: Updated leadership team section with new CMO', severity: 'low' as const, changeType: 'minor', createdAt: '2024-05-18T16:30:00Z', roomId: 'room-1', watchedUrlId: 'url-4' },
-];
+const demoChanges: Record<string, Array<{
+  id: string;
+  summary: string;
+  severity: 'high' | 'medium' | 'low';
+  changeType: string;
+  createdAt: string;
+  roomId: string;
+  watchedUrlId: string;
+}>> = {
+  'room-1': [
+    { id: 'change-1', summary: 'AWS Lambda Pricing Update — new pricing tiers for ARM-based functions', severity: 'high' as const, changeType: 'pricing', createdAt: '2024-05-28T10:30:00Z', roomId: 'room-1', watchedUrlId: 'url-1' },
+  ],
+  'room-2': [
+    { id: 'change-2', summary: 'Apify Storage Limits Changed — free tier expanded from 2TB to 5TB', severity: 'medium' as const, changeType: 'feature', createdAt: '2024-05-27T14:20:00Z', roomId: 'room-2', watchedUrlId: 'url-2' },
+  ],
+  'room-3': [
+    { id: 'change-3', summary: 'Box Security Whitepaper Updated — SOC 2 and ISO 27001:2022 certification', severity: 'low' as const, changeType: 'security', createdAt: '2024-05-26T09:15:00Z', roomId: 'room-3', watchedUrlId: 'url-3' },
+  ],
+};
 
-const demoWatchedUrls = [
-  { id: 'url-1', url: 'https://demo.co/pricing', label: 'Pricing', pageType: 'pricing', lastChanged: '2024-05-22T10:30:00Z', severity: 'high' as const },
-  { id: 'url-2', url: 'https://demo.co/', label: 'Homepage', pageType: 'homepage', lastChanged: '2024-05-21T14:20:00Z', severity: 'medium' as const },
-  { id: 'url-3', url: 'https://demo.co/features', label: 'Features', pageType: 'docs', lastChanged: '2024-05-20T09:15:00Z', severity: 'medium' as const },
-  { id: 'url-4', url: 'https://demo.co/about', label: 'About', pageType: 'unknown', lastChanged: '2024-05-18T16:30:00Z', severity: 'low' as const },
-  { id: 'url-5', url: 'https://demo.co/security', label: 'Security', pageType: 'trust', lastChanged: '2024-05-15T11:00:00Z', severity: 'low' as const },
-];
+const demoWatchedUrls: Record<string, Array<{
+  id: string;
+  url: string;
+  label: string;
+  pageType: string;
+  lastChanged: string;
+  severity: 'high' | 'medium' | 'low';
+}>> = {
+  'room-1': [
+    { id: 'url-1', url: 'https://aws.amazon.com/', label: 'Homepage', pageType: 'homepage', lastChanged: '2024-05-28T10:30:00Z', severity: 'low' as const },
+    { id: 'url-2', url: 'https://aws.amazon.com/ec2/', label: 'EC2', pageType: 'product', lastChanged: '2024-05-25T08:00:00Z', severity: 'low' as const },
+    { id: 'url-3', url: 'https://aws.amazon.com/s3/', label: 'S3', pageType: 'product', lastChanged: '2024-05-24T08:00:00Z', severity: 'low' as const },
+    { id: 'url-4', url: 'https://aws.amazon.com/lambda/', label: 'Lambda', pageType: 'product', lastChanged: '2024-05-28T10:30:00Z', severity: 'high' as const },
+    { id: 'url-5', url: 'https://aws.amazon.com/iam/', label: 'IAM', pageType: 'product', lastChanged: '2024-05-20T08:00:00Z', severity: 'low' as const },
+  ],
+  'room-2': [
+    { id: 'url-1', url: 'https://apify.com/', label: 'Homepage', pageType: 'homepage', lastChanged: '2024-05-27T14:20:00Z', severity: 'low' as const },
+    { id: 'url-2', url: 'https://apify.com/pricing', label: 'Pricing', pageType: 'pricing', lastChanged: '2024-05-22T08:00:00Z', severity: 'low' as const },
+    { id: 'url-3', url: 'https://apify.com/storage', label: 'Storage', pageType: 'product', lastChanged: '2024-05-27T14:20:00Z', severity: 'medium' as const },
+    { id: 'url-4', url: 'https://apify.com/actor', label: 'Actor', pageType: 'product', lastChanged: '2024-05-18T08:00:00Z', severity: 'low' as const },
+  ],
+  'room-3': [
+    { id: 'url-1', url: 'https://www.box.com/', label: 'Homepage', pageType: 'homepage', lastChanged: '2024-05-26T09:15:00Z', severity: 'low' as const },
+    { id: 'url-2', url: 'https://www.box.com/security', label: 'Security', pageType: 'trust', lastChanged: '2024-05-26T09:15:00Z', severity: 'low' as const },
+    { id: 'url-3', url: 'https://www.box.com/integrations', label: 'Integrations', pageType: 'product', lastChanged: '2024-05-15T08:00:00Z', severity: 'low' as const },
+    { id: 'url-4', url: 'https://www.box.com/developers', label: 'Developers', pageType: 'docs', lastChanged: '2024-05-10T08:00:00Z', severity: 'low' as const },
+    { id: 'url-5', url: 'https://www.box.com/about', label: 'About', pageType: 'company', lastChanged: '2024-05-05T08:00:00Z', severity: 'low' as const },
+  ],
+};
 
 export default function RoomDetailPage() {
   const params = useParams();
@@ -43,7 +106,11 @@ export default function RoomDetailPage() {
     setScanning(false);
   };
 
-  if (roomId !== 'room-1') {
+  const demoRoom = demoRoomsData[roomId];
+  const roomChanges = demoChanges[roomId] || [];
+  const watchedUrls = demoWatchedUrls[roomId] || [];
+
+  if (!demoRoom) {
     return (
       <div className="max-w-5xl mx-auto">
         <div className="bg-white border border-[#e2e8f0] rounded-2xl text-center py-12">
@@ -58,10 +125,10 @@ export default function RoomDetailPage() {
   }
 
   const stats = [
-    { label: 'Total URLs', value: 47, icon: Globe },
-    { label: 'Monitored Changes', value: 17, icon: AlertTriangle },
+    { label: 'Total URLs', value: watchedUrls.length, icon: Globe },
+    { label: 'Monitored Changes', value: roomChanges.length, icon: AlertTriangle },
     { label: 'Last Scan', value: '2 hours ago', icon: Calendar },
-    { label: 'Health', value: 'Good', icon: CheckCircle },
+    { label: 'Health', value: demoRoom.status === 'Active' ? 'Good' : 'Paused', icon: CheckCircle },
   ];
 
   return (
@@ -77,7 +144,7 @@ export default function RoomDetailPage() {
       <div className="flex items-start justify-between mb-8">
         <div className="flex items-center gap-4">
           <div className="w-14 h-14 rounded-xl bg-[#2563eb] flex items-center justify-center text-white text-2xl font-bold">
-            D
+            {demoRoom.name.charAt(0)}
           </div>
           <div>
             <h1 className="text-2xl font-bold text-[#131b2e]">{demoRoom.name}</h1>
@@ -134,7 +201,7 @@ export default function RoomDetailPage() {
                 </tr>
               </thead>
               <tbody>
-                {demoWatchedUrls.map((url) => (
+                {watchedUrls.map((url) => (
                   <tr key={url.id} className="border-b border-[#e2e8f0] last:border-0 hover:bg-[#f8fafc] transition-colors">
                     <td className="py-4">
                       <div className="flex items-center gap-2">
@@ -160,7 +227,7 @@ export default function RoomDetailPage() {
           <div className="bg-white border border-[#e2e8f0] rounded-2xl p-6">
             <h2 className="text-lg font-semibold text-[#131b2e] mb-4">Recent Changes</h2>
             <div className="space-y-4">
-              {demoChanges.map((change) => (
+              {roomChanges.map((change) => (
                 <div key={change.id} className="flex items-start gap-4 pb-4 border-b border-[#e2e8f0] last:border-0 last:pb-0">
                   <div className="w-24 flex-shrink-0">
                     <div className="text-xs text-[#434655]">
@@ -176,6 +243,9 @@ export default function RoomDetailPage() {
                   </div>
                 </div>
               ))}
+              {roomChanges.length === 0 && (
+                <p className="text-sm text-[#434655]">No changes detected yet.</p>
+              )}
             </div>
           </div>
         </div>

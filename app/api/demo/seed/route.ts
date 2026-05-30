@@ -13,7 +13,7 @@ export async function POST(): Promise<NextResponse<{ roomId: string } | ErrorRes
 
     const result = await seedDemo();
 
-    return NextResponse.json({ roomId: result.roomId });
+    return NextResponse.json({ roomId: result.roomIds[0] });
   } catch (error) {
     console.error('Demo seed failed:', error);
     return NextResponse.json(

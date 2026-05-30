@@ -5,300 +5,287 @@ import { createBoxFolder } from './box';
 import { hashContent } from './diff';
 import type { NewChangeAnalysis } from '@/types';
 
-// Demo room configuration
-const DEMO_ROOM_NAME = 'DemoCo';
-const DEMO_TARGET_NAME = 'DemoCo Inc.';
-const DEMO_CATEGORY = 'competitor';
-
-// Demo URLs with labels and page types
-const DEMO_URLS = [
-  { url: 'https://democo.com/', label: 'Homepage', pageType: 'homepage' },
-  { url: 'https://democo.com/pricing', label: 'Pricing', pageType: 'pricing' },
-  { url: 'https://democo.com/security', label: 'Security Docs', pageType: 'docs' },
-  { url: 'https://democo.com/changelog', label: 'Changelog', pageType: 'changelog' },
-  { url: 'https://democo.com/careers', label: 'Careers', pageType: 'careers' },
+// Room configurations for real websites
+const ROOMS = [
+  {
+    name: 'Cloud Infrastructure Monitor',
+    targetName: 'aws.amazon.com',
+    category: 'competitor',
+    baseUrl: 'https://aws.amazon.com',
+    status: 'Active' as const,
+    urls: [
+      { url: 'https://aws.amazon.com/', label: 'Homepage', pageType: 'homepage' },
+      { url: 'https://aws.amazon.com/ec2/', label: 'EC2', pageType: 'product' },
+      { url: 'https://aws.amazon.com/s3/', label: 'S3', pageType: 'product' },
+      { url: 'https://aws.amazon.com/lambda/', label: 'Lambda', pageType: 'product' },
+      { url: 'https://aws.amazon.com/iam/', label: 'IAM', pageType: 'product' },
+    ],
+  },
+  {
+    name: 'Automation Tools Tracker',
+    targetName: 'apify.com',
+    category: 'competitor',
+    baseUrl: 'https://apify.com',
+    status: 'Active' as const,
+    urls: [
+      { url: 'https://apify.com/', label: 'Homepage', pageType: 'homepage' },
+      { url: 'https://apify.com/pricing', label: 'Pricing', pageType: 'pricing' },
+      { url: 'https://apify.com/storage', label: 'Storage', pageType: 'product' },
+      { url: 'https://apify.com/actor', label: 'Actor', pageType: 'product' },
+    ],
+  },
+  {
+    name: 'Enterprise SaaS Watch',
+    targetName: 'box.com',
+    category: 'competitor',
+    baseUrl: 'https://www.box.com',
+    status: 'Paused' as const,
+    urls: [
+      { url: 'https://www.box.com/', label: 'Homepage', pageType: 'homepage' },
+      { url: 'https://www.box.com/security', label: 'Security', pageType: 'trust' },
+      { url: 'https://www.box.com/integrations', label: 'Integrations', pageType: 'product' },
+      { url: 'https://www.box.com/developers', label: 'Developers', pageType: 'docs' },
+      { url: 'https://www.box.com/about', label: 'About', pageType: 'company' },
+    ],
+  },
 ];
 
-// Demo snapshot content pairs (previous → current)
+// Demo snapshot content pairs for AWS Lambda (previous → current)
 const DEMO_SNAPSHOTS: Record<string, { previous: string; current: string }> = {
-  'https://democo.com/': {
-    previous: `# DemoCo - For Small Teams
+  'https://aws.amazon.com/lambda/': {
+    previous: `# AWS Lambda - Serverless Computing
 
-DemoCo helps small teams collaborate and ship faster. Our platform is designed for teams of up to 10 people, offering unlimited projects, SSO integration, and full API access on our Starter plan.
+## Pricing
+- $0.20 per 1M requests
+- $0.0000166667 per GB-second
+- ARM-based functions: 20% cheaper
 
-Trusted by over 10,000 small businesses worldwide.`,
-    current: `# DemoCo - For Modern Enterprises
+## Use Cases
+- Web backends
+- Data processing
+- Real-time file processing
+- IoT backends`,
+    current: `# AWS Lambda - Serverless Computing
 
-DemoCo helps modern enterprises scale efficiently. Our platform is designed for growing teams, offering 10 projects on Starter, SSO on Enterprise, and API access on Pro.
+## Pricing
+- $0.20 per 1M requests (x86)
+- $0.17 per 1M requests (ARM) — NEW
+- $0.0000166667 per GB-second (x86)
+- $0.0000133334 per GB-second (ARM) — NEW 15% reduction
+- ARM-based functions now 20% cheaper (increased from 20%) — UPDATED
 
-Trusted by over 10,000 companies worldwide.`,
+## New ARM-based Pricing Tiers
+- Functions using Graviton2 processors receive 15% additional discount
+- Effective June 1, 2026
+
+## Use Cases
+- Web backends
+- Data processing
+- Real-time file processing
+- IoT backends
+- AI/ML inference — NEW`,
   },
-  'https://democo.com/pricing': {
-    previous: `# Pricing Plans
+  'https://apify.com/storage/': {
+    previous: `# Apify Storage
 
-## Starter Plan - $29/month
-Unlimited projects included on Starter
-SSO included
-API access included
-All features for small teams
+## Free Tier
+- 2TB storage included
+- 100GB request bandwidth
+- 30 days data retention
 
-## Enterprise Plan - $99/month
-Unlimited everything
-Advanced security
-Priority support`,
-    current: `# Pricing Plans
+## Team Plan - $49/month
+- 5TB storage
+- 1TB request bandwidth
+- 90 days data retention
+- Priority support`,
+    current: `# Apify Storage
 
-## Starter Plan - $49/month
-10 projects included on Starter
-SSO available on Enterprise
-API access available on Pro
-For teams with basic needs
+## Free Tier — UPDATED
+- 5TB storage included (was 2TB)
+- 100GB request bandwidth
+- 30 days data retention
 
-## Enterprise Plan - $199/month
-Unlimited everything
-Advanced security
-Priority support
-SSO included`,
+## Team Plan - $49/month
+- 10TB storage (was 5TB)
+- 2TB request bandwidth (was 1TB)
+- 90 days data retention
+- Priority support`,
   },
-  'https://democo.com/security': {
-    previous: `# Security Documentation
+  'https://www.box.com/security': {
+    previous: `# Box Security
 
-## Authentication
+## Compliance
+- SOC 2 Type II certified
+- ISO 27001:2013 certified
+- GDPR compliant
 
-DemoCo supports SSO with SAML 2.0 for all Starter plans. OAuth 2.0 is available for API access. Our security framework is SOC 2 Type II compliant.
+## Security Features
+- Enterprise key management
+- Box Shield for malware protection
+- Two-factor authentication
 
-## Data Privacy
+## Controls
+- 45 control objectives
+- Annual audit`,
+    current: `# Box Security — UPDATED
 
-All data is encrypted at rest and in transit. GDPR compliant.`,
-    current: `# Security Documentation
+## Compliance
+- SOC 2 Type II certified
+- ISO 27001:2022 certified — UPDATED
+- GDPR compliant
+- CCPA compliant — NEW
 
-## Authentication
+## Security Features
+- Enterprise key management
+- Box Shield for malware protection
+- Two-factor authentication
+- AI Data Handling controls — NEW
 
-DemoCo supports SSO with SAML 2.0 for Enterprise plans only. OAuth 2.0 is available for Pro plans. Our security framework is SOC 2 Type II compliant.
-
-## Data Privacy
-
-All data is encrypted at rest and in transit. GDPR compliant.`,
-  },
-  'https://democo.com/changelog': {
-    previous: `# Changelog
-
-## v2.1.0 - June 2024
-- Performance improvements
-- Bug fixes
-- UI refinements
-
-## v2.0.0 - May 2024
-- Major platform update
-- New dashboard design`,
-    current: `# Changelog
-
-## v2.2.0 - July 2024
-- Pricing changes
-- New enterprise features
-- Performance improvements
-
-## v2.1.0 - June 2024
-- Performance improvements
-- Bug fixes
-- UI refinements`,
-  },
-  'https://democo.com/careers': {
-    previous: `# Careers at DemoCo
-
-We're always looking for talented people to join our team.
-
-## Open Positions
-
-- Senior Software Engineer
-- Product Designer
-
-## Benefits
-
-- Competitive salary
-- Health insurance
-- Remote work options`,
-    current: `# Careers at DemoCo
-
-We're always looking for talented people to join our team.
-
-## Open Positions
-
-- Senior Software Engineer
-- Product Designer
-- Enterprise Account Executive
-
-## Benefits
-
-- Competitive salary
-- Health insurance
-- Remote work options
-- Stock options`,
+## Controls — EXPANDED
+- 57 control objectives (was 45)
+- 12 new AI data handling controls — NEW
+- Annual audit`,
   },
 };
 
-// Demo change analyses (5 specific changes as per requirements)
+// Demo change analyses
 const DEMO_ANALYSES = [
   {
-    url: 'https://democo.com/pricing',
+    url: 'https://aws.amazon.com/lambda/',
     pageType: 'pricing' as const,
-    summary: 'Pricing plan changed - Starter plan project limit reduced from unlimited to 10 projects',
-    businessInterpretation: 'DemoCo appears to be moving upmarket, shifting from unlimited Starter to a 10-project limit while gating SSO and API access to higher paid tiers. This suggests they are repositioning their entry tier to capture more revenue from growing teams.',
+    summary: 'AWS Lambda Pricing Update — new pricing tiers for ARM-based functions',
+    businessInterpretation: 'AWS announced a 15% reduction in Lambda pricing for ARM-based functions, effective June 1. This follows Google\'s similar move in March and could signal a broader price war in serverless computing.',
     severity: 'high' as const,
     changeType: 'pricing' as const,
   },
   {
-    url: 'https://democo.com/security',
-    pageType: 'docs' as const,
-    summary: 'SSO availability moved from Starter to Enterprise tier',
-    businessInterpretation: 'Security offering change detected - SSO moved to Enterprise tier suggests pricing restructuring. Existing Starter customers using SSO will need to upgrade or find alternative solutions.',
-    severity: 'medium' as const,
-    changeType: 'security' as const,
-  },
-  {
-    url: 'https://democo.com/security',
-    pageType: 'docs' as const,
-    summary: 'API access moved from Starter to Pro tier',
-    businessInterpretation: 'API access change suggests DemoCo is decoupling API access as a separate paid feature. Teams relying on API integration on Starter plan will need to upgrade.',
+    url: 'https://apify.com/storage/',
+    pageType: 'product' as const,
+    summary: 'Apify Storage Limits Changed — free tier expanded from 2TB to 5TB',
+    businessInterpretation: 'Apify expanded its free storage tier from 2TB to 5TB. This is the first capacity increase since 2023, likely a response to competitor Playwright\'s enterprise push.',
     severity: 'medium' as const,
     changeType: 'feature' as const,
   },
   {
-    url: 'https://democo.com/',
-    pageType: 'homepage' as const,
-    summary: 'Market positioning changed from "for small teams" to "for modern enterprises"',
-    businessInterpretation: 'Market positioning shift detected - moving from "small teams" to "modern enterprises" indicates target market change. DemoCo is clearly repositioning away from SMB toward mid-market/enterprise.',
-    severity: 'medium' as const,
-    changeType: 'positioning' as const,
-  },
-  {
-    url: 'https://democo.com/careers',
-    pageType: 'careers' as const,
-    summary: 'New "Enterprise Account Executive" position added',
-    businessInterpretation: 'New enterprise sales role added, supporting the positioning shift toward enterprise customers. DemoCo is building out enterprise sales capability.',
+    url: 'https://www.box.com/security/',
+    pageType: 'trust' as const,
+    summary: 'Box Security Whitepaper Updated — SOC 2 and ISO 27001:2022 certification',
+    businessInterpretation: 'Box updated their SOC 2 compliance certification. The new report covers ISO 27001:2022 requirements and adds 12 new control objectives for AI data handling.',
     severity: 'low' as const,
-    changeType: 'hiring' as const,
+    changeType: 'security' as const,
   },
 ];
 
 const RECOMMENDED_ACTIONS = [
-  'Update the competitive battlecard to reflect new pricing tiers',
-  'Review vendor renewal risk for DemoCo accounts',
-  'Ask whether existing customers are grandfathered on unlimited Starter',
-  'Monitor future pricing changes and communicate to customers',
+  'Update competitive battlecards with new pricing tiers',
+  'Monitor Google Cloud Functions for similar price adjustments',
+  'Review serverless cost projections for Q3',
+  'Share findings with infrastructure team for architecture decisions',
 ];
 
 /**
- * Seed the demo room with complete before/after data.
- * Creates the DemoCo room, 5 watched URLs, previous/current snapshots for each,
- * and 5 specific change analyses with the documented content.
+ * Seed demo rooms with complete before/after data.
+ * Creates three rooms (AWS, Apify, Box), watched URLs, snapshots, and change analyses.
  *
- * Returns the seeded room id.
- * Individual insert failures are logged and skipped; returns room id if room creation succeeded.
+ * Returns the seeded room ids.
  */
-export async function seedDemo(): Promise<{ roomId: string }> {
-  // Create the demo room and its Box folder
-  let boxFolderId: string | null = null;
+export async function seedDemo(): Promise<{ roomIds: string[] }> {
+  const roomIds: string[] = [];
 
-  try {
-    boxFolderId = await createBoxFolder(`PageVault/${DEMO_ROOM_NAME}`);
-  } catch {
-    // Box folder creation failure is non-fatal in demo mode
-    boxFolderId = 'mock-folder-democo-1';
-  }
-
-  const room = await createRoom({
-    name: DEMO_ROOM_NAME,
-    targetName: DEMO_TARGET_NAME,
-    category: DEMO_CATEGORY,
-    boxFolderId,
-  });
-
-  // Create a scan run to have a valid scan run ID for snapshots
-  let scanRun = { id: 'demo-scan-previous' };
-  try {
-    scanRun = await createScanRun(room.id);
-    await completeScanRun(scanRun.id);
-  } catch {
-    // Non-fatal if scan run creation fails
-  }
-
-  // Add the 5 watched URLs
-  const urls = DEMO_URLS.map(u => ({
-    roomId: room.id,
-    url: u.url,
-    label: u.label,
-    pageType: u.pageType,
-  }));
-
-  let watchedUrls = await addWatchedUrls(room.id, urls);
-
-  // Insert snapshots and analyses for each URL with demo data
-  for (let i = 0; i < watchedUrls.length; i++) {
-    const watchedUrl = watchedUrls[i];
-    const snapshotPair = DEMO_SNAPSHOTS[watchedUrl.url];
-
-    if (!snapshotPair) {
-      // URL without specific demo content - skip snapshot creation
-      continue;
+  for (const roomConfig of ROOMS) {
+    // Create Box folder
+    let boxFolderId: string | null = null;
+    try {
+      boxFolderId = await createBoxFolder(`PageVault/${roomConfig.name}`);
+    } catch {
+      boxFolderId = `mock-folder-${roomConfig.name.toLowerCase().replace(/\s+/g, '-')}`;
     }
 
+    const room = await createRoom({
+      name: roomConfig.name,
+      targetName: roomConfig.targetName,
+      category: roomConfig.category,
+      boxFolderId,
+    });
+    roomIds.push(room.id);
+
+    // Create a scan run
+    let scanRun = { id: `demo-scan-${room.id}` };
     try {
-      // Insert previous snapshot
-      const prevSnapshot = await insertSnapshot({
-        roomId: room.id,
-        watchedUrlId: watchedUrl.id,
-        scanRunId: scanRun.id,
-        url: watchedUrl.url,
-        title: watchedUrl.label ?? '',
-        textContent: snapshotPair.previous,
-        contentHash: hashContent(snapshotPair.previous),
-        boxFileId: null,
-        capturedAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(), // 7 days ago
-      });
+      scanRun = await createScanRun(room.id);
+      await completeScanRun(scanRun.id);
+    } catch {
+      // Non-fatal if scan run creation fails
+    }
 
-      // Insert current snapshot
-      const currSnapshot = await insertSnapshot({
-        roomId: room.id,
-        watchedUrlId: watchedUrl.id,
-        scanRunId: scanRun.id,
-        url: watchedUrl.url,
-        title: watchedUrl.label ?? '',
-        textContent: snapshotPair.current,
-        contentHash: hashContent(snapshotPair.current),
-        boxFileId: null,
-        capturedAt: new Date().toISOString(),
-      });
+    // Add watched URLs
+    const urls = roomConfig.urls.map(u => ({
+      roomId: room.id,
+      url: u.url,
+      label: u.label,
+      pageType: u.pageType,
+    }));
 
-      // Find the change analysis config for this URL
-      const analysisConfig = DEMO_ANALYSES.find(a => a.url === watchedUrl.url);
-      if (analysisConfig) {
-        const analysis: NewChangeAnalysis = {
+    const watchedUrls = await addWatchedUrls(room.id, urls);
+
+    // Insert snapshots and analyses for URLs with demo content
+    for (const watchedUrl of watchedUrls) {
+      const snapshotPair = DEMO_SNAPSHOTS[watchedUrl.url];
+      if (!snapshotPair) continue;
+
+      try {
+        const prevSnapshot = await insertSnapshot({
           roomId: room.id,
           watchedUrlId: watchedUrl.id,
-          previousSnapshotId: prevSnapshot.id,
-          currentSnapshotId: currSnapshot.id,
-          severity: analysisConfig.severity,
-          changeType: analysisConfig.changeType,
-          summary: analysisConfig.summary,
-          businessInterpretation: analysisConfig.businessInterpretation,
-          recommendedActions: RECOMMENDED_ACTIONS,
-          evidence: [
-            {
-              before: snapshotPair.previous.split('\n').find(l => l.trim().length > 0) ?? snapshotPair.previous.slice(0, 100),
-              after: snapshotPair.current.split('\n').find(l => l.trim().length > 0) ?? snapshotPair.current.slice(0, 100),
-              explanation: 'Pricing and feature availability changed between versions',
-            },
-          ],
-          reportBoxFileId: null,
-        };
-        await insertChangeAnalysis(analysis);
+          scanRunId: scanRun.id,
+          url: watchedUrl.url,
+          title: watchedUrl.label ?? '',
+          textContent: snapshotPair.previous,
+          contentHash: hashContent(snapshotPair.previous),
+          boxFileId: null,
+          capturedAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+        });
+
+        const currSnapshot = await insertSnapshot({
+          roomId: room.id,
+          watchedUrlId: watchedUrl.id,
+          scanRunId: scanRun.id,
+          url: watchedUrl.url,
+          title: watchedUrl.label ?? '',
+          textContent: snapshotPair.current,
+          contentHash: hashContent(snapshotPair.current),
+          boxFileId: null,
+          capturedAt: new Date().toISOString(),
+        });
+
+        const analysisConfig = DEMO_ANALYSES.find(a => a.url === watchedUrl.url);
+        if (analysisConfig) {
+          const analysis: NewChangeAnalysis = {
+            roomId: room.id,
+            watchedUrlId: watchedUrl.id,
+            previousSnapshotId: prevSnapshot.id,
+            currentSnapshotId: currSnapshot.id,
+            severity: analysisConfig.severity,
+            changeType: analysisConfig.changeType,
+            summary: analysisConfig.summary,
+            businessInterpretation: analysisConfig.businessInterpretation,
+            recommendedActions: RECOMMENDED_ACTIONS,
+            evidence: [
+              {
+                before: snapshotPair.previous.split('\n').find(l => l.trim().length > 0) ?? snapshotPair.previous.slice(0, 100),
+                after: snapshotPair.current.split('\n').find(l => l.trim().length > 0) ?? snapshotPair.current.slice(0, 100),
+                explanation: 'Content changed between versions',
+              },
+            ],
+            reportBoxFileId: null,
+          };
+          await insertChangeAnalysis(analysis);
+        }
+      } catch (err) {
+        console.error(`Demo seed: failed to create snapshot/analysis for ${watchedUrl.url}:`, err);
       }
-    } catch (err) {
-      console.error(`Demo seed: failed to create snapshot/analysis for ${watchedUrl.url}:`, err);
-      // Continue with other URLs
     }
   }
 
-  return { roomId: room.id };
+  return { roomIds };
 }

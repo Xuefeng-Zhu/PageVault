@@ -6,7 +6,7 @@ async function main() {
   console.log('Seeding demo data...');
   try {
     const result = await seedDemo();
-    console.log(`Demo seeded successfully. Room ID: ${result.roomId}`);
+    console.log(`Demo seeded successfully. Room IDs: ${result.roomIds.join(', ')}`);
     process.exit(0);
   } catch (error) {
     console.error('Demo seed failed:', error);
