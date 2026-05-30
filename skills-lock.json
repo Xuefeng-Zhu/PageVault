@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "box": {
+      "source": "box/box-for-ai",
+      "sourceType": "github",
+      "skillPath": "skills/box/SKILL.md",
+      "computedHash": "afd81389b0ad5d8006d7054c49376afa8edd9f92f210368811c95f0a095731ff"
+    }
+  }
+}
