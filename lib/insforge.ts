@@ -15,23 +15,15 @@ import type {
   NewChangeAnalysis,
 } from '@/types';
 import { getInsforgeClient } from './env';
-import { createClient } from '@insforge/sdk';
 
 // ─── SDK client setup ──────────────────────────────────────────────────────────
-
-const INSFORGE_ANON_KEY = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY ?? 'ik_e3a65bb4148400ec7697ac2602884f38';
-const INSFORGE_API_BASE = process.env.NEXT_PUBLIC_INSFORGE_URL ?? 'https://wga6k9at.us-east.insforge.app';
-
-let _sdk: ReturnType<typeof createClient> | null = null;
-function getSdkClient(): ReturnType<typeof createClient> | null {
-  if (!_sdk) {
-    _sdk = createClient({
-      anonKey: INSFORGE_ANON_KEY,
-      baseUrl: INSFORGE_API_BASE,
-    });
-  }
-  return _sdk;
-}
+//
+// lib/env.ts:getInsforgeClient is the single source of truth for the
+// InsForge SDK. It throws at construction time if INSFORGE_API_URL /
+// INSFORGE_ANON_KEY are missing, so every call below is guaranteed a
+// configured client. Do not introduce a second client factory here —
+// a duplicate with hardcoded fallbacks would route misconfigured deploys
+// to the wrong tenant and leak a known publishable key into the bundle.
 
 /**
  * Execute a PostgREST query via the InsForge SDK.
@@ -44,8 +36,7 @@ async function sdkQuery<T = Record<string, unknown>>(table: string, opts: {
   limit?: number;
   offset?: number;
 } = {}): Promise<T[]> {
-  const client = getSdkClient();
-  if (!client) return [];
+  const client = getInsforgeClient();
   const { select = '*', filters = '', order = '', limit, offset } = opts;
   // Strip schema prefix (e.g. "public.projects" -> "projects")
   const tableName = table.replace(/^public\./, '');
@@ -634,8 +625,7 @@ export function sortAndLimitChanges(
  */
 export async function migrateOwnerIds(): Promise<{ updated: number }> {
   // Use direct fetch for UPDATE (PostgREST RPC-style)
-  const client = getSdkClient();
-  if (!client) return { updated: 0 };
+  const client = getInsforgeClient();
   const { error } = await client.database.from('projects').update({
     owner_id: '00000000-0000-0000-0000-000000000001',
   }).eq('owner_id', '');
@@ -644,4 +634,66 @@ export async function migrateOwnerIds(): Promise<{ updated: number }> {
     return { updated: 0 };
   }
   return { updated: 1 };
+}
+
+
+// ─── Scan schedule operations ──────────────────────────────────────────────
+
+export interface ScanSchedule {
+  id: string;
+  roomId: string;
+  cronExpression: string;
+  enabled: boolean;
+  insforgeScheduleId: string | null;
+  lastRunAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function getScheduleForRoom(roomId: string): Promise<ScanSchedule | null> {
+  const { data, error } = await getInsforgeClient()
+    .database
+    .from('scan_schedules?project_id=eq.' + roomId + '&limit=1')
+    .select('id,project_id,cron_expression,enabled,insforge_schedule_id,last_run_at,created_at,updated_at');
+  if (error) {
+    console.error('getScheduleForRoom error:', error.message);
+    return null;
+  }
+  if (!data || data.length === 0) return null;
+  const r = data[0] as {
+    id: string; project_id: string; cron_expression: string; enabled: boolean;
+    insforge_schedule_id: string | null; last_run_at: string | null;
+    created_at: string; updated_at: string;
+  };
+  return {
+    id: r.id,
+    roomId: r.project_id,
+    cronExpression: r.cron_expression,
+    enabled: r.enabled,
+    insforgeScheduleId: r.insforge_schedule_id,
+    lastRunAt: r.last_run_at,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+export async function getActiveSchedules(): Promise<ScanSchedule[]> {
+  const { data, error } = await getInsforgeClient()
+    .database
+    .from('scan_schedules?enabled=eq.true&select=id,project_id,cron_expression,enabled,insforge_schedule_id,last_run_at,created_at,updated_at')
+    .select('id,project_id,cron_expression,enabled,insforge_schedule_id,last_run_at,created_at,updated_at');
+  if (error) {
+    console.error('getActiveSchedules error:', error.message);
+    return [];
+  }
+  return (data || []).map((r) => ({
+    id: (r as { id: string }).id,
+    roomId: (r as { project_id: string }).project_id,
+    cronExpression: (r as { cron_expression: string }).cron_expression,
+    enabled: (r as { enabled: boolean }).enabled,
+    insforgeScheduleId: (r as { insforge_schedule_id: string | null }).insforge_schedule_id,
+    lastRunAt: (r as { last_run_at: string | null }).last_run_at,
+    createdAt: (r as { created_at: string }).created_at,
+    updatedAt: (r as { updated_at: string }).updated_at,
+  }));
 }
