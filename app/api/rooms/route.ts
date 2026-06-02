@@ -1,22 +1,26 @@
 // API route: GET /api/rooms (list rooms) and POST /api/rooms (create room)
-// Updated to wire to InsForge DB via edge-client and use session for user filtering
 import { NextRequest, NextResponse } from 'next/server';
 import type { ErrorResponse, RoomWithStats, MemoryRoom } from '@/types';
-import { createRoom as insforgeCreateRoom, listRoomsWithStats } from '@/lib/insforge';
+import {
+  createRoom as insforgeCreateRoom,
+  createRoomWithDefaults,
+  listRoomsWithStats,
+} from '@/lib/insforge';
 import { validateRoomField, normalizeCategory } from '@/lib/validation';
 import { createStorageFolder } from '@/lib/box';
-import { getServerSession } from 'next-auth';
-import { authOptions } from '@/lib/auth';
+import { requireSession } from '@/lib/apiAuth';
 
 export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorResponse>> {
+  const session = await requireSession();
+  if (session instanceof NextResponse) return session;
+
   try {
-    const session = await getServerSession(authOptions);
-    const userId = (session?.user as {id?: string})?.id;
-
-    // Use listRoomsWithStats from lib/insforge.ts (uses InsForge SDK with service role)
     const rooms = await listRoomsWithStats();
-
-    return NextResponse.json(rooms);
+    const userId = session.user.id;
+    // listRoomsWithStats queries the service-role client, so the result set
+    // is NOT pre-filtered by RLS. Scope to the caller's owned rooms here.
+    const ownRooms = rooms.filter(r => r.userId === userId);
+    return NextResponse.json(ownRooms);
   } catch (error) {
     console.error('Failed to list rooms:', error);
     return NextResponse.json(
@@ -27,9 +31,11 @@ export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorRespons
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoom | ErrorResponse>> {
+  const session = await requireSession();
+  if (session instanceof NextResponse) return session;
+  const userId = session.user.id;
+
   try {
-    const session = await getServerSession(authOptions);
-    const userId = (session?.user as {id?: string})?.id ?? null;
     const body = await request.json() as { name?: string; targetName?: string; category?: string };
 
     // Validate name
@@ -66,7 +72,9 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
       );
     }
 
-    // Create room in DB
+    // Create room in DB. userId is the authenticated session's id — the
+    // projects.owner_id NOT NULL column is satisfied by the real user id,
+    // not by a hardcoded system-user fallback.
     const room = await insforgeCreateRoom({
       name: nameResult.value,
       targetName: targetNameResult.value,
@@ -74,6 +82,14 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
       boxFolderId,
       userId,
     });
+
+    // Auto-create default scan schedule (daily 3am). Best-effort: if it
+    // fails the room still works; user can configure manually. AC3.
+    try {
+      await createRoomWithDefaults(room.id);
+    } catch (schedErr) {
+      console.error('Failed to create default schedule for room', room.id, schedErr);
+    }
 
     return NextResponse.json(room, { status: 201 });
   } catch (error) {
