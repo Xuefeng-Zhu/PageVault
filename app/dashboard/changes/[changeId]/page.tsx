@@ -213,14 +213,14 @@ export default function ChangeDetailPage() {
               <div className="space-y-3">
                 {change.reportBoxFileId && (
                   <a
-                    href={`https://app.box.com/file/${change.reportBoxFileId}`}
+                    href={`/api/storage/file/${encodeURIComponent(change.reportBoxFileId)}`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="flex items-center gap-3 p-4 rounded-xl transition-colors hover:bg-slate-100 bg-slate-50 border border-slate-200"
                   >
                     <FileText className="w-5 h-5 text-blue-600" />
                     <div className="flex-1">
-                      <div className="text-body-md font-medium text-slate-900">Box Report</div>
+                      <div className="text-body-md font-medium text-slate-900">Storage Report</div>
                       <div className="text-label-sm text-slate-600">AI Analysis</div>
                     </div>
                     <ExternalLink className="w-4 h-4 text-slate-600" />
@@ -242,18 +242,18 @@ export default function ChangeDetailPage() {
       {/* Footer */}
       <div className="flex items-center justify-between mt-12 pt-6 border-t border-slate-200 mx-8">
         <div className="text-body-sm text-slate-600">
-          Evidence stored in Box • AI analysis by OpenAI • Snapshot captured at {new Date(change.createdAt).toLocaleString()}
+          Evidence stored in Storage • AI analysis by OpenAI • Snapshot captured at {new Date(change.createdAt).toLocaleString()}
         </div>
         <div className="flex items-center gap-3">
           {change.reportBoxFileId && (
             <a
-              href={`https://app.box.com/file/${change.reportBoxFileId}`}
+              href={`/api/storage/file/${encodeURIComponent(change.reportBoxFileId)}`}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-2 px-4 py-2 text-body-md font-medium rounded-xl border bg-white border-slate-200 text-slate-900 transition-colors hover:bg-slate-50"
             >
               <FileText className="w-4 h-4" />
-              Open Box Folder
+              Open Storage Report
             </a>
           )}
           <Button onClick={handleMarkAsReviewed} disabled={reviewed}>

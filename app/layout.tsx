@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import './globals.css';
 import { ToastProvider } from '@/components/ui/Toast';
+import { SessionProvider } from '@/components/providers/SessionProvider';
 
 export const metadata: Metadata = {
   title: 'PageVault — AI Memory for the Changing Web',
@@ -15,9 +16,11 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body>
-        <ToastProvider>
-          {children}
-        </ToastProvider>
+        <SessionProvider>
+          <ToastProvider>
+            {children}
+          </ToastProvider>
+        </SessionProvider>
       </body>
     </html>
   );

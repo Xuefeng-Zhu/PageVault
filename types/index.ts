@@ -34,6 +34,9 @@ export interface MemoryRoom {
   name: string;
   targetName: string;
   category: Category;
+  /** InsForge Storage folder path, e.g. "pagevault/aws-infrastructure-monitor" */
+  storageFolderPath: string | null;
+  /** @deprecated Use `storageFolderPath` — kept for back-compat with the old Box field name. */
   boxFolderId: string | null;
   createdAt: string;
 }
@@ -62,6 +65,11 @@ export interface PageSnapshot {
   title: string;
   textContent: string;
   contentHash: string;
+  /** InsForge Storage key for the snapshot's evidence file. */
+  storageKey: string | null;
+  /** Public URL for the snapshot's evidence file. */
+  storageUrl: string | null;
+  /** @deprecated Use `storageKey` — kept for back-compat with the old Box field name. */
   boxFileId: string | null;
   capturedAt: string;
 }
@@ -94,6 +102,11 @@ export interface ChangeAnalysis {
   businessInterpretation: string | null;
   recommendedActions: string[];
   evidence: EvidenceItem[];
+  /** InsForge Storage key for the change report markdown. */
+  storageKey: string | null;
+  /** Public URL for the change report markdown. */
+  storageUrl: string | null;
+  /** @deprecated Use `storageKey` — kept for back-compat with the old Box field name. */
   reportBoxFileId: string | null;
   createdAt: string;
 }
@@ -111,6 +124,8 @@ export interface NewRoom {
   name: string;
   targetName: string;
   category?: string;
+  storageFolderPath?: string | null;
+  /** @deprecated Use `storageFolderPath` */
   boxFolderId?: string | null;
   userId?: string | null;
 }
@@ -130,6 +145,9 @@ export interface NewSnapshot {
   title: string;
   textContent: string;
   contentHash: string;
+  storageKey?: string | null;
+  storageUrl?: string | null;
+  /** @deprecated Use `storageKey` */
   boxFileId?: string | null;
   capturedAt?: string;
 }
@@ -145,6 +163,9 @@ export interface NewChangeAnalysis {
   businessInterpretation?: string | null;
   recommendedActions: string[];
   evidence: EvidenceItem[];
+  storageKey?: string | null;
+  storageUrl?: string | null;
+  /** @deprecated Use `storageKey` */
   reportBoxFileId?: string | null;
 }
 

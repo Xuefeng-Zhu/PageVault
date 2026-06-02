@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { ChevronRight, ExternalLink, Box, Globe, Calendar, CheckCircle, AlertTriangle } from 'lucide-react';
+import { ChevronRight, ExternalLink, Database, Globe, Calendar, CheckCircle, AlertTriangle } from 'lucide-react';
 import { SeverityBadge } from '@/components/dashboard/SeverityBadge';
 import { Button } from '@/components/ui/Button';
 import type { RoomDetailResponse, WatchedUrl, ChangeAnalysis } from '@/types';
@@ -133,15 +133,15 @@ export default function RoomDetailPage() {
           </div>
         </div>
         <div className="flex items-center gap-3">
-          {room.boxFolderId && (
+          {room.storageFolderPath && (
             <a
-              href={`https://app.box.com/folder/${room.boxFolderId}`}
+              href={`/api/storage/folder/${encodeURIComponent(room.storageFolderPath)}`}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-2 px-4 py-2 bg-white border border-[#e2e8f0] text-[#131b2e] text-sm font-medium rounded-lg hover:bg-[#f8fafc] transition-colors"
             >
-              <Box className="w-4 h-4" />
-              Open in Box
+              <Database className="w-4 h-4" />
+              Open in Storage
               <ExternalLink className="w-3 h-3" />
             </a>
           )}

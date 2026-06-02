@@ -1,11 +1,20 @@
-// AI integration for PageVault
-// Requests change analysis from an OpenAI-compatible LLM or returns deterministic mock analysis
+// AI integration for PageVault.
+//
+// Behavior:
+//   - Missing OPENAI_API_KEY  → throw a clear setup error (the LLM is what
+//                               makes the change analysis valuable).
+//   - Real call fails (network, 4xx/5xx, malformed JSON) → throw the underlying
+//     error. We do NOT return a synthetic analysis on real-call failure; that
+//     would silently pass off a fake interpretation as a real one.
+//
+// If you need a fixture for local UI development, set `__dev__FALLBACK__=1` —
+// when the real call fails, the analyzer returns a small synthetic analysis
+// built from the input text. This is a developer escape hatch only.
 import type {
   AnalyzeInput,
   ChangeAnalysisResult,
   ChangeType,
   EvidenceItem,
-  PageType,
   Severity,
 } from '@/types';
 import { hasAiCreds } from './env';
@@ -33,16 +42,13 @@ Rules:
 - evidence: at least 1 item, each grounded in the provided text
 - recommended_actions: 1-5 actionable items based on the change`;
 
-// Keywords that indicate higher severity
+// ─── Dev fallback heuristic (used only with __dev__FALLBACK__=1) ─────────────
+
 const PRICING_KEYWORDS = ['price', 'pricing', 'plan', 'cost', 'subscription', 'billing', 'charged', 'fee', 'tier', 'unlimited', 'projects', 'included'];
-const SECURITY_KEYWORDS = ['security', 'ssO', 'auth', 'authentication', 'saml', 'oauth', 'enterprise', 'compliance'];
+const SECURITY_KEYWORDS = ['security', 'sso', 'auth', 'authentication', 'saml', 'oauth', 'enterprise', 'compliance'];
 const LEGAL_KEYWORDS = ['terms', 'privacy', 'legal', 'gdpr', 'ccpa', 'cookie', 'policy'];
 
-/**
- * Detect severity from text content when AI is unavailable.
- * Derives from keywords in before/after text.
- */
-function deriveMockSeverity(before: string, after: string): Severity {
+function deriveFallbackSeverity(before: string, after: string): Severity {
   const combined = (before + ' ' + after).toLowerCase();
   if (PRICING_KEYWORDS.some(k => combined.includes(k))) return 'high';
   if (SECURITY_KEYWORDS.some(k => combined.includes(k))) return 'medium';
@@ -50,10 +56,7 @@ function deriveMockSeverity(before: string, after: string): Severity {
   return 'low';
 }
 
-/**
- * Detect change type from text content.
- */
-function deriveMockChangeType(before: string, after: string): ChangeType {
+function deriveFallbackChangeType(before: string, after: string): ChangeType {
   const combined = (before + ' ' + after).toLowerCase();
   if (PRICING_KEYWORDS.some(k => combined.includes(k))) return 'pricing';
   if (SECURITY_KEYWORDS.some(k => combined.includes(k))) return 'security';
@@ -63,14 +66,13 @@ function deriveMockChangeType(before: string, after: string): ChangeType {
 }
 
 /**
- * Build a deterministic mock analysis from before/after text.
- * Always returns ≥1 evidence item grounded in the provided text.
+ * Build a synthetic analysis from before/after text. Used ONLY when the dev
+ * escape hatch is on and a real LLM call fails.
  */
-function buildMockAnalysis(input: AnalyzeInput): ChangeAnalysisResult {
-  const severity = deriveMockSeverity(input.previousText, input.currentText);
-  const changeType = deriveMockChangeType(input.previousText, input.currentText);
+function buildFallbackAnalysis(input: AnalyzeInput): ChangeAnalysisResult {
+  const severity = deriveFallbackSeverity(input.previousText, input.currentText);
+  const changeType = deriveFallbackChangeType(input.previousText, input.currentText);
 
-  // Extract short text snippets for evidence
   const prevSentences = input.previousText.split(/[.\n]/).filter(s => s.trim().length > 0);
   const currSentences = input.currentText.split(/[.\n]/).filter(s => s.trim().length > 0);
 
@@ -82,7 +84,6 @@ function buildMockAnalysis(input: AnalyzeInput): ChangeAnalysisResult {
     },
   ];
 
-  // Build summary based on change type
   const summaryMap: Record<ChangeType, string> = {
     pricing: 'Pricing plan changed - project limits and feature availability modified',
     security: 'Security features updated - SSO and authentication options changed',
@@ -97,7 +98,7 @@ function buildMockAnalysis(input: AnalyzeInput): ChangeAnalysisResult {
 
   const summary = summaryMap[changeType] ?? 'Content changed';
   const businessInterpretation = changeType === 'pricing'
-    ? 'DemoCo appears to be moving upmarket, shifting from unlimited Starter to a 10-project limit while gating SSO and API access to higher tiers.'
+    ? 'Vendor appears to be moving upmarket, shifting from unlimited Starter to a 10-project limit while gating SSO and API access to higher tiers.'
     : changeType === 'security'
     ? 'Security offering change detected - SSO moved to Enterprise tier suggests pricing restructuring.'
     : changeType === 'positioning'
@@ -119,23 +120,46 @@ function buildMockAnalysis(input: AnalyzeInput): ChangeAnalysisResult {
   };
 }
 
+function devFallbackEnabled(): boolean {
+  return process.env.__dev__FALLBACK__ === '1';
+}
+
+// Normalize severity to valid enum values
+function normalizeSeverity(value: string): Severity {
+  if (value === 'medium' || value === 'high') return value as Severity;
+  return 'low';
+}
+
+// Normalize change type to valid enum values
+function normalizeChangeType(value: string): ChangeType {
+  const validTypes: ChangeType[] = ['pricing', 'positioning', 'feature', 'legal', 'security', 'hiring', 'docs', 'minor', 'unknown'];
+  if (validTypes.includes(value as ChangeType)) return value as ChangeType;
+  return 'unknown';
+}
+
 /**
- * Analyze a page change using AI or return a deterministic mock.
- * Real mode: calls OpenAI-compatible Chat Completions API with JSON-only prompt.
- * Mock/fallback mode: returns deterministic mock when creds absent, call fails, or response is unparseable.
- * Never rejects - always resolves to a structurally valid ChangeAnalysisResult.
+ * Analyze a page change using an OpenAI-compatible LLM.
+ *
+ * Throws if credentials are missing or the API call fails (or returns
+ * unparseable JSON). The dev escape hatch `__dev__FALLBACK__=1` returns a
+ * synthetic analysis on real-call failure; this is for local UI work and is
+ * never the default.
  */
 export async function analyzePageChange(input: AnalyzeInput): Promise<ChangeAnalysisResult> {
   if (!hasAiCreds()) {
-    return buildMockAnalysis(input);
+    throw new Error(
+      'AI credentials are not configured. Set OPENAI_API_KEY in your environment ' +
+      'to analyze page changes. (OPENAI_BASE_URL and OPENAI_MODEL are optional overrides.)'
+    );
   }
 
-  try {
-    const apiKey = process.env.OPENAI_API_KEY!;
-    const baseUrl = process.env.OPENAI_BASE_URL ?? 'https://openai.com/v1';
-    const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
+  const apiKey = process.env.OPENAI_API_KEY!;
+  const baseUrl = process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1';
+  const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
 
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -153,67 +177,70 @@ export async function analyzePageChange(input: AnalyzeInput): Promise<ChangeAnal
         temperature: 0.3,
       }),
     });
-
-    if (!response.ok) {
-      console.error(`AI API error: ${response.status} ${response.statusText}`);
-      return buildMockAnalysis(input);
+  } catch (networkErr) {
+    if (devFallbackEnabled()) {
+      console.warn('[ai] real call failed, dev fallback engaged:', networkErr);
+      return buildFallbackAnalysis(input);
     }
-
-    const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-    const content = data.choices?.[0]?.message?.content;
-
-    if (!content) {
-      return buildMockAnalysis(input);
-    }
-
-    // Parse the JSON response
-    try {
-      const parsed = JSON.parse(content) as Record<string, unknown>;
-
-      // Validate and extract required fields
-      const severity = (parsed.severity as string) ?? 'low';
-      const changeType = (parsed.change_type as string) ?? 'unknown';
-      const summary = (parsed.summary as string) ?? 'Change detected';
-      const businessInterpretation = (parsed.business_interpretation as string) ?? 'Business impact identified';
-      const evidence = (parsed.evidence as EvidenceItem[]) ?? [];
-      const recommendedActions = (parsed.recommended_actions as string[]) ?? [];
-
-      // Ensure at least one evidence item
-      if (evidence.length === 0) {
-        evidence.push({
-          before: input.previousText.slice(0, 100),
-          after: input.currentText.slice(0, 100),
-          explanation: 'Content changed between versions',
-        });
-      }
-
-      return {
-        severity: normalizeSeverity(severity),
-        changeType: normalizeChangeType(changeType),
-        summary,
-        businessInterpretation,
-        evidence,
-        recommendedActions,
-      };
-    } catch {
-      console.error('Failed to parse AI response as JSON, using mock');
-      return buildMockAnalysis(input);
-    }
-  } catch (error) {
-    console.error('AI analysis failed, using mock:', error);
-    return buildMockAnalysis(input);
+    throw new Error(
+      `AI request failed: ${networkErr instanceof Error ? networkErr.message : 'network error'}`
+    );
   }
-}
 
-// Normalize severity to valid enum values
-function normalizeSeverity(value: string): Severity {
-  if (value === 'medium' || value === 'high') return value as Severity;
-  return 'low';
-}
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    if (devFallbackEnabled()) {
+      console.warn(`[ai] ${response.status} ${response.statusText} — dev fallback engaged`);
+      return buildFallbackAnalysis(input);
+    }
+    throw new Error(
+      `AI API error: ${response.status} ${response.statusText}${body ? ` — ${body.slice(0, 200)}` : ''}`
+    );
+  }
 
-// Normalize change type to valid enum values
-function normalizeChangeType(value: string): ChangeType {
-  const validTypes: ChangeType[] = ['pricing', 'positioning', 'feature', 'legal', 'security', 'hiring', 'docs', 'minor', 'unknown'];
-  if (validTypes.includes(value as ChangeType)) return value as ChangeType;
-  return 'unknown';
+  const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const content = data.choices?.[0]?.message?.content;
+
+  if (!content) {
+    if (devFallbackEnabled()) {
+      console.warn('[ai] empty response — dev fallback engaged');
+      return buildFallbackAnalysis(input);
+    }
+    throw new Error('AI API returned an empty response');
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(content) as Record<string, unknown>;
+  } catch {
+    if (devFallbackEnabled()) {
+      console.warn('[ai] unparseable JSON, dev fallback engaged');
+      return buildFallbackAnalysis(input);
+    }
+    throw new Error('AI response was not valid JSON');
+  }
+
+  const severity = (parsed.severity as string) ?? 'low';
+  const changeType = (parsed.change_type as string) ?? 'unknown';
+  const summary = (parsed.summary as string) ?? 'Change detected';
+  const businessInterpretation = (parsed.business_interpretation as string) ?? 'Business impact identified';
+  let evidence: EvidenceItem[] = Array.isArray(parsed.evidence) ? (parsed.evidence as EvidenceItem[]) : [];
+  const recommendedActions = Array.isArray(parsed.recommended_actions) ? (parsed.recommended_actions as string[]) : [];
+
+  if (evidence.length === 0) {
+    evidence.push({
+      before: input.previousText.slice(0, 100),
+      after: input.currentText.slice(0, 100),
+      explanation: 'Content changed between versions',
+    });
+  }
+
+  return {
+    severity: normalizeSeverity(severity),
+    changeType: normalizeChangeType(changeType),
+    summary,
+    businessInterpretation,
+    evidence,
+    recommendedActions,
+  };
 }

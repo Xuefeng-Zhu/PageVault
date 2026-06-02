@@ -1,7 +1,6 @@
 // Insforge data layer for PageVault
 // Typed database access helpers for rooms, URLs, scan runs, snapshots, and change analyses
-// In Demo_Mode (no credentials): uses in-memory storage with the same interface
-// In Real mode: connects to Insforge Postgres backend
+// Connects to Insforge Postgres backend via @insforge/sdk
 import type {
   MemoryRoom,
   RoomWithStats,
@@ -15,59 +14,78 @@ import type {
   NewSnapshot,
   NewChangeAnalysis,
 } from '@/types';
-import { hasInsforgeCreds } from './env';
+import { getInsforgeClient } from './env';
+import { createClient } from '@insforge/sdk';
 
-// In-memory store for demo mode
-interface InMemoryStore {
-  memory_rooms: Record<string, unknown>[];
-  watched_urls: Record<string, unknown>[];
-  scan_runs: Record<string, unknown>[];
-  page_snapshots: Record<string, unknown>[];
-  change_analyses: Record<string, unknown>[];
+// ─── SDK client setup ──────────────────────────────────────────────────────────
+
+const INSFORGE_ANON_KEY = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY ?? 'ik_e3a65bb4148400ec7697ac2602884f38';
+const INSFORGE_API_BASE = process.env.NEXT_PUBLIC_INSFORGE_URL ?? 'https://wga6k9at.us-east.insforge.app';
+
+let _sdk: ReturnType<typeof createClient> | null = null;
+function getSdkClient(): ReturnType<typeof createClient> | null {
+  if (!_sdk) {
+    _sdk = createClient({
+      anonKey: INSFORGE_ANON_KEY,
+      baseUrl: INSFORGE_API_BASE,
+    });
+  }
+  return _sdk;
 }
 
-let _memoryStore: InMemoryStore | null = null;
-
-function getMemoryStore(): InMemoryStore {
-  if (!_memoryStore) {
-    _memoryStore = {
-      memory_rooms: [],
-      watched_urls: [],
-      scan_runs: [],
-      page_snapshots: [],
-      change_analyses: [],
-    };
+/**
+ * Execute a PostgREST query via the InsForge SDK.
+ * Returns an array of row objects.
+ */
+async function sdkQuery<T = Record<string, unknown>>(table: string, opts: {
+  select?: string;
+  filters?: string;
+  order?: string;
+  limit?: number;
+  offset?: number;
+} = {}): Promise<T[]> {
+  const client = getSdkClient();
+  if (!client) return [];
+  const { select = '*', filters = '', order = '', limit, offset } = opts;
+  // Strip schema prefix (e.g. "public.projects" -> "projects")
+  const tableName = table.replace(/^public\./, '');
+  const params: string[] = [`select=${select}`];
+  if (filters) params.push(filters);
+  if (order) params.push(`order=${order}`);
+  if (limit) params.push(`limit=${limit}`);
+  if (offset) params.push(`offset=${offset}`);
+  const queryStr = params.join('&');
+  try {
+    // Use URL format for table?query params
+    const { data, error } = await client.database.from(`${tableName}?${queryStr}`).select(select);
+    if (error) {
+      console.error('[insforge] query error:', error.message);
+      return [];
+    }
+    return (data ?? []) as T[];
+  } catch (e) {
+    console.error('[insforge] query exception:', e);
+    return [];
   }
-  return _memoryStore;
-}
-
-// Throw this when Insforge is not available
-export class InsforgeUnavailableError extends Error {
-  constructor(message = 'Insforge backend is not available') {
-    super(message);
-    this.name = 'InsforgeUnavailableError';
-  }
-}
-
-// Get the database client (throws if credentials missing)
-export function getDb(): InMemoryStore {
-  if (!hasInsforgeCreds()) {
-    return getMemoryStore();
-  }
-  // In production, this would return the Insforge client
-  // For now, we use in-memory store even with creds to avoid dependency issues
-  return getMemoryStore();
 }
 
 // Helper to convert snake_case DB row to camelCase
 function toMemoryRoom(row: Record<string, unknown>): MemoryRoom {
+  // InsForge storage replaces Box; the underlying DB column is still called
+  // `box_root_folder_id` for legacy reasons, but it now holds a storage path.
+  const storageFolderPath = row.box_root_folder_id
+    ? String(row.box_root_folder_id)
+    : row.storage_folder_path
+    ? String(row.storage_folder_path)
+    : null;
   return {
     id: String(row.id),
     userId: row.user_id ? String(row.user_id) : null,
     name: String(row.name),
     targetName: String(row.target_name),
     category: (row.category as string) as MemoryRoom['category'],
-    boxFolderId: row.box_folder_id ? String(row.box_folder_id) : null,
+    storageFolderPath,
+    boxFolderId: storageFolderPath, // legacy alias
     createdAt: String(row.created_at),
   };
 }
@@ -75,8 +93,8 @@ function toMemoryRoom(row: Record<string, unknown>): MemoryRoom {
 function toWatchedUrl(row: Record<string, unknown>): WatchedUrl {
   return {
     id: String(row.id),
-    roomId: String(row.room_id),
-    url: String(row.url),
+    roomId: String(row.project_id),
+    url: String(row.source_url),
     label: row.label ? String(row.label) : null,
     pageType: (row.page_type as string) as WatchedUrl['pageType'],
     createdAt: String(row.created_at),
@@ -96,6 +114,13 @@ function toScanRun(row: Record<string, unknown>): ScanRun {
 }
 
 function toPageSnapshot(row: Record<string, unknown>): PageSnapshot {
+  // Legacy `box_file_id` column now holds the InsForge storage key.
+  const storageKey = row.box_file_id
+    ? String(row.box_file_id)
+    : row.storage_key
+    ? String(row.storage_key)
+    : null;
+  const storageUrl = row.storage_url ? String(row.storage_url) : null;
   return {
     id: String(row.id),
     roomId: String(row.room_id),
@@ -105,7 +130,9 @@ function toPageSnapshot(row: Record<string, unknown>): PageSnapshot {
     title: row.title ? String(row.title) : '',
     textContent: row.text_content ? String(row.text_content) : '',
     contentHash: String(row.content_hash),
-    boxFileId: row.box_file_id ? String(row.box_file_id) : null,
+    storageKey,
+    storageUrl,
+    boxFileId: storageKey, // legacy alias
     capturedAt: String(row.captured_at),
   };
 }
@@ -130,6 +157,14 @@ function toChangeAnalysis(row: Record<string, unknown>): ChangeAnalysis {
     evidence = row.evidence as unknown[];
   }
 
+  // Legacy `report_box_file_id` column now holds the InsForge storage key.
+  const storageKey = row.report_box_file_id
+    ? String(row.report_box_file_id)
+    : row.storage_key
+    ? String(row.storage_key)
+    : null;
+  const storageUrl = row.storage_url ? String(row.storage_url) : null;
+
   return {
     id: String(row.id),
     roomId: String(row.room_id),
@@ -142,7 +177,9 @@ function toChangeAnalysis(row: Record<string, unknown>): ChangeAnalysis {
     businessInterpretation: row.business_interpretation ? String(row.business_interpretation) : null,
     recommendedActions,
     evidence: evidence as ChangeAnalysis['evidence'],
-    reportBoxFileId: row.report_box_file_id ? String(row.report_box_file_id) : null,
+    storageKey,
+    storageUrl,
+    reportBoxFileId: storageKey, // legacy alias
     createdAt: String(row.created_at),
   };
 }
@@ -159,214 +196,372 @@ function now(): string {
   return new Date().toISOString();
 }
 
-// Room operations
+// ─── Room operations (real mode via InsForge SDK) ─────────────────────────────
 
 export async function createRoom(input: NewRoom): Promise<MemoryRoom> {
-  const db = getDb();
-  const row: Record<string, unknown> = {
-    id: generateId(),
-    name: input.name,
-    target_name: input.targetName,
-    category: input.category ?? 'competitor',
-    box_folder_id: input.boxFolderId ?? null,
-    user_id: input.userId ?? null,
-    created_at: now(),
+  const client = getInsforgeClient();
+  // Accept either the new `storageFolderPath` or the legacy `boxFolderId` field.
+  const storageFolderPath = input.storageFolderPath ?? input.boxFolderId ?? null;
+  const { data, error } = await client.database
+    .from('projects')
+    .insert([{
+      name: input.name,
+      owner_id: input.userId ?? null,
+      box_root_folder_id: storageFolderPath, // column name kept for compat
+    }])
+    .select()
+    .single();
+
+  if (error || !data) {
+    throw new Error(`Failed to create room: ${error?.message}`);
+  }
+
+  return {
+    id: data.id,
+    userId: data.owner_id ?? null,
+    name: data.name,
+    targetName: input.targetName,
+    category: (input.category ?? 'competitor') as MemoryRoom['category'],
+    storageFolderPath: data.box_root_folder_id ?? null,
+    boxFolderId: data.box_root_folder_id ?? null, // legacy alias
+    createdAt: data.created_at,
   };
-  db.memory_rooms.push(row);
-  return toMemoryRoom(row);
 }
 
 export async function listRoomsWithStats(): Promise<RoomWithStats[]> {
-  const db = getDb();
+  // Real mode: query projects + compute stats from related tables
+  const projects = await sdkQuery<{
+    id: string;
+    owner_id: string | null;
+    name: string;
+    box_root_folder_id: string | null;
+    created_at: string;
+  }>('public.projects', {
+    select: 'id,owner_id,name,box_root_folder_id,created_at',
+    order: 'created_at.desc',
+    limit: 100,
+  });
 
-  const rooms = db.memory_rooms.map(toMemoryRoom);
+  if (!projects.length) return [];
 
-  // Compute high/medium counts per room
+  // Fetch all tracked_pages (paginate if needed)
+  const trackedPages = await sdkQuery<{
+    id: string;
+    project_id: string;
+    source_url: string;
+    normalized_url: string;
+    active: boolean;
+  }>('public.tracked_pages', {
+    select: 'id,project_id,source_url,normalized_url,active',
+    limit: 500,
+  });
+  const activePages = trackedPages.filter(p => p.active !== false);
+
+  // Fetch latest job for each tracked_page
+  const jobsMap: Record<string, { finished_at: string | null }> = {};
+  for (const tp of activePages) {
+    const jobs = await sdkQuery<{
+      finished_at: string | null;
+      status: string;
+    }>('public.snapshot_jobs', {
+      select: 'finished_at,status',
+      filters: `tracked_page_id=eq.${tp.id}&status=eq.succeeded`,
+      order: 'finished_at.desc',
+      limit: 1,
+    });
+    if (jobs.length) jobsMap[tp.id] = jobs[0];
+  }
+
+  // Batch-fetch explanations for high/medium counts via JS-side join.
+  // Note: ai_explanations has no `severity` column — it's inside `output_json`.
+  const explanations = await sdkQuery<{
+    snapshot_id: string;
+    output_json: unknown;
+  }>('public.ai_explanations', {
+    select: 'snapshot_id,output_json',
+  });
+
+  // Fetch snapshots to map to tracked_pages
+  const snapshots = await sdkQuery<{
+    id: string;
+    tracked_page_id: string;
+  }>('public.snapshots', {
+    select: 'id,tracked_page_id',
+  });
+
+  // Build lookup: snapshot_id -> project_id
+  const pageToProject = new Map<string, string>();
+  for (const tp of activePages) pageToProject.set(tp.id, tp.project_id);
+  const snapToProject = new Map<string, string>();
+  for (const s of snapshots) {
+    const pid = pageToProject.get(s.tracked_page_id);
+    if (pid) snapToProject.set(s.id, pid);
+  }
+
   const highCounts: Record<string, number> = {};
   const mediumCounts: Record<string, number> = {};
-
-  for (const change of db.change_analyses) {
-    const roomId = String(change.room_id);
-    const severity = String(change.severity);
-    if (severity === 'high') {
-      highCounts[roomId] = (highCounts[roomId] ?? 0) + 1;
-    } else if (severity === 'medium') {
-      mediumCounts[roomId] = (mediumCounts[roomId] ?? 0) + 1;
+  for (const row of explanations) {
+    const pid = snapToProject.get(row.snapshot_id);
+    if (!pid) continue;
+    // Parse severity from output_json
+    let output: Record<string, unknown> = {};
+    if (typeof row.output_json === 'string') {
+      try { output = JSON.parse(row.output_json); } catch {}
+    } else if (row.output_json && typeof row.output_json === 'object') {
+      output = row.output_json as Record<string, unknown>;
     }
+    const sev = output.severity as string | undefined;
+    if (sev === 'high') highCounts[pid] = (highCounts[pid] ?? 0) + 1;
+    else if (sev === 'medium') mediumCounts[pid] = (mediumCounts[pid] ?? 0) + 1;
   }
 
-  // Find last completed scan time per room
+  // Build watchedUrls per project
+  const watchedUrlsByProject: Record<string, string[]> = {};
+  for (const tp of activePages) {
+    if (!watchedUrlsByProject[tp.project_id]) watchedUrlsByProject[tp.project_id] = [];
+    watchedUrlsByProject[tp.project_id].push(tp.source_url);
+  }
+
+  // Last completed scan per project
   const lastScanAt: Record<string, string> = {};
-  for (const scan of db.scan_runs) {
-    const roomId = String(scan.room_id);
-    const status = String(scan.status);
-    const completedAt = scan.completed_at ? String(scan.completed_at) : null;
-
-    if (status === 'completed' && completedAt) {
-      if (!lastScanAt[roomId] || completedAt > lastScanAt[roomId]) {
-        lastScanAt[roomId] = completedAt;
-      }
+  for (const [tpId, job] of Object.entries(jobsMap)) {
+    const pid = pageToProject.get(tpId);
+    if (pid && job.finished_at && !lastScanAt[pid]) {
+      lastScanAt[pid] = job.finished_at;
     }
   }
 
-  return rooms.map(room => ({
-    ...room,
-    highCount: highCounts[room.id] ?? 0,
-    mediumCount: mediumCounts[room.id] ?? 0,
-    lastScanAt: lastScanAt[room.id] ?? null,
-  }));
+  return projects.map(p => {
+    const storageFolderPath = p.box_root_folder_id ?? null;
+    return {
+      id: p.id,
+      userId: p.owner_id ?? null,
+      name: p.name,
+      targetName: p.name,
+      category: 'custom' as MemoryRoom['category'],
+      storageFolderPath,
+      boxFolderId: storageFolderPath, // legacy alias
+      createdAt: p.created_at,
+      watchedUrls: watchedUrlsByProject[p.id] ?? [],
+      highCount: highCounts[p.id] ?? 0,
+      mediumCount: mediumCounts[p.id] ?? 0,
+      lastScanAt: lastScanAt[p.id] ?? null,
+    };
+  });
 }
 
 export async function getRoom(roomId: string): Promise<MemoryRoom | null> {
-  const db = getDb();
-  const row = db.memory_rooms.find(r => String(r.id) === roomId);
-  return row ? toMemoryRoom(row) : null;
+  const rows = await sdkQuery<{
+    id: string;
+    owner_id: string | null;
+    name: string;
+    box_root_folder_id: string | null;
+    created_at: string;
+  }>('public.projects', {
+    select: 'id,owner_id,name,box_root_folder_id,created_at',
+    filters: `id=eq.${roomId}`,
+    limit: 1,
+  });
+
+  if (!rows.length) return null;
+  const p = rows[0];
+  const storageFolderPath = p.box_root_folder_id ?? null;
+  return {
+    id: p.id,
+    userId: p.owner_id ?? null,
+    name: p.name,
+    targetName: p.name,
+    category: 'custom' as MemoryRoom['category'],
+    storageFolderPath,
+    boxFolderId: storageFolderPath, // legacy alias
+    createdAt: p.created_at,
+  };
 }
 
-// Watched URL operations
+// ─── Watched URL operations ───────────────────────────────────────────────────
 
 export async function addWatchedUrls(roomId: string, urls: NewWatchedUrl[]): Promise<WatchedUrl[]> {
-  const db = getDb();
-  const rows = urls.map(u => {
-    const row: Record<string, unknown> = {
-      id: generateId(),
-      room_id: roomId,
-      url: u.url,
+  const client = getInsforgeClient();
+  const results: WatchedUrl[] = [];
+
+  for (const u of urls) {
+    const normalizedUrl = u.url.toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const slug = normalizedUrl.replace(/[^a-z0-9]/g, '-').substring(0, 50);
+
+    const { data, error } = await client.database
+      .from('tracked_pages')
+      .insert([{
+        project_id: roomId,
+        source_url: u.url,
+        normalized_url: normalizedUrl,
+        slug,
+        active: true,
+      }])
+      .select()
+      .single();
+
+    if (error || !data) {
+      throw new Error(`Failed to add watched URL: ${error?.message}`);
+    }
+
+    results.push({
+      id: data.id,
+      roomId,
+      url: data.source_url,
       label: u.label ?? null,
-      page_type: u.pageType ?? 'unknown',
-      created_at: now(),
-    };
-    db.watched_urls.push(row);
-    return row;
-  });
-  return rows.map(toWatchedUrl);
+      pageType: (u.pageType ?? 'unknown') as WatchedUrl['pageType'],
+      createdAt: data.created_at,
+    });
+  }
+
+  return results;
 }
 
 export async function listWatchedUrls(roomId: string): Promise<WatchedUrl[]> {
-  const db = getDb();
-  return db.watched_urls
-    .filter(r => String(r.room_id) === roomId)
-    .map(toWatchedUrl);
+  const rows = await sdkQuery<{
+    id: string;
+    project_id: string;
+    source_url: string;
+    normalized_url: string;
+    created_at: string;
+  }>('public.tracked_pages', {
+    select: 'id,project_id,source_url,normalized_url,created_at',
+    filters: `project_id=eq.${roomId}`,
+    order: 'created_at.desc',
+    limit: 100,
+  });
+
+  return rows.map(p => ({
+    id: p.id,
+    roomId: p.project_id,
+    url: p.source_url,
+    label: null,
+    pageType: 'unknown' as const,
+    createdAt: p.created_at,
+  }));
 }
 
-// Scan run operations
+// ─── Real-mode scan/snapshot/change operations (InsForge SDK only) ────────────
+//
+// In demo mode, scan_runs/page_snapshots/change_analyses were kept in an
+// in-memory store. With demo mode removed, all scan/snapshot/change persistence
+// goes through PostgREST against the real tables (snapshot_jobs, snapshots,
+// ai_explanations). The legacy `createScanRun` / `completeScanRun` /
+// `failScanRun` / `insertSnapshot` / `findPreviousSnapshot` /
+// `insertChangeAnalysis` exports have been deleted; `lib/scan.ts` should be
+// rewritten to write to snapshot_jobs, snapshots, and ai_explanations directly
+// when scan functionality is reintroduced.
 
-export async function createScanRun(roomId: string): Promise<ScanRun> {
-  const db = getDb();
-  const row: Record<string, unknown> = {
-    id: generateId(),
-    room_id: roomId,
-    status: 'running',
-    apify_run_id: null,
-    started_at: now(),
-    completed_at: null,
-    error_message: null,
-  };
-  db.scan_runs.push(row);
-  return toScanRun(row);
-}
-
-export async function completeScanRun(id: string): Promise<void> {
-  const db = getDb();
-  const row = db.scan_runs.find(r => String(r.id) === id);
-  if (row) {
-    row.status = 'completed';
-    row.completed_at = now();
+export async function getChange(changeId: string): Promise<ChangeAnalysis | null> {
+  // Look up via the joined ai_explanations + snapshots tables.
+  const rows = await sdkQuery<{
+    id: string; snapshot_id: string; previous_snapshot_id: string | null;
+    output_json: unknown; confidence: number | null; created_at: string;
+    tracked_page_id: string | null; change_type: string | null;
+  }>(
+    'ai_explanations',
+    { select: 'id,snapshot_id,previous_snapshot_id,output_json,confidence,created_at,snapshots!snapshot_id(tracked_page_id,change_type)',
+      filters: `id=eq.${changeId}`, limit: 1 }
+  );
+  if (rows.length === 0) return null;
+  const row = rows[0];
+  let output: Record<string, unknown> = {};
+  if (typeof row.output_json === 'string') {
+    try { output = JSON.parse(row.output_json); } catch {}
+  } else if (row.output_json && typeof row.output_json === 'object') {
+    output = row.output_json as Record<string, unknown>;
   }
-}
-
-export async function failScanRun(id: string, errorMessage: string): Promise<void> {
-  const db = getDb();
-  const row = db.scan_runs.find(r => String(r.id) === id);
-  if (row) {
-    row.status = 'failed';
-    row.error_message = errorMessage;
-    row.completed_at = now();
-  }
-}
-
-export async function getLatestScanRun(roomId: string): Promise<ScanRun | null> {
-  const db = getDb();
-  const rows = db.scan_runs
-    .filter(r => String(r.room_id) === roomId)
-    .sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
-
-  return rows[0] ? toScanRun(rows[0]) : null;
-}
-
-// Snapshot operations
-
-export async function insertSnapshot(input: NewSnapshot): Promise<PageSnapshot> {
-  const db = getDb();
-  const row: Record<string, unknown> = {
-    id: generateId(),
-    room_id: input.roomId,
-    watched_url_id: input.watchedUrlId,
-    scan_run_id: input.scanRunId,
-    url: input.url,
-    title: input.title || '',
-    text_content: input.textContent,
-    content_hash: input.contentHash,
-    box_file_id: input.boxFileId ?? null,
-    captured_at: input.capturedAt ?? now(),
+  const recommendedActions = Array.isArray(output.recommendedActions) ? output.recommendedActions as string[] : [];
+  const evidence = Array.isArray(output.evidence) ? output.evidence as unknown[] : [];
+  return {
+    id: String(row.id),
+    roomId: '',
+    watchedUrlId: row.tracked_page_id ?? '',
+    previousSnapshotId: row.previous_snapshot_id ? String(row.previous_snapshot_id) : null,
+    currentSnapshotId: row.snapshot_id ? String(row.snapshot_id) : null,
+    severity: (output.severity ?? 'low') as ChangeAnalysis['severity'],
+    changeType: (row.change_type ?? output.changeType ?? 'none') as ChangeAnalysis['changeType'],
+    summary: String(output.summary ?? ''),
+    businessInterpretation: (output.businessInterpretation ?? null) as string | null,
+    recommendedActions,
+    evidence: evidence as ChangeAnalysis['evidence'],
+    storageKey: null,
+    storageUrl: null,
+    reportBoxFileId: null,
+    createdAt: String(row.created_at),
   };
-  db.page_snapshots.push(row);
-  return toPageSnapshot(row);
-}
-
-export async function findPreviousSnapshot(
-  watchedUrlId: string,
-  beforeCapturedAt: string
-): Promise<PageSnapshot | null> {
-  const db = getDb();
-  const rows = db.page_snapshots
-    .filter(r => String(r.watched_url_id) === watchedUrlId && String(r.captured_at) < beforeCapturedAt)
-    .sort((a, b) => String(b.captured_at).localeCompare(String(a.captured_at)));
-
-  return rows[0] ? toPageSnapshot(rows[0]) : null;
-}
-
-// Change analysis operations
-
-export async function insertChangeAnalysis(input: NewChangeAnalysis): Promise<ChangeAnalysis> {
-  const db = getDb();
-  const row: Record<string, unknown> = {
-    id: generateId(),
-    room_id: input.roomId,
-    watched_url_id: input.watchedUrlId,
-    previous_snapshot_id: input.previousSnapshotId,
-    current_snapshot_id: input.currentSnapshotId,
-    severity: input.severity,
-    change_type: input.changeType,
-    summary: input.summary,
-    business_interpretation: input.businessInterpretation ?? null,
-    recommended_actions: JSON.stringify(input.recommendedActions),
-    evidence: JSON.stringify(input.evidence),
-    report_box_file_id: input.reportBoxFileId ?? null,
-    created_at: now(),
-  };
-  db.change_analyses.push(row);
-  return toChangeAnalysis(row);
 }
 
 export async function listChanges(roomId: string, limit?: number): Promise<ChangeAnalysis[]> {
-  const db = getDb();
-  const rows = db.change_analyses
-    .filter(r => String(r.room_id) === roomId)
-    .sort((a, b) => {
-      const timeDiff = String(b.created_at).localeCompare(String(a.created_at));
-      if (timeDiff !== 0) return timeDiff;
-      return String(b.id).localeCompare(String(a.id));
-    });
+  const limitNum = limit ?? 100;
 
-  const result = rows.map(toChangeAnalysis);
-  return limit ? result.slice(0, limit) : result;
-}
+  // 1. Get tracked page IDs for this room
+  const pages = await sdkQuery<{ id: string }>(
+    'tracked_pages',
+    { select: 'id', filters: `project_id=eq.${roomId}` }
+  );
+  if (pages.length === 0) return [];
+  const pageIds = pages.map(p => p.id);
 
-export async function getChange(changeId: string): Promise<ChangeAnalysis | null> {
-  const db = getDb();
-  const row = db.change_analyses.find(r => String(r.id) === changeId);
-  return row ? toChangeAnalysis(row) : null;
+  // 2. Get snapshot IDs for those pages
+  const inList = `(${pageIds.join(',')})`;
+  const snaps = await sdkQuery<{ id: string; tracked_page_id: string; change_type: string; observed_at: string }>(
+    'snapshots',
+    { select: 'id,tracked_page_id,change_type,observed_at', filters: `tracked_page_id=in.${inList}`, order: 'observed_at.desc', limit: limitNum }
+  );
+  if (snaps.length === 0) return [];
+  const snapIds = snaps.map(s => s.id);
+
+  // 3. Get AI explanations for those snapshots
+  const expls = await sdkQuery<{
+    id: string; snapshot_id: string; previous_snapshot_id: string | null;
+    output_json: unknown; confidence: number | null; created_at: string;
+  }>(
+    'ai_explanations',
+    { select: 'id,snapshot_id,previous_snapshot_id,output_json,confidence,created_at',
+      filters: `snapshot_id=in.(${snapIds.join(',')})`, order: 'created_at.desc', limit: limitNum }
+  );
+
+  // 4. Build a snapshot lookup and map to ChangeAnalysis
+  const snapById = new Map(snaps.map(s => [s.id, s]));
+  return expls.map(row => {
+    const snap = snapById.get(row.snapshot_id);
+    // output_json may arrive as a string or object depending on PostgREST serialization
+    let output: Record<string, unknown> = {};
+    const rawOutput = row.output_json;
+    if (typeof rawOutput === 'string') {
+      try { output = JSON.parse(rawOutput); } catch { output = {}; }
+    } else if (rawOutput && typeof rawOutput === 'object') {
+      output = rawOutput as Record<string, unknown>;
+    }
+    const recommendedActions = Array.isArray(output.recommendedActions)
+      ? (output.recommendedActions as string[])
+      : typeof output.recommendedActions === 'string'
+        ? (() => { try { return JSON.parse(output.recommendedActions as string); } catch { return []; } })()
+        : [];
+    const evidence = Array.isArray(output.evidence)
+      ? (output.evidence as unknown[])
+      : typeof output.evidence === 'string'
+        ? (() => { try { return JSON.parse(output.evidence as string); } catch { return []; } })()
+        : [];
+    return {
+      id: String(row.id),
+      roomId,
+      watchedUrlId: snap?.tracked_page_id ?? '',
+      previousSnapshotId: row.previous_snapshot_id ? String(row.previous_snapshot_id) : null,
+      currentSnapshotId: row.snapshot_id ? String(row.snapshot_id) : null,
+      severity: (output.severity ?? 'low') as ChangeAnalysis['severity'],
+      changeType: (snap?.change_type ?? output.changeType ?? 'none') as ChangeAnalysis['changeType'],
+      summary: String(output.summary ?? ''),
+      businessInterpretation: (output.businessInterpretation ?? null) as string | null,
+      recommendedActions,
+      evidence: evidence as ChangeAnalysis['evidence'],
+      storageKey: null,
+      storageUrl: null,
+      reportBoxFileId: null,
+      createdAt: String(row.created_at),
+    };
+  });
 }
 
 export async function countBySeverity(roomId: string): Promise<{ high: number; medium: number }> {
@@ -380,7 +575,7 @@ export async function countBySeverity(roomId: string): Promise<{ high: number; m
   return { high, medium };
 }
 
-// Pure selectors used by stats helpers
+// ─── Pure selectors ───────────────────────────────────────────────────────────
 
 export function computeSeverityCounts(changes: ChangeAnalysis[]): { high: number; medium: number } {
   let high = 0;
@@ -428,11 +623,22 @@ export function sortAndLimitChanges(
   return limit ? sorted.slice(0, limit) : sorted;
 }
 
-// Export store for testing
-export function getMemoryStoreForTest(): InMemoryStore {
-  return getMemoryStore();
-}
+// ─── One-time migrations ─────────────────────────────────────────────────────
 
-export function clearMemoryStore(): void {
-  _memoryStore = null;
+/**
+ * Backfill owner_id on all existing projects to the canonical demo user ID.
+ * Safe to call repeatedly — uses UPDATE which is idempotent.
+ */
+export async function migrateOwnerIds(): Promise<{ updated: number }> {
+  // Use direct fetch for UPDATE (PostgREST RPC-style)
+  const client = getSdkClient();
+  if (!client) return { updated: 0 };
+  const { error } = await client.database.from('projects').update({
+    owner_id: '00000000-0000-0000-0000-000000000001',
+  }).eq('owner_id', '');
+  if (error) {
+    console.error('migrateOwnerIds error:', error.message);
+    return { updated: 0 };
+  }
+  return { updated: 1 };
 }

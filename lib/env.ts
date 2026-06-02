@@ -1,6 +1,26 @@
-// Credential detection helpers for PageVault
+// Credential detection helpers for PageVault.
 // A credential is "present" only when it is a non-empty string after trimming.
 // A malformed value is still treated as present (it will surface as a real-call error).
+//
+// Required vs optional:
+//   - INSFORGE_*  → REQUIRED. The app cannot run without an InsForge backend.
+//   - APIFY_*     → OPTIONAL. Missing creds throw a clear error at call time.
+//   - OPENAI_*    → OPTIONAL. Missing creds throw a clear error at call time.
+//                   Apify and AI use graceful fallback ONLY when the real API call
+//                   fails (network, quota, transient error), not when creds are absent.
+
+import { createClient } from '@insforge/sdk';
+
+let _client: ReturnType<typeof createClient> | null = null;
+export function getInsforgeClient(): ReturnType<typeof createClient> {
+  if (!_client) {
+    _client = createClient({
+      baseUrl: process.env.INSFORGE_API_URL!,
+      anonKey: process.env.INSFORGE_ANON_KEY!,
+    });
+  }
+  return _client;
+}
 
 /**
  * Returns true if the given value is a non-empty string after trimming.
@@ -22,31 +42,9 @@ export function hasApifyCreds(): boolean {
 }
 
 /**
- * Returns true when Box credentials are configured.
- * Either a developer token OR client id+secret pair must be present.
- */
-export function hasBoxCreds(): boolean {
-  return (
-    isPresent(process.env.BOX_DEVELOPER_TOKEN) ||
-    (isPresent(process.env.BOX_CLIENT_ID) && isPresent(process.env.BOX_CLIENT_SECRET))
-  );
-}
-
-/**
  * Returns true when AI/LLM credentials are configured.
  * Requires an OpenAI-compatible API key.
  */
 export function hasAiCreds(): boolean {
   return isPresent(process.env.OPENAI_API_KEY);
-}
-
-/**
- * Returns true when Insforge credentials are configured.
- * Requires API URL and either a service role key or anon key.
- */
-export function hasInsforgeCreds(): boolean {
-  return (
-    isPresent(process.env.INSFORGE_API_URL) &&
-    (isPresent(process.env.INSFORGE_SERVICE_ROLE_KEY) || isPresent(process.env.INSFORGE_ANON_KEY))
-  );
 }

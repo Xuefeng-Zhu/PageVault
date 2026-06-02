@@ -109,15 +109,13 @@ npm start
 
 ## Demo Mode
 
-Without any credentials, the application runs in Demo Mode with full functionality:
+Demo mode is removed. To populate the database with realistic seed data:
 
 ```bash
-npm run dev
+python3 scripts/seed_via_api.py
 ```
 
-Navigate to `http://localhost:3000` and click **"Load Demo"** to seed a complete demonstration room with before/after data and change analyses.
-
-Or run the seed script directly:
+This uses the InsForge service role key to write projects, tracked pages, snapshot jobs, snapshots, and AI explanations directly to the database. Navigate to `http://localhost:3000` to see the data.
 
 ```bash
 npx ts-node scripts/seed-demo.ts

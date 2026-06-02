@@ -49,3 +49,4 @@ build/
 .roo
 .trae
 .windsurf
+.rooms_cache.json

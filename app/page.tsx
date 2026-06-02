@@ -2,8 +2,7 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useState } from 'react';
-import { 
+import {
   ArrowRight, 
   Globe, 
   Database, 
@@ -147,18 +146,9 @@ const footerLinks = {
 
 export default function LandingPage() {
   const router = useRouter();
-  const [seeding, setSeeding] = useState(false);
 
-  const handleLoadDemo = async () => {
-    setSeeding(true);
-    try {
-      const res = await fetch('/api/demo/seed', { method: 'POST' });
-      if (!res.ok) throw new Error('Failed to seed demo');
-      const data = await res.json();
-      router.push(`/dashboard/rooms/${data.roomId}`);
-    } catch {
-      setSeeding(false);
-    }
+  const handleGetStarted = () => {
+    router.push('/dashboard/rooms/new');
   };
 
   return (
@@ -236,19 +226,6 @@ export default function LandingPage() {
                   Get Started Free
                   <ArrowRight className="w-5 h-5" />
                 </Link>
-                <button
-                  onClick={handleLoadDemo}
-                  disabled={seeding}
-                  className="px-6 py-3 rounded-lg font-bold border text-sm transition-all hover:-translate-y-0.5 disabled:opacity-50"
-                  style={{ 
-                    backgroundColor: 'white', 
-                    borderColor: '#e2e8f0', 
-                    color: '#131b2e',
-                    fontFamily: 'Inter, sans-serif'
-                  }}
-                >
-                  {seeding ? 'Loading...' : 'View Demo'}
-                </button>
               </div>
             </div>
           </div>

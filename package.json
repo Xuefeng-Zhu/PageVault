@@ -14,8 +14,11 @@
   },
   "dependencies": {
     "@insforge/sdk": "^1.0.0",
+    "@types/bcryptjs": "^2.4.6",
+    "bcryptjs": "^3.0.3",
     "lucide-react": "^1.17.0",
     "next": "^14.2.5",
+    "next-auth": "^4.24.14",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

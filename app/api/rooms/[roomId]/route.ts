@@ -1,7 +1,7 @@
 // API route: GET /api/rooms/[roomId]
 import { NextRequest, NextResponse } from 'next/server';
-import type { ErrorResponse, RoomDetailResponse } from '@/types';
-import { getRoom, listWatchedUrls, getLatestScanRun, listChanges } from '@/lib/insforge';
+import type { ErrorResponse, RoomDetailResponse, WatchedUrl, ScanRun } from '@/types';
+import { getRoom, listWatchedUrls, listChanges } from '@/lib/insforge';
 
 export async function GET(
   request: NextRequest,
@@ -19,13 +19,12 @@ export async function GET(
     }
 
     const watchedUrls = await listWatchedUrls(roomId);
-    const latestScan = await getLatestScanRun(roomId);
-    const changes = await listChanges(roomId, 20);
+    const changes = await listChanges(roomId, 50);
 
     return NextResponse.json({
       room,
       watchedUrls,
-      latestScan,
+      latestScan: null,
       changes,
     });
   } catch (error) {

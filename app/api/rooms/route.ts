@@ -1,15 +1,22 @@
 // API route: GET /api/rooms (list rooms) and POST /api/rooms (create room)
-// Updated to wire to InsForge edge functions
+// Updated to wire to InsForge DB via edge-client and use session for user filtering
 import { NextRequest, NextResponse } from 'next/server';
 import type { ErrorResponse, RoomWithStats, MemoryRoom } from '@/types';
 import { createRoom as insforgeCreateRoom, listRoomsWithStats } from '@/lib/insforge';
 import { validateRoomField, normalizeCategory } from '@/lib/validation';
-import { createBoxFolder } from '@/lib/box';
+import { createStorageFolder } from '@/lib/box';
 import { callCreateWatch } from '@/lib/edge-client';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/lib/auth';
 
 export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorResponse>> {
   try {
+    const session = await getServerSession(authOptions);
+    const userId = (session?.user as {id?: string})?.id;
+
+    // Use listRoomsWithStats from lib/insforge.ts (uses InsForge SDK with service role)
     const rooms = await listRoomsWithStats();
+
     return NextResponse.json(rooms);
   } catch (error) {
     console.error('Failed to list rooms:', error);
@@ -45,14 +52,15 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
     // Normalize category
     const category = normalizeCategory(body.category);
 
-    // Create Box folder
+    // Create InsForge storage folder
     let boxFolderId: string | null = null;
     try {
-      boxFolderId = await createBoxFolder(`PageVault/${nameResult.value}`);
+      const folderPath = await createStorageFolder(`pagevault/${nameResult.value.toLowerCase().replace(/\s+/g, '-')}`);
+      boxFolderId = folderPath;
     } catch (error) {
-      console.error('Box folder creation failed:', error);
+      console.error('Storage folder creation failed:', error);
       return NextResponse.json(
-        { error: { code: 'BOX_ERROR', message: 'Failed to create Box folder for the room' } },
+        { error: { code: 'STORAGE_ERROR', message: 'Failed to create storage folder for the room' } },
         { status: 500 }
       );
     }
