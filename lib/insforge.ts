@@ -14,7 +14,7 @@ import type {
   NewSnapshot,
   NewChangeAnalysis,
 } from '@/types';
-import { getInsforgeClient } from './env';
+import { getInsforgeClient, getInsforgeBaseUrl } from './env';
 
 // ─── SDK client setup ──────────────────────────────────────────────────────────
 //
@@ -806,11 +806,11 @@ export async function listEnabledSubscriptions(): Promise<NotificationSubscripti
 
 export async function updateScheduleLastRun(scheduleId: string, lastRunAt: string): Promise<void> {
   const srk = process.env.INSFORGE_SERVICE_ROLE_KEY;
-  const baseUrl = process.env.INSFORGE_API_URL;
+  const baseUrl = srk ? getInsforgeBaseUrl() : null;
   if (!srk || !baseUrl) {
     throw new Error('INSFORGE_SERVICE_ROLE_KEY and INSFORGE_API_URL must be set for updateScheduleLastRun');
   }
-  const r = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/database/records/scan_schedules?id=eq.${scheduleId}`, {
+  const r = await fetch(`${baseUrl}/api/database/records/scan_schedules?id=eq.${scheduleId}`, {
     method: 'PATCH',
     headers: { 'Authorization': `Bearer ${srk}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ last_run_at: lastRunAt }),
@@ -822,12 +822,12 @@ export async function updateScheduleLastRun(scheduleId: string, lastRunAt: strin
 
 export async function createRoomWithDefaults(roomId: string, cronExpression = '0 3 * * *'): Promise<ScanSchedule> {
   const srk = process.env.INSFORGE_SERVICE_ROLE_KEY;
-  const baseUrl = process.env.INSFORGE_API_URL;
+  const baseUrl = srk ? getInsforgeBaseUrl() : null;
   if (!srk || !baseUrl) {
     throw new Error('INSFORGE_SERVICE_ROLE_KEY and INSFORGE_API_URL must be set for createRoomWithDefaults');
   }
   const now = new Date().toISOString();
-  const r = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/database/records/scan_schedules`, {
+  const r = await fetch(`${baseUrl}/api/database/records/scan_schedules`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${srk}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
     body: JSON.stringify({
