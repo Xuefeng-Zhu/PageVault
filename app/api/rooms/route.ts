@@ -5,7 +5,6 @@ import type { ErrorResponse, RoomWithStats, MemoryRoom } from '@/types';
 import { createRoom as insforgeCreateRoom, listRoomsWithStats } from '@/lib/insforge';
 import { validateRoomField, normalizeCategory } from '@/lib/validation';
 import { createStorageFolder } from '@/lib/box';
-import { callCreateWatch } from '@/lib/edge-client';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 
@@ -29,6 +28,8 @@ export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorRespons
 
 export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoom | ErrorResponse>> {
   try {
+    const session = await getServerSession(authOptions);
+    const userId = (session?.user as {id?: string})?.id ?? null;
     const body = await request.json() as { name?: string; targetName?: string; category?: string };
 
     // Validate name
@@ -55,7 +56,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
     // Create InsForge storage folder
     let boxFolderId: string | null = null;
     try {
-      const folderPath = await createStorageFolder(`pagevault/${nameResult.value.toLowerCase().replace(/\s+/g, '-')}`);
+      const folderPath = await createStorageFolder(nameResult.value.toLowerCase().replace(/\s+/g, '-'));
       boxFolderId = folderPath;
     } catch (error) {
       console.error('Storage folder creation failed:', error);
@@ -71,6 +72,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
       targetName: targetNameResult.value,
       category,
       boxFolderId,
+      userId,
     });
 
     return NextResponse.json(room, { status: 201 });

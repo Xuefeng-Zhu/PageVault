@@ -202,11 +202,14 @@ export async function createRoom(input: NewRoom): Promise<MemoryRoom> {
   const client = getInsforgeClient();
   // Accept either the new `storageFolderPath` or the legacy `boxFolderId` field.
   const storageFolderPath = input.storageFolderPath ?? input.boxFolderId ?? null;
+  // Fall back to a system user ID if no session user is provided — the projects
+  // table has a NOT NULL constraint on owner_id.
+  const ownerId = input.userId ?? '00000000-0000-0000-0000-000000000001';
   const { data, error } = await client.database
     .from('projects')
     .insert([{
       name: input.name,
-      owner_id: input.userId ?? null,
+      owner_id: ownerId,
       box_root_folder_id: storageFolderPath, // column name kept for compat
     }])
     .select()
