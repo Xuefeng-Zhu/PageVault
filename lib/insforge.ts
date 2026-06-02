@@ -802,3 +802,51 @@ export async function listEnabledSubscriptions(): Promise<NotificationSubscripti
     updatedAt: (r as { updated_at: string }).updated_at,
   }));
 }
+
+
+export async function updateScheduleLastRun(scheduleId: string, lastRunAt: string): Promise<void> {
+  const srk = process.env.INSFORGE_SERVICE_ROLE_KEY;
+  const baseUrl = process.env.INSFORGE_API_URL;
+  if (!srk || !baseUrl) {
+    throw new Error('INSFORGE_SERVICE_ROLE_KEY and INSFORGE_API_URL must be set for updateScheduleLastRun');
+  }
+  const r = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/database/records/scan_schedules?id=eq.${scheduleId}`, {
+    method: 'PATCH',
+    headers: { 'Authorization': `Bearer ${srk}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ last_run_at: lastRunAt }),
+  });
+  if (!r.ok) {
+    throw new Error(`updateScheduleLastRun failed: ${r.status} ${(await r.text()).slice(0, 200)}`);
+  }
+}
+
+export async function createRoomWithDefaults(roomId: string, cronExpression = '0 3 * * *'): Promise<ScanSchedule> {
+  const srk = process.env.INSFORGE_SERVICE_ROLE_KEY;
+  const baseUrl = process.env.INSFORGE_API_URL;
+  if (!srk || !baseUrl) {
+    throw new Error('INSFORGE_SERVICE_ROLE_KEY and INSFORGE_API_URL must be set for createRoomWithDefaults');
+  }
+  const now = new Date().toISOString();
+  const r = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/database/records/scan_schedules`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${srk}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
+    body: JSON.stringify({
+      project_id: roomId,
+      cron_expression: cronExpression,
+      enabled: true,
+      created_at: now,
+      updated_at: now,
+    }),
+  });
+  if (!r.ok) {
+    throw new Error(`createRoomWithDefaults failed: ${r.status} ${(await r.text()).slice(0, 200)}`);
+  }
+  const rows = await r.json();
+  if (!rows[0]) throw new Error('createRoomWithDefaults: no row returned');
+  const row = rows[0];
+  return {
+    id: row.id, roomId: row.project_id, cronExpression: row.cron_expression,
+    enabled: row.enabled, insforgeScheduleId: row.insforge_schedule_id,
+    lastRunAt: row.last_run_at, createdAt: row.created_at, updatedAt: row.updated_at,
+  };
+}
