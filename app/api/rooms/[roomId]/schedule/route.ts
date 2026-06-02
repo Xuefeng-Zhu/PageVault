@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { getInsforgeBaseUrl } from '@/lib/env';
+import { getRoom } from '@/lib/insforge';
 
 const execAsync = promisify(exec);
 const SRK = () => process.env.INSFORGE_SERVICE_ROLE_KEY!;
@@ -54,6 +55,17 @@ async function createOrUpdateInsforgeSchedule(
   return m ? m[0] : existingId;
 }
 
+async function authorizeRoom(roomId: string, sessionUserId: string): Promise<NextResponse | null> {
+  const room = await getRoom(roomId);
+  if (!room) {
+    return NextResponse.json({ error: { code: 'NOT_FOUND', message: 'Room not found' } }, { status: 404 });
+  }
+  if (room.userId && room.userId !== sessionUserId) {
+    return NextResponse.json({ error: { code: 'FORBIDDEN', message: 'Not the room owner' } }, { status: 403 });
+  }
+  return null;
+}
+
 export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ roomId: string }> },
@@ -61,6 +73,8 @@ export async function GET(
   const session = await getServerSession(authOptions);
   if (!session?.user) return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
   const { roomId } = await params;
+  const deny = await authorizeRoom(roomId, session.user.id);
+  if (deny) return deny;
   const r = await fetch(`${DB()}/scan_schedules?project_id=eq.${roomId}&limit=1`, {
     headers: { 'Authorization': `Bearer ${SRK()}` },
   });
@@ -88,6 +102,8 @@ export async function POST(
       return NextResponse.json({ error: { code: 'UNAUTHORIZED', message: 'Sign in required' } }, { status: 401 });
     }
     const { roomId } = await params;
+    const deny = await authorizeRoom(roomId, session.user.id);
+    if (deny) return deny;
     const body = (await request.json()) as ScheduleRequestBody;
     const cronExpression = (body.cronExpression ?? '').trim();
     const enabled = body.enabled !== false;
@@ -157,6 +173,8 @@ export async function DELETE(
       return NextResponse.json({ error: { code: 'UNAUTHORIZED' } }, { status: 401 });
     }
     const { roomId } = await params;
+    const deny = await authorizeRoom(roomId, session.user.id);
+    if (deny) return deny;
     // Delete the DB row
     await fetch(`${DB()}/scan_schedules?project_id=eq.${roomId}`, {
       method: 'DELETE',
