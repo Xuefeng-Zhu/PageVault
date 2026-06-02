@@ -128,13 +128,33 @@ async function callLlm(
   system: string,
   user: string,
   maxTokens = 1500,
-): Promise<ChangeAnalysisResult> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY is not configured');
+): Promise<{ result: ChangeAnalysisResult; model: string }> {
+  // Prefer the OpenRouter key (set by `npx @insforge/cli ai setup`) over
+  // the placeholder OPENAI_API_KEY that may still be in .env.local.
+  let apiKey = process.env.OPENAI_API_KEY;
+  let baseUrl = process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1';
+  let model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
+
+  const isPlaceholder = (k: string | undefined): boolean =>
+    !k || k.includes('...') || k.length < 30;
+
+  if (isPlaceholder(apiKey) && process.env.OPENROUTER_API_KEY) {
+    apiKey = process.env.OPENROUTER_API_KEY;
+    if (!process.env.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL.includes('api.openai.com')) {
+      baseUrl = 'https://openrouter.ai/api/v1';
+    }
+    // Prefer a strong cheap default on OpenRouter
+    if (model === 'gpt-4o-mini' || isPlaceholder(process.env.OPENAI_MODEL)) {
+      model = 'anthropic/claude-3.5-haiku';
+    }
   }
-  const baseUrl = process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1';
-  const model = process.env.OPENAI_MODEL ?? 'anthropic/claude-3.5-haiku';
+
+  if (!apiKey) {
+    throw new Error(
+      'No LLM API key configured. Set OPENAI_API_KEY (with valid OpenAI key) ' +
+      'or OPENROUTER_API_KEY (set by `npx @insforge/cli ai setup`).'
+    );
+  }
 
   const r = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
@@ -190,22 +210,25 @@ async function callLlm(
     : 'unknown';
 
   return {
-    severity: severity as ChangeAnalysisResult['severity'],
-    changeType,
-    summary: String(parsed.summary ?? 'Content changed'),
-    businessInterpretation: String(parsed.business_interpretation ?? parsed.businessInterpretation ?? ''),
-    evidence: Array.isArray(parsed.evidence)
-      ? (parsed.evidence as Array<Record<string, string>>).map((e) => ({
-          before: String(e.before ?? e.old ?? ''),
-          after: String(e.after ?? e.new ?? ''),
-          explanation: String(e.explanation ?? ''),
-        }))
-      : [],
-    recommendedActions: Array.isArray(parsed.recommended_actions)
-      ? (parsed.recommended_actions as string[])
-      : Array.isArray(parsed.recommendedActions)
-        ? (parsed.recommendedActions as string[])
+    result: {
+      severity: severity as ChangeAnalysisResult['severity'],
+      changeType,
+      summary: String(parsed.summary ?? 'Content changed'),
+      businessInterpretation: String(parsed.business_interpretation ?? parsed.businessInterpretation ?? ''),
+      evidence: Array.isArray(parsed.evidence)
+        ? (parsed.evidence as Array<Record<string, string>>).map((e) => ({
+            before: String(e.before ?? e.old ?? ''),
+            after: String(e.after ?? e.new ?? ''),
+            explanation: String(e.explanation ?? ''),
+          }))
         : [],
+      recommendedActions: Array.isArray(parsed.recommended_actions)
+        ? (parsed.recommended_actions as string[])
+        : Array.isArray(parsed.recommendedActions)
+          ? (parsed.recommendedActions as string[])
+          : [],
+    },
+    model,
   };
 }
 
@@ -424,8 +447,8 @@ async function scanOne(
 
   // 2. Look up the previous snapshot for this page
   const prevRows = (await dbGet(
-    `snapshots?tracked_page_id=eq.${wp.id}&order=observed_at.desc&limit=1`,
-  )) as Array<{ id: string; markdown_hash: string; text_content: string }>;
+    `snapshots?tracked_page_id=eq.${wp.id}&order=observed_at.desc&limit=1&select=id,markdown_hash,markdown_text`,
+  )) as Array<{ id: string; markdown_hash: string; markdown_text: string | null }>;
   const prev = prevRows[0];
 
   // 3. Skip if hash matches (no change → no snapshot, no LLM call)
@@ -454,6 +477,7 @@ async function scanOne(
     page_title: crawled.title || crawled.url,
     http_status: 200,
     markdown_hash: mdHash,
+    markdown_text: crawled.markdown.slice(0, 50000), // cap at 50KB to keep rows small
     change_type: prev ? 'textual' : 'none', // refined by AI if change detected
     box_snapshot_folder_id: uploaded
       ? `pagevault/${(room.storageFolderPath || room.boxFolderId || '').replace(/^pagevault\//, '')}/snapshots/${observedAt.slice(0, 10)}/`
@@ -483,7 +507,7 @@ async function scanOne(
   }
 
   // 7. Call the LLM
-  const prevExcerpt = extractExcerpt(prev.text_content, 800);
+  const prevExcerpt = extractExcerpt(prev.markdown_text || '', 800);
   const liveExcerpt = extractExcerpt(crawled.markdown, 1200);
   const userPrompt = `Tracked page: ${crawled.url}
 Title: ${crawled.title || crawled.url}
@@ -495,10 +519,13 @@ ${prevExcerpt || '(no previous text excerpt available)'}
 ${liveExcerpt}
 
 Analyze the change. Return JSON only.`;
-
+  // Call the LLM. callLlm returns the actual model used so we can persist it.
   let analysis: ChangeAnalysisResult;
+  let llmModel = 'unknown';
   try {
-    analysis = await callLlm(SYSTEM, userPrompt, 1500);
+    const result = await callLlm(SYSTEM, userPrompt, 1500);
+    analysis = result.result;
+    llmModel = result.model;
   } catch (err) {
     console.error(`[scan] LLM call failed for ${crawled.url}:`, err);
     // Record the snapshot but no change analysis
@@ -540,7 +567,7 @@ Analyze the change. Return JSON only.`;
     id: explId,
     snapshot_id: snapId,
     previous_snapshot_id: prev.id,
-    model: process.env.OPENAI_MODEL ?? 'anthropic/claude-3.5-haiku',
+    model: llmModel,
     prompt_version: 'pagevault-scan-2026-06-02',
     output_json: JSON.stringify(outputJson),
     confidence: 0.85,
