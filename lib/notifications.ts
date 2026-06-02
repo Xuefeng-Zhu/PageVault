@@ -51,6 +51,27 @@ async function dbGet(path: string): Promise<unknown[]> {
   return r.json();
 }
 
+// RPC endpoint for PostgREST stored procedures. Returns the parsed JSON
+// body on success, or null on non-ok. The endpoint path is relative to
+// the project's RPC base (which InsForge mounts at /api/database/rpc/).
+async function dbRpc(path: string, body: unknown): Promise<unknown | null> {
+  const base = getInsforgeBaseUrl();
+  const r = await fetch(`${base}/api/database/rpc/${path}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${SRK()}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) return null;
+  // 204 No Content for void functions; the body is empty
+  if (r.status === 204) return null;
+  const text = await r.text();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return text; }
+}
+
 // Called from lib/scan.ts after the ai_explanations insert.
 export async function enqueueNotification(opts: {
   aiExplanationId: string;
@@ -71,10 +92,10 @@ export async function enqueueNotification(opts: {
 
 // Returns the count of pending → delivered/failed.
 export async function drainOutbox(limit = 50): Promise<{ processed: number; succeeded: number; failed: number }> {
-  // Acquire advisory lock — a row is returned only if we got the lock
-  const lockRows = await dbGet('pg_try_advisory_lock?arg=42&select=pg_try_advisory_lock');
-  const got = (lockRows[0] as { pg_try_advisory_lock?: boolean } | undefined)?.pg_try_advisory_lock;
-  if (!got) {
+  // Acquire advisory lock via the public-schema wrapper. Returns the
+  // scalar boolean directly (RPC endpoint, not the table endpoint).
+  const got = await dbRpc('acquire_notification_lock', { arg: 42 });
+  if (got !== true) {
     return { processed: 0, succeeded: 0, failed: 0 };
   }
 
@@ -117,8 +138,13 @@ export async function drainOutbox(limit = 50): Promise<{ processed: number; succ
         await recordDeliverySuccess(sub);
         succeeded++;
       } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        await markOutbox(row.id, 'failed', errMsg, row.attempts + 1);
+        let errMsg: string;
+        if (err instanceof Error) {
+          errMsg = err.message || err.name || 'Unknown error';
+        } else {
+          errMsg = String(err);
+        }
+        await markOutbox(row.id, 'failed', errMsg.slice(0, 500), row.attempts + 1);
         // Try to load the subscription for failure tracking
         try {
           const sub = await getSubscription(row.subscription_id);
@@ -129,8 +155,8 @@ export async function drainOutbox(limit = 50): Promise<{ processed: number; succ
     }
     return { processed: rows.length, succeeded, failed };
   } finally {
-    // Release the lock (best-effort)
-    await dbGet('pg_advisory_unlock?arg=42&select=pg_advisory_unlock').catch(() => undefined);
+    // Release the lock (best-effort, via the public-schema wrapper)
+    await dbRpc('release_notification_lock', { arg: 42 }).catch(() => undefined);
   }
 }
 
