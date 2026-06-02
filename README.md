@@ -4,6 +4,35 @@
 
 PageVault is a Next.js (App Router) + TypeScript full-stack application that monitors public web pages using Apify, stores every snapshot and report as evidence in Box, persists metadata in an Insforge Postgres backend, and uses an OpenAI-compatible LLM to explain what changed and why it matters.
 
+## Documentation
+
+The full developer reference lives in [`docs/00-INDEX.md`](docs/00-INDEX.md).
+Start with the index, then read in this order for the fastest onboarding:
+
+1. **[Architecture](docs/ARCHITECTURE.md)** — how the five planes (browser,
+   InsForge, Apify, LLM, Storage, Schedules) fit together
+2. **[Data model](docs/DATA_MODEL.md)** — every table, every column, ER
+   diagram
+3. **[Environment](docs/ENVIRONMENT.md)** — every env var, what enables
+   which mode
+4. **[API reference](docs/API.md)** — every route, every auth check,
+   every error code
+5. **[Component reference](docs/COMPONENTS.md)** — every component,
+   props, when to use it
+6. **[Development](docs/DEVELOPMENT.md)** — local setup, common tasks,
+   debugging
+7. **[Deployment](docs/DEPLOYMENT.md)** — Vercel + InsForge Schedules
+8. **[Operations](docs/OPERATIONS.md)** — incident response
+9. **[Security](SECURITY.md)** — reporting vulns, threat model
+
+Additional reference material in `docs/`: the LLM model-selection
+research ([`docs/LLM_MODEL_RESEARCH.md`](docs/LLM_MODEL_RESEARCH.md)),
+the codebase audit
+([`docs/audits/2026-06-02-codebase-audit.md`](docs/audits/2026-06-02-codebase-audit.md)),
+and the implementation plans in `docs/plans/`. The original
+architectural spec is at the repo root:
+[`SYSTEM_DESIGN.md`](SYSTEM_DESIGN.md).
+
 ## Architecture
 
 ```
