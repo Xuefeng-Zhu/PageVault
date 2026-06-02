@@ -7,7 +7,7 @@ import {
   listRoomsWithStats,
 } from '@/lib/insforge';
 import { validateRoomField, normalizeCategory } from '@/lib/validation';
-import { createStorageFolder } from '@/lib/box';
+import { createStorageFolder } from '@/lib/storage';
 import { requireSession } from '@/lib/apiAuth';
 
 export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorResponse>> {

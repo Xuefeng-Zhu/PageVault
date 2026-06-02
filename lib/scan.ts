@@ -64,9 +64,9 @@ function htmlToMarkdown(html: string): { title: string; markdown: string; text: 
   return { title, markdown: body, text };
 }
 
-// Direct HTTP fetch as a baseline crawler. Tries Apify first if creds
-// are present (via lib/apify.ts); otherwise falls back to a plain
-// fetch() with HTML→Markdown extraction.
+// Direct HTTP fetch as a baseline crawler. Tries the Apify run-sync API
+// directly if creds are present, otherwise falls back to a plain fetch()
+// with HTML→Markdown extraction.
 async function crawlOne(url: string): Promise<{
   url: string; title: string; markdown: string; text: string; capturedAt: string;
   apifyRunId: string | null;
