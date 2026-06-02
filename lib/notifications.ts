@@ -229,14 +229,22 @@ async function recordDeliveryFailure(sub: NotificationSubscription, error: strin
   // 24h window reset: if the previous failure was more than 24h ago, start
   // a new failure window. The spec says "if the gap between failures
   // exceeds 24h, the window resets." (notifications-design.md:137)
+  //
+  // Note on persistence: the local `windowReset` flag is needed because
+  // the previous version of this function updated a local `windowStart` var
+  // but never persisted it to the DB (the `if (!windowStart)` guard caught
+  // the post-reset value and skipped the write). Now we always write the
+  // window_start explicitly when we reset.
   const now = new Date();
   let effectiveCount = sub.consecutiveFailures;
-  let windowStart = sub.failureWindowStart;
+  let windowStart: string | null = sub.failureWindowStart;
+  let windowReset = false;
   if (windowStart) {
     const windowAge = now.getTime() - new Date(windowStart).getTime();
     if (windowAge > 24 * 60 * 60 * 1000) {
       effectiveCount = 0;
       windowStart = now.toISOString();
+      windowReset = true;
     }
   }
   const newCount = effectiveCount + 1;
@@ -245,7 +253,9 @@ async function recordDeliveryFailure(sub: NotificationSubscription, error: strin
     last_failure_at: now.toISOString(),
     last_failure_error: error.slice(0, 500),
   };
-  if (!windowStart) updates.failure_window_start = now.toISOString();
+  if (windowReset || !windowStart) {
+    updates.failure_window_start = now.toISOString();
+  }
   if (newCount >= 10) updates.enabled = false;
   await dbPatch(`notification_subscriptions?id=eq.${sub.id}`, updates);
 }
