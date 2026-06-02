@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireCronSecret } from '@/lib/cron-auth';
 import { getRoom } from '@/lib/insforge';
 import { runScan } from '@/lib/scan';
+import { getInsforgeBaseUrl } from '@/lib/env';
 
 const MAX_CONCURRENT = 3;
 
@@ -14,7 +15,7 @@ export async function POST(request: NextRequest) {
 
   // Fetch all enabled schedules via service-role REST
   const srk = process.env.INSFORGE_SERVICE_ROLE_KEY!;
-  const dbUrl = 'https://wga6k9at.us-east.insforge.app/api/database/records';
+  const dbUrl = `${getInsforgeBaseUrl()}/api/database/records`;
   const schedulesRes = await fetch(
     `${dbUrl}/scan_schedules?enabled=eq.true&select=id,project_id,cron_expression`,
     { headers: { 'Authorization': `Bearer ${srk}` } },

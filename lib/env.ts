@@ -42,6 +42,21 @@ export function hasApifyCreds(): boolean {
 }
 
 /**
+ * Returns the base URL for the InsForge REST API (PostgREST-compatible).
+ * Throws if INSFORGE_API_URL is not set, matching the safe-by-default
+ * posture in lib/scan.ts:281-286.
+ *
+ * Use this for raw fetch() calls; use getInsforgeClient() for SDK calls.
+ */
+export function getInsforgeBaseUrl(): string {
+  const url = process.env.INSFORGE_API_URL;
+  if (!url || url.trim().length === 0) {
+    throw new Error('INSFORGE_API_URL is not set; cannot make InsForge REST calls');
+  }
+  return url.replace(/\/+$/, '');  // strip trailing slash
+}
+
+/**
  * Returns true when AI/LLM credentials are configured.
  * Requires an OpenAI-compatible API key.
  */

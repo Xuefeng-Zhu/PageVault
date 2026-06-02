@@ -2,7 +2,7 @@
 // Outbound notification dispatcher. The scan pipeline calls enqueueNotification()
 // after every ai_explanations insert. The cron worker (every 1 min) calls
 // drainOutbox() to actually send the webhooks.
-import { getInsforgeClient } from './env';
+import { getInsforgeClient, getInsforgeBaseUrl } from './env';
 import {
   listEnabledSubscriptions,
   getSubscription,
@@ -18,7 +18,7 @@ function severityInt(s: string | null | undefined): number {
 
 // REST API base for service-role writes
 const SRK = () => process.env.INSFORGE_SERVICE_ROLE_KEY!;
-const DB = () => 'https://wga6k9at.us-east.insforge.app/api/database/records';
+const DB = () => `${getInsforgeBaseUrl()}/api/database/records`;
 
 async function dbPost(path: string, body: unknown, prefer = 'return=minimal'): Promise<Response> {
   return fetch(`${DB()}/${path}`, {

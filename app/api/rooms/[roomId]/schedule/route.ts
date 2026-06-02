@@ -4,10 +4,11 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
+import { getInsforgeBaseUrl } from '@/lib/env';
 
 const execAsync = promisify(exec);
 const SRK = () => process.env.INSFORGE_SERVICE_ROLE_KEY!;
-const DB = () => 'https://wga6k9at.us-east.insforge.app/api/database/records';
+const DB = () => `${getInsforgeBaseUrl()}/api/database/records`;
 
 interface ScheduleRequestBody {
   cronExpression?: string;
