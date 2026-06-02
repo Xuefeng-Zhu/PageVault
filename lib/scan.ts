@@ -14,6 +14,7 @@
 // generate a unique `jobId` per run. The previous-snapshot lookup is by
 // (tracked_page_id, observed_at desc) so re-running won't double-insert.
 import { createHash } from 'node:crypto';
+import { enqueueNotification } from './notifications';
 import type {
   MemoryRoom,
   PageSnapshot,
@@ -277,7 +278,12 @@ Rules:
 // InsForge REST helpers (server-side, use service role key for writes)
 // ============================================================================
 
-const BASE_URL = process.env.INSFORGE_API_URL || 'https://wga6k9at.us-east.insforge.app';
+// No hardcoded URL fallback: a misconfigured deploy must fail loudly
+// rather than silently route traffic to the wrong InsForge tenant.
+const BASE_URL = process.env.INSFORGE_API_URL;
+if (!BASE_URL) {
+  throw new Error('INSFORGE_API_URL is not set. Refusing to run scans against an unknown InsForge tenant.');
+}
 const SRK = process.env.INSFORGE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
 const ANON = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
 
@@ -350,8 +356,12 @@ async function uploadEvidence(
   // Use the SDK via dynamic import to avoid bundling issues
   try {
     const { createClient } = await import('@insforge/sdk');
+    const storageBaseUrl = process.env.NEXT_PUBLIC_INSFORGE_URL || process.env.INSFORGE_API_URL;
+    if (!storageBaseUrl) {
+      throw new Error('INSFORGE_API_URL is not set; cannot upload evidence.');
+    }
     const client = createClient({
-      baseUrl: process.env.NEXT_PUBLIC_INSFORGE_URL || process.env.INSFORGE_API_URL || 'https://wga6k9at.us-east.insforge.app',
+      baseUrl: storageBaseUrl,
       anonKey: ANON,
     });
     const blob = new Blob([content], { type: 'text/markdown' });
@@ -573,6 +583,13 @@ Analyze the change. Return JSON only.`;
     confidence: 0.85,
     created_at: new Date().toISOString(),
   });
+
+  // 8a. Enqueue notification for the dispatcher (best-effort, never blocks scan)
+  try {
+    await enqueueNotification({ aiExplanationId: explId, projectId: room.id });
+  } catch (notifErr) {
+    console.error(`[scan] failed to enqueue notification for ${crawled.url}:`, notifErr);
+  }
 
   // 9. Update the snapshot's change_type based on the analysis
   const changeTypeMap: Record<string, string> = {
