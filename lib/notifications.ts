@@ -226,13 +226,26 @@ async function recordDeliverySuccess(sub: NotificationSubscription): Promise<voi
 }
 
 async function recordDeliveryFailure(sub: NotificationSubscription, error: string): Promise<void> {
-  const newCount = sub.consecutiveFailures + 1;
+  // 24h window reset: if the previous failure was more than 24h ago, start
+  // a new failure window. The spec says "if the gap between failures
+  // exceeds 24h, the window resets." (notifications-design.md:137)
+  const now = new Date();
+  let effectiveCount = sub.consecutiveFailures;
+  let windowStart = sub.failureWindowStart;
+  if (windowStart) {
+    const windowAge = now.getTime() - new Date(windowStart).getTime();
+    if (windowAge > 24 * 60 * 60 * 1000) {
+      effectiveCount = 0;
+      windowStart = now.toISOString();
+    }
+  }
+  const newCount = effectiveCount + 1;
   const updates: Record<string, unknown> = {
     consecutive_failures: newCount,
-    last_failure_at: new Date().toISOString(),
+    last_failure_at: now.toISOString(),
     last_failure_error: error.slice(0, 500),
   };
-  if (!sub.failureWindowStart) updates.failure_window_start = new Date().toISOString();
+  if (!windowStart) updates.failure_window_start = now.toISOString();
   if (newCount >= 10) updates.enabled = false;
   await dbPatch(`notification_subscriptions?id=eq.${sub.id}`, updates);
 }
