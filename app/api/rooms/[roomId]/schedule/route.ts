@@ -57,11 +57,13 @@ async function createOrUpdateInsforgeSchedule(
 
 async function authorizeRoom(roomId: string, sessionUserId: string): Promise<NextResponse | null> {
   const room = await getRoom(roomId);
-  if (!room) {
+  // Return 404 (not 403) for both missing rooms AND non-owner access.
+  // Rationale: don't reveal room existence to non-owners. If the room has
+  // a null userId (legacy data), treat it as unowned and 404 too — being
+  // permissive on null userId would re-introduce the horizontal-priv-esc
+  // bug this check is meant to prevent.
+  if (!room || !room.userId || room.userId !== sessionUserId) {
     return NextResponse.json({ error: { code: 'NOT_FOUND', message: 'Room not found' } }, { status: 404 });
-  }
-  if (room.userId && room.userId !== sessionUserId) {
-    return NextResponse.json({ error: { code: 'FORBIDDEN', message: 'Not the room owner' } }, { status: 403 });
   }
   return null;
 }
