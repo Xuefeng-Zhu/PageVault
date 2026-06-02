@@ -171,9 +171,21 @@ async function buildPayload(
     `snapshots?id=eq.${c.snapshot_id}&select=id,final_url,observed_at`,
   ) as Array<{ final_url: string | null; observed_at: string | null }>;
   const snap = snapRows[0] ?? null;
+
+  // Look up the room so the payload has the human-readable name and the
+  // storage folder path. Best-effort: if the room is gone, fall back to
+  // the project_id (which is the same as the room's id) and a null path.
+  const roomRows = await dbGet(
+    `projects?id=eq.${sub.projectId}&select=id,name,box_root_folder_id&limit=1`,
+  ) as Array<{ id: string; name: string; box_root_folder_id: string | null }>;
+  const room = roomRows[0] ?? null;
   return {
     event: 'change.detected',
-    room: { id: sub.projectId, name: sub.projectId, storageFolderPath: null },
+    room: {
+      id: sub.projectId,
+      name: room?.name ?? sub.projectId,
+      storageFolderPath: room?.box_root_folder_id ?? null,
+    },
     change: {
       id: c.id,
       severity: String(output.severity ?? 'unknown'),
