@@ -2,11 +2,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import type { ErrorResponse } from '@/types';
 import { getChange } from '@/lib/insforge';
+import { requireSession } from '@/lib/apiAuth';
 
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ changeId: string }> }
 ): Promise<NextResponse<import('@/types').ChangeAnalysis | ErrorResponse>> {
+  const session = await requireSession();
+  if (session instanceof NextResponse) return session;
+
   try {
     const { changeId } = await params;
 
