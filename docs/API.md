@@ -71,18 +71,32 @@ type Response = RoomWithStats[];  // see types/index.ts:44
 
 **Request body:**
 ```ts
-interface CreateRoomInput {
+{
   name: string;          // 1-200 chars, required
   targetName: string;    // 1-200 chars, required
   category?: string;     // 'competitor' | 'vendor' | 'policy' | 'docs' | 'custom', default 'competitor'
-  urls?: UrlEntryInput[];  // 0-100 entries
 }
 ```
 
+> ⚠️ **The `CreateRoomInput` type in `types/index.ts:174` includes an
+> optional `urls?: UrlEntryInput[]` field, but the current handler does
+> **not** read it.** This is a known doc/code mismatch (flagged in PR #1
+> review). The contract today is: send only the three fields above. To
+> add URLs, call `POST /api/rooms/[roomId]/urls` after creation. If you
+> do pass `urls` in the body, the field is silently ignored. Don't fix
+> this with a type-narrowing change to `CreateRoomInput` — the type
+> describes the desired future state; the route handler describes the
+> current behaviour. Fix the route to honour `urls` first, then the
+> doc and the type will agree.
+
 **Response (201):**
 ```ts
-{ room: MemoryRoom, createdUrls: WatchedUrl[] }
+{ room: MemoryRoom }
 ```
+
+> Note: the type in the codebase (`RouteHandler<...>`) declares the
+> return as `MemoryRoom | ErrorResponse`, so the body is a bare
+> `MemoryRoom` (or an `{ error: ... }` envelope on failure).
 
 **Response (400, validation):**
 ```json

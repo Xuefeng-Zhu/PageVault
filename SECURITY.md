@@ -8,8 +8,18 @@
 
 **Please do not open a public GitHub issue for security findings.**
 
-Email `security@pagevault.local` (replace with the real address once
-one is provisioned) with:
+Use **one** of these channels, in order of preference:
+
+1. **GitHub private vulnerability reporting** (preferred) — on
+   <https://github.com/Xuefeng-Zhu/PageVault/security/advisories/new>.
+   This routes the report to the maintainers privately and tracks
+   disclosure timelines in the GitHub advisory database.
+2. **Email** — the project does not currently publish a dedicated
+   security mailbox. Until one is provisioned, contact the
+   repository owner directly via their GitHub profile
+   (<https://github.com/Xuefeng-Zhu>) and request a private channel.
+
+Either way, include:
 
 - A description of the vulnerability and reproduction steps.
 - The commit or version affected.
