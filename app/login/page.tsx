@@ -4,7 +4,10 @@ import { useState } from 'react';
 import { signIn } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Database, Eye, EyeOff, AlertCircle } from 'lucide-react';
+import { Database, Eye, EyeOff, AlertCircle, ArrowRight, ArrowUpRight, Camera, Box, Sparkles } from 'lucide-react';
+import { Input } from '@/components/ui/Input';
+import { Button } from '@/components/ui/Button';
+import { Spinner } from '@/components/ui/Primitives';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -18,20 +21,13 @@ export default function LoginPage() {
     e.preventDefault();
     setError('');
     setLoading(true);
-
     try {
-      const result = await signIn('credentials', {
-        email,
-        password,
-        redirect: false,
-      });
-
+      const result = await signIn('credentials', { email, password, redirect: false });
       if (result?.error) {
-        setError('Invalid email or password. Please try again.');
+        setError('Invalid credentials. Please verify your filing number and try again.');
         setLoading(false);
         return;
       }
-
       router.push('/dashboard');
       router.refresh();
     } catch {
@@ -41,142 +37,226 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex" style={{ backgroundColor: '#0f172a' }}>
-      {/* Left side - branding */}
-      <div className="hidden lg:flex lg:w-1/2 flex-col justify-between p-12">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-[#2563eb] flex items-center justify-center">
-            <Database className="w-5 h-5 text-white" />
+    <div className="min-h-screen grid lg:grid-cols-2 bg-paper text-ink">
+      {/* === Left panel — "dossier cover" === */}
+      <aside className="relative hidden lg:flex flex-col justify-between p-12 bg-ink text-paper overflow-hidden">
+        {/* Decorative diagonals */}
+        <div className="absolute inset-0 bg-diagonal opacity-[0.05] pointer-events-none" />
+        {/* Ruled lines */}
+        <div className="absolute inset-0 bg-ruled opacity-30 pointer-events-none" style={{ backgroundSize: '100% 32px' }} />
+
+        <div className="relative">
+          <Link href="/" className="inline-flex items-center gap-3 group">
+            <div className="relative w-10 h-10 flex items-center justify-center">
+              <div className="absolute inset-0 border border-paper" />
+              <div className="absolute inset-1.5 bg-paper" />
+              <Database className="relative w-4 h-4 text-ink" strokeWidth={1.75} />
+            </div>
+            <div className="flex flex-col leading-none">
+              <span className="font-display text-[1.375rem] tracking-[-0.02em] text-paper">PageVault</span>
+              <span className="font-mono text-[0.625rem] uppercase tracking-archive text-paper/50 mt-1">
+                The Archive
+              </span>
+            </div>
+          </Link>
+        </div>
+
+        <div className="relative max-w-md">
+          {/* Top meta */}
+          <div className="flex items-center gap-3 mb-8 font-mono text-mono-sm uppercase tracking-archive text-paper/50">
+            <span>Restricted · For credentialed analysts</span>
+            <span className="h-px flex-1 bg-paper/20" />
+            <span className="stamp stamp-enter" style={{ animationDelay: '0.3s' }}>
+              Members only
+            </span>
           </div>
-          <span className="font-bold text-xl text-white">PageVault</span>
-        </div>
 
-        <div className="space-y-6">
-          <h1 className="text-4xl font-bold text-white leading-tight">
-            Your Memory Layer<br />for the Web
+          <h1 className="font-display text-display-2xl text-paper leading-[0.95] mb-6 tracking-[-0.03em]">
+            Sign in to<br />
+            <span className="italic text-paper/60">read the record.</span>
           </h1>
-          <p className="text-lg text-white/70 max-w-md">
-            Monitor competitors, vendors, and policy targets. When something changes, our AI explains what happened and why it matters.
+          <p className="font-body text-body-lg text-paper/70 leading-relaxed mb-10">
+            Your rooms, your snapshots, your briefs. The archive is read-only on this side —
+            edits are sealed in Box, and only the LLM is allowed to annotate.
           </p>
+
+          {/* Mini pipeline */}
+          <div className="border-t border-paper/15 pt-6 space-y-4">
+            {[
+              { icon: Camera, label: 'Capture', meta: 'Apify' },
+              { icon: Box, label: 'Preserve', meta: 'Box' },
+              { icon: Sparkles, label: 'Explain', meta: 'LLM' },
+            ].map((s, i) => (
+              <div key={s.label} className="flex items-center gap-4">
+                <span className="font-mono text-mono-sm text-paper/40 tabular w-6">
+                  {String(i + 1).padStart(2, '0')}
+                </span>
+                <span className="w-8 h-8 flex items-center justify-center border border-paper/20">
+                  <s.icon className="w-3.5 h-3.5 text-paper/70" strokeWidth={1.5} />
+                </span>
+                <span className="font-display text-display-sm text-paper">{s.label}</span>
+                <span className="ml-auto font-mono text-mono-sm text-paper/50 uppercase tracking-archive">
+                  {s.meta}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
 
-        <div className="text-sm text-white/40">
-          © 2024 PageVault Inc. All rights reserved.
+        <div className="relative flex items-center justify-between font-mono text-mono-sm uppercase tracking-archive text-paper/40">
+          <span>© 2026 PageVault Inc</span>
+          <span className="flex items-center gap-2">
+            <span className="w-1.5 h-1.5 bg-signal-bright pulse-dot" />
+            <span>All systems nominal</span>
+          </span>
         </div>
-      </div>
+      </aside>
 
-      {/* Right side - login form */}
-      <div className="flex-1 flex items-center justify-center p-8">
+      {/* === Right panel — form === */}
+      <main className="flex items-center justify-center p-6 sm:p-10 lg:p-16 bg-paper">
         <div className="w-full max-w-md">
           {/* Mobile logo */}
-          <div className="lg:hidden flex items-center justify-center gap-3 mb-8">
-            <div className="w-10 h-10 rounded-lg bg-[#2563eb] flex items-center justify-center">
-              <Database className="w-5 h-5 text-white" />
+          <Link href="/" className="lg:hidden inline-flex items-center gap-3 mb-10">
+            <div className="relative w-9 h-9 flex items-center justify-center">
+              <div className="absolute inset-0 border border-ink" />
+              <div className="absolute inset-1 bg-ink" />
+              <Database className="relative w-4 h-4 text-paper" strokeWidth={1.75} />
             </div>
-            <span className="font-bold text-xl text-white">PageVault</span>
+            <span className="font-display text-[1.25rem]">PageVault</span>
+          </Link>
+
+          {/* Section header */}
+          <div className="section-label mb-6">
+            <span>Access · 001</span>
           </div>
 
-          <div className="bg-white rounded-2xl p-8 shadow-2xl">
-            <div className="text-center mb-8">
-              <h2 className="text-2xl font-bold text-[#131b2e]">Welcome back</h2>
-              <p className="text-sm text-[#434655] mt-2">Sign in to access your memory rooms</p>
+          <h2 className="font-display text-display-lg text-ink leading-[1.05] mb-2">
+            Welcome back.
+          </h2>
+          <p className="font-body text-body-md text-ink-2 mb-8">
+            Use the credentials filed against your account.
+          </p>
+
+          {error && (
+            <div className="mb-6 flex items-start gap-3 p-4 bg-ember-wash border border-ember/40">
+              <AlertCircle className="w-4 h-4 text-ember shrink-0 mt-0.5" strokeWidth={1.75} />
+              <p className="font-body text-body-sm text-ember leading-relaxed">{error}</p>
             </div>
+          )}
 
-            {error && (
-              <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
-                <AlertCircle className="w-5 h-5 text-red-500 flex-shrink-0" />
-                <p className="text-sm text-red-700">{error}</p>
-              </div>
-            )}
+          <form onSubmit={handleSubmit} className="space-y-5">
+            <Input
+              label="Email"
+              type="email"
+              placeholder="you@example.com"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              autoComplete="email"
+              labelMeta="01 / 02"
+            />
 
-            <form onSubmit={handleSubmit} className="space-y-5">
-              <div>
-                <label htmlFor="email" className="block text-sm font-medium text-[#131b2e] mb-2">
-                  Email address
-                </label>
-                <input
-                  id="email"
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="you@example.com"
-                  required
-                  className="w-full px-4 py-3 bg-[#f8fafc] border border-[#e2e8f0] rounded-lg text-[#131b2e] placeholder:text-[#434655]/50 focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 focus:border-[#2563eb] transition-all"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="password" className="block text-sm font-medium text-[#131b2e] mb-2">
-                  Password
-                </label>
-                <div className="relative">
-                  <input
-                    id="password"
-                    type={showPassword ? 'text' : 'password'}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Enter your password"
-                    required
-                    className="w-full px-4 py-3 bg-[#f8fafc] border border-[#e2e8f0] rounded-lg text-[#131b2e] placeholder:text-[#434655]/50 focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 focus:border-[#2563eb] transition-all pr-12"
-                  />
+            <div>
+              <Input
+                label="Password"
+                type={showPassword ? 'text' : 'password'}
+                placeholder="••••••••••"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                autoComplete="current-password"
+                labelMeta="02 / 02"
+                rightAdornment={
                   <button
                     type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-[#434655] hover:text-[#131b2e] transition-colors"
+                    onClick={() => setShowPassword((s) => !s)}
+                    className="text-ink-3 hover:text-ink transition-colors"
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    tabIndex={-1}
                   >
-                    {showPassword ? (
-                      <EyeOff className="w-5 h-5" />
-                    ) : (
-                      <Eye className="w-5 h-5" />
-                    )}
+                    {showPassword ? <EyeOff /> : <Eye />}
                   </button>
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full py-3 px-4 rounded-lg font-bold text-white transition-all hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
-                style={{ backgroundColor: '#2563eb' }}
-              >
-                {loading ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <svg className="animate-spin h-5 w-5 text-white" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                    </svg>
-                    Signing in...
-                  </span>
-                ) : (
-                  'Sign in'
-                )}
-              </button>
-            </form>
-
-            <div className="mt-6 text-center">
-              <p className="text-sm text-[#434655]">
-                Don't have an account?{' '}
-                <Link href="/dashboard/rooms/new" className="text-[#2563eb] hover:underline font-medium">
-                  Get started free
+                }
+              />
+              <div className="flex items-center justify-end mt-2">
+                <Link
+                  href="#"
+                  className="font-mono text-mono-sm uppercase tracking-archive text-ink-3 hover:text-ink transition-colors"
+                >
+                  Forgot filing number?
                 </Link>
-              </p>
+              </div>
             </div>
 
-            {/* Demo credentials hint */}
-            <div className="mt-6 p-4 bg-[#f2f3ff] rounded-lg">
-              <p className="text-xs text-[#434655] text-center">
-                <span className="font-medium text-[#2563eb]">Demo:</span> admin@example.com / demo123
-              </p>
+            <Button
+              type="submit"
+              block
+              size="lg"
+              disabled={loading}
+              icon={loading ? undefined : <ArrowRight className="w-4 h-4" />}
+              iconRight={loading ? undefined : undefined}
+            >
+              {loading ? (
+                <span className="inline-flex items-center gap-2">
+                  <Spinner size="sm" />
+                  <span>Verifying credentials…</span>
+                </span>
+              ) : (
+                'Sign in to the archive'
+              )}
+            </Button>
+          </form>
+
+          {/* Divider */}
+          <div className="my-7 flex items-center gap-3">
+            <span className="h-px flex-1 bg-rule" />
+            <span className="font-mono text-mono-sm text-ink-3 uppercase tracking-archive">or</span>
+            <span className="h-px flex-1 bg-rule" />
+          </div>
+
+          {/* Secondary action */}
+          <Link
+            href="/dashboard/rooms/new"
+            className="group flex items-center justify-between gap-4 p-4 border border-rule bg-surface-raised hover:border-ink hover:bg-paper-2 transition-all duration-150"
+          >
+            <div>
+              <div className="font-display text-body-lg text-ink leading-tight">
+                New to PageVault?
+              </div>
+              <div className="font-mono text-mono-sm text-ink-3 uppercase tracking-archive mt-0.5">
+                Open your first room — free
+              </div>
+            </div>
+            <ArrowUpRight className="w-4 h-4 text-ink-2 group-hover:text-ink group-hover:-translate-y-0.5 group-hover:translate-x-0.5 transition-transform" />
+          </Link>
+
+          {/* Demo credentials hint */}
+          <div className="mt-7 p-4 border border-dashed border-rule">
+            <div className="font-mono text-mono-sm uppercase tracking-archive text-ink-3 mb-2">
+              Demo filing
+            </div>
+            <div className="grid grid-cols-2 gap-3 font-mono text-mono-sm">
+              <div>
+                <div className="text-ink-4 uppercase tracking-archive text-[0.625rem]">Email</div>
+                <div className="text-ink-2">admin@example.com</div>
+              </div>
+              <div>
+                <div className="text-ink-4 uppercase tracking-archive text-[0.625rem]">Password</div>
+                <div className="text-ink-2">demo123</div>
+              </div>
             </div>
           </div>
 
-          <p className="mt-8 text-center text-sm text-white/50">
-            <Link href="/" className="hover:text-white transition-colors">
-              ← Back to home
+          <p className="mt-8 text-center">
+            <Link
+              href="/"
+              className="font-mono text-mono-sm text-ink-3 hover:text-ink transition-colors inline-flex items-center gap-1.5"
+            >
+              ← Back to the cover
             </Link>
           </p>
         </div>
-      </div>
+      </main>
     </div>
   );
 }
