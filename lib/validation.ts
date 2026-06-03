@@ -130,6 +130,24 @@ export function validateUrlBatch(
 }
 
 /**
+ * Map a frequency preset (in hours) to a 5-field cron expression.
+ * Returns null for unknown / missing values so callers can fall
+ * back to a safe default. The cadence keys match the new-room
+ * wizard: '1' hourly, '6' every 6h, '24' daily, '168' weekly.
+ */
+export function frequencyToCronExpression(
+  frequency: string | undefined | null,
+): string | null {
+  switch ((frequency ?? '').trim()) {
+    case '1':   return '0 * * * *';      // every hour
+    case '6':   return '0 */6 * * *';    // every 6 hours
+    case '24':  return '0 2 * * *';      // daily at 02:00 UTC
+    case '168': return '0 2 * * 0';      // weekly on Sunday 02:00 UTC
+    default:    return null;
+  }
+}
+
+/**
  * Build normalized NewWatchedUrl records from a batch of URL entries.
  * Produces one normalized record per entry, each associated with the given room id.
  */

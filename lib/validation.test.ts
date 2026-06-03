@@ -10,6 +10,7 @@ import {
   validateUrlEntry,
   validateUrlBatch,
   buildWatchedUrlRows,
+  frequencyToCronExpression,
 } from './validation';
 
 describe('normalizeCategory', () => {
@@ -237,5 +238,24 @@ describe('validation property checks', () => {
       ),
       { numRuns: 50 }
     );
+  });
+});
+
+describe('frequencyToCronExpression', () => {
+  it('maps the four wizard presets to the right cron expressions', () => {
+    expect(frequencyToCronExpression('1')).toBe('0 * * * *');
+    expect(frequencyToCronExpression('6')).toBe('0 */6 * * *');
+    expect(frequencyToCronExpression('24')).toBe('0 2 * * *');
+    expect(frequencyToCronExpression('168')).toBe('0 2 * * 0');
+  });
+  it('returns null for unknown or missing values so the API can fall back', () => {
+    expect(frequencyToCronExpression('')).toBeNull();
+    expect(frequencyToCronExpression('7')).toBeNull();
+    expect(frequencyToCronExpression('hourly')).toBeNull();
+    expect(frequencyToCronExpression(null)).toBeNull();
+    expect(frequencyToCronExpression(undefined)).toBeNull();
+  });
+  it('trims whitespace around the input', () => {
+    expect(frequencyToCronExpression('  24  ')).toBe('0 2 * * *');
   });
 });

@@ -76,6 +76,11 @@ export default function NewRoomPage() {
         body: JSON.stringify({
           name: formData.name,
           targetName: formData.name.split(' ')[0].toLowerCase() + '.com',
+          // Pass the user-selected cadence so the room's default
+          // schedule matches what they confirmed in the review step.
+          // Without this, the API falls back to daily 3am regardless
+          // of the wizard's selection.
+          frequency: formData.frequency,
         }),
       });
       if (!roomRes.ok) {
@@ -84,10 +89,18 @@ export default function NewRoomPage() {
       }
       const room = await roomRes.json();
       if (formData.urls.length > 0) {
+        // The API expects UrlEntryInput[] (objects with a `url` field),
+        // not a raw string[]. Map before sending so validation
+        // passes. Without this, validateUrlBatch returns
+        // "url is required" for each entry and the response is
+        // discarded, so the user sees "Room opened" but the room
+        // has no watched URLs.
         await fetch(`/api/rooms/${room.id}/urls`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ urls: formData.urls }),
+          body: JSON.stringify({
+            urls: formData.urls.map((url) => ({ url })),
+          }),
         });
       }
       try {
