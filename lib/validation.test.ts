@@ -83,8 +83,10 @@ describe('validateRoomField', () => {
   it('accepts exactly 200 chars and trims', () => {
     const r = validateRoomField('  ' + 'a'.repeat(200), 'name');
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.value).toBe('a'.repeat(200));
-    expect(r.value.length).toBe(200);
+    if (r.ok) {
+      expect(r.value).toBe('a'.repeat(200));
+      expect(r.value.length).toBe(200);
+    }
   });
 
   it('trims surrounding whitespace on success', () => {
