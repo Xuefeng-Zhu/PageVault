@@ -1,7 +1,7 @@
 // API route: GET /api/changes/[changeId]
 import { NextRequest, NextResponse } from 'next/server';
 import type { ErrorResponse } from '@/types';
-import { getChange } from '@/lib/insforge';
+import { getChangeForUser } from '@/lib/insforge';
 import { requireSession } from '@/lib/apiAuth';
 
 export async function GET(
@@ -14,7 +14,11 @@ export async function GET(
   try {
     const { changeId } = await params;
 
-    const change = await getChange(changeId);
+    // Owner scoping via the join ai_explanations -> snapshots ->
+    // tracked_pages -> projects -> owner_id. A 404 (not 403) on a
+    // non-owned change is intentional — returning 403 would let a
+    // probe confirm the change exists for another user.
+    const change = await getChangeForUser(changeId, session.user.id);
     if (!change) {
       return NextResponse.json(
         { error: { code: 'NOT_FOUND', message: 'Change not found' } },

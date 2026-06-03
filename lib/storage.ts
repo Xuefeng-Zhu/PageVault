@@ -17,12 +17,14 @@ export const STORAGE_ROOT = 'pagevault';
 
 /**
  * Returns true when InsForge storage credentials are configured.
- * Storage has no separate "creds" — it rides on the InsForge client.
+ * Storage has no separate "creds" — it rides on the InsForge client, and
+ * the client is constructed from the anon key. (The service-role key
+ * is used for direct PostgREST writes but the SDK is anon-key only.)
  */
 export function hasStorageCreds(): boolean {
   return (
     isPresent(process.env.INSFORGE_API_URL) &&
-    (isPresent(process.env.INSFORGE_SERVICE_ROLE_KEY) || isPresent(process.env.INSFORGE_ANON_KEY))
+    isPresent(process.env.INSFORGE_ANON_KEY)
   );
 }
 
@@ -35,9 +37,24 @@ export function hasStorageCreds(): boolean {
  */
 export async function createStorageFolder(name: string, parentPath?: string): Promise<string> {
   if (!hasStorageCreds()) {
+    const haveUrl = isPresent(process.env.INSFORGE_API_URL);
+    const haveAnon = isPresent(process.env.INSFORGE_ANON_KEY);
+    const haveSrk  = isPresent(process.env.INSFORGE_SERVICE_ROLE_KEY);
+    const missing = [
+      !haveUrl  && 'INSFORGE_API_URL',
+      !haveAnon && 'INSFORGE_ANON_KEY',
+    ].filter(Boolean).join(' and ');
+    // Note: INSFORGE_SERVICE_ROLE_KEY is intentionally NOT sufficient here
+    // because the storage SDK client is built with the anon key, not the
+    // service-role key. (Direct PostgREST writes elsewhere can use the
+    // service-role key; the storage SDK can't.)
     throw new Error(
-      'InsForge storage is not configured. Set INSFORGE_API_URL and INSFORGE_SERVICE_ROLE_KEY ' +
-      '(or INSFORGE_ANON_KEY) in your environment to enable evidence storage.'
+      'InsForge storage is not configured. ' +
+      (missing
+        ? `Missing ${missing}. `
+        : 'Unexpected: all keys are present but the SDK init still failed. ') +
+      'Set INSFORGE_API_URL and INSFORGE_ANON_KEY in your environment to enable evidence storage. ' +
+      `(INSFORGE_SERVICE_ROLE_KEY=${haveSrk ? 'set' : 'unset'} is not enough on its own.)`
     );
   }
 

@@ -447,15 +447,45 @@ export async function listWatchedUrls(roomId: string): Promise<WatchedUrl[]> {
 // when scan functionality is reintroduced.
 
 export async function getChange(changeId: string): Promise<ChangeAnalysis | null> {
-  // Look up via the joined ai_explanations + snapshots tables.
+  return getChangeInternal(changeId, /* ownerIdFilter */ null);
+}
+
+/**
+ * Like {@link getChange} but additionally filters by the owning user.
+ * Returns null if the change doesn't exist OR if the user doesn't own the
+ * project that owns the tracked page that owns the snapshot that the
+ * change explains. The auth check in the route should use 404 (not 403)
+ * for the not-owned case so a probe cannot confirm the change exists
+ * for some other user.
+ */
+export async function getChangeForUser(
+  changeId: string,
+  userId: string,
+): Promise<ChangeAnalysis | null> {
+  if (!userId) return null;
+  return getChangeInternal(changeId, userId);
+}
+
+async function getChangeInternal(
+  changeId: string,
+  ownerIdFilter: string | null,
+): Promise<ChangeAnalysis | null> {
+  // Look up via the joined ai_explanations + snapshots + tracked_pages + projects tables.
+  // The deep join lets us filter on projects.owner_id in a single round-trip
+  // (the alternative — 4 sequential calls — is slower and racy).
+  const select =
+    'id,snapshot_id,previous_snapshot_id,output_json,confidence,created_at,' +
+    'snapshots!snapshot_id(tracked_page_id,change_type,tracked_pages!tracked_page_id(project_id,projects!project_id(owner_id)))';
+  const filters = ownerIdFilter
+    ? `id=eq.${changeId}&snapshots.tracked_pages.projects.owner_id=eq.${ownerIdFilter}`
+    : `id=eq.${changeId}`;
   const rows = await sdkQuery<{
     id: string; snapshot_id: string; previous_snapshot_id: string | null;
     output_json: unknown; confidence: number | null; created_at: string;
     tracked_page_id: string | null; change_type: string | null;
   }>(
     'ai_explanations',
-    { select: 'id,snapshot_id,previous_snapshot_id,output_json,confidence,created_at,snapshots!snapshot_id(tracked_page_id,change_type)',
-      filters: `id=eq.${changeId}`, limit: 1 }
+    { select, filters, limit: 1 }
   );
   if (rows.length === 0) return null;
   const row = rows[0];
