@@ -3,9 +3,24 @@
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { ChevronRight, ExternalLink, Database, Globe, Calendar, CheckCircle, AlertTriangle } from 'lucide-react';
+import {
+  ChevronRight,
+  ExternalLink,
+  Database,
+  Globe,
+  Calendar,
+  CheckCircle2,
+  AlertTriangle,
+  ArrowUpRight,
+  Radar,
+  Clock,
+} from 'lucide-react';
 import { SeverityBadge } from '@/components/dashboard/SeverityBadge';
 import { Button } from '@/components/ui/Button';
+import { Badge } from '@/components/ui/Badge';
+import { Card } from '@/components/ui/Card';
+import { SectionHeader, EmptyState, Spinner, Progress } from '@/components/ui/Primitives';
+import { StatCard } from '@/components/dashboard/StatCard';
 import type { RoomDetailResponse, WatchedUrl, ChangeAnalysis } from '@/types';
 
 export default function RoomDetailPage() {
@@ -22,7 +37,7 @@ export default function RoomDetailPage() {
         const res = await fetch(`/api/rooms/${roomId}`, { cache: 'no-store' });
         if (!res.ok) {
           if (res.status === 404) {
-            setError('Room not found');
+            setError('Room not found in the archive.');
           } else {
             throw new Error('Failed to fetch room');
           }
@@ -45,7 +60,6 @@ export default function RoomDetailPage() {
     try {
       const res = await fetch(`/api/rooms/${roomId}/scan`, { method: 'POST', cache: 'no-store' });
       if (!res.ok) throw new Error('Scan failed');
-      // Refresh room data after scan
       const roomRes = await fetch(`/api/rooms/${roomId}`, { cache: 'no-store' });
       if (roomRes.ok) {
         const json: RoomDetailResponse = await roomRes.json();
@@ -60,15 +74,15 @@ export default function RoomDetailPage() {
 
   if (loading) {
     return (
-      <div className="max-w-[1600px] mx-auto bg-[#f8fafc] min-h-screen p-8">
-        <div className="animate-pulse space-y-6">
-          <div className="h-4 bg-gray-200 rounded w-48" />
-          <div className="h-12 bg-gray-200 rounded w-1/2" />
-          <div className="grid grid-cols-4 gap-6">
-            {Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="h-24 bg-gray-200 rounded-2xl" />
-            ))}
-          </div>
+      <div className="space-y-8 fade-up-1">
+        <div className="h-4 w-48 bg-rule animate-pulse" />
+        <div className="h-12 w-1/2 bg-rule animate-pulse" />
+        <div className="grid grid-cols-4 gap-px bg-rule border border-rule">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="bg-surface-raised h-32 flex items-center justify-center">
+              <Spinner size="sm" />
+            </div>
+          ))}
         </div>
       </div>
     );
@@ -76,124 +90,195 @@ export default function RoomDetailPage() {
 
   if (error || !data) {
     return (
-      <div className="max-w-5xl mx-auto">
-        <div className="bg-white border border-[#e2e8f0] rounded-2xl text-center py-12">
-          <h2 className="text-xl font-semibold text-[#131b2e] mb-2">{error || 'Room not found'}</h2>
-          <p className="text-sm text-[#434655] mb-4">The room you're looking for doesn't exist.</p>
-          <Link href="/dashboard">
-            <Button variant="secondary">Back to Dashboard</Button>
-          </Link>
-        </div>
+      <div className="max-w-2xl mx-auto pt-20">
+        <Card padding="xl">
+          <div className="text-center">
+            <div className="w-12 h-12 border border-ember mx-auto mb-5 flex items-center justify-center">
+              <AlertTriangle className="w-5 h-5 text-ember" strokeWidth={1.5} />
+            </div>
+            <h2 className="font-display text-display-md text-ink mb-2">{error || 'Room not found'}</h2>
+            <p className="font-body text-body-md text-ink-2 mb-6">
+              The filing you're looking for isn't in the archive. It may have been sealed or never opened.
+            </p>
+            <Link href="/dashboard">
+              <Button variant="secondary">← Back to overview</Button>
+            </Link>
+          </div>
+        </Card>
       </div>
     );
   }
 
   const { room, watchedUrls, latestScan, changes } = data;
+
+  const highCount = changes.filter((c) => c.severity === 'high').length;
+  const mediumCount = changes.filter((c) => c.severity === 'medium').length;
+  const lowCount = changes.filter((c) => c.severity === 'low').length;
+
   const stats = [
-    { label: 'Total URLs', value: watchedUrls.length, icon: Globe },
-    { label: 'Monitored Changes', value: changes.length, icon: AlertTriangle },
+    { label: 'URLs watched', value: watchedUrls.length, icon: Globe },
+    { label: 'Changes', value: changes.length, icon: AlertTriangle },
     {
-      label: 'Last Scan',
+      label: 'Last scan',
       value: latestScan?.completedAt
-        ? new Date(latestScan.completedAt).toLocaleDateString()
-        : 'Never',
+        ? new Date(latestScan.completedAt).toLocaleDateString('en-US', { month: 'short', day: '2-digit' })
+        : '—',
       icon: Calendar,
     },
     {
       label: 'Health',
-      value: latestScan?.status === 'completed' ? 'Good' : latestScan?.status === 'running' ? 'Scanning...' : 'Pending',
-      icon: CheckCircle,
+      value: latestScan?.status === 'completed' ? 'Nominal' : latestScan?.status === 'running' ? 'Scanning' : 'Pending',
+      icon: CheckCircle2,
     },
   ];
 
   return (
-    <div className="max-w-[1600px] mx-auto bg-[#f8fafc] min-h-screen p-8">
+    <div className="space-y-10 fade-up-1">
       {/* Breadcrumb */}
-      <nav className="flex items-center gap-2 text-sm text-[#434655] mb-6">
-        <Link href="/dashboard" className="hover:text-[#2563eb]">Dashboard</Link>
-        <ChevronRight className="w-4 h-4" />
-        <span className="text-[#131b2e] font-medium">{room.name}</span>
+      <nav className="flex items-center gap-2 font-mono text-mono-sm text-ink-3 uppercase tracking-archive">
+        <Link href="/dashboard" className="hover:text-ink transition-colors">Overview</Link>
+        <ChevronRight className="w-3 h-3" />
+        <span className="text-ink">Rooms</span>
+        <ChevronRight className="w-3 h-3" />
+        <span className="text-ink truncate max-w-[260px]">{room.name}</span>
       </nav>
 
       {/* Header */}
-      <div className="flex items-start justify-between mb-8">
-        <div className="flex items-center gap-4">
-          <div className="w-14 h-14 rounded-xl bg-[#2563eb] flex items-center justify-center text-white text-2xl font-bold">
-            {room.name.charAt(0)}
+      <header className="flex flex-wrap items-end justify-between gap-6 pb-6 border-b border-rule">
+        <div className="flex items-start gap-5 min-w-0">
+          <div className="relative w-14 h-14 flex items-center justify-center shrink-0">
+            <div className="absolute inset-0 border border-ink" />
+            <div className="absolute inset-1.5 bg-ink" />
+            <span className="relative font-display text-[1.5rem] text-paper">
+              {room.name.charAt(0)}
+            </span>
           </div>
-          <div>
-            <h1 className="text-2xl font-bold text-[#131b2e]">{room.name}</h1>
-            <div className="flex items-center gap-3 mt-2">
-              <span className="text-sm text-[#434655] font-mono">{room.targetName}</span>
-              <span className="text-sm text-[#434655]">•</span>
-              <span className="text-sm text-[#434655]">
-                Last scanned: {latestScan?.completedAt ? new Date(latestScan.completedAt).toLocaleDateString() : 'Never'}
-              </span>
+          <div className="min-w-0">
+            <div className="section-label mb-2">
+              <span>Room · {room.id.slice(0, 8)}</span>
+              <span className="ml-auto">Live</span>
             </div>
+            <h1 className="font-display text-display-lg text-ink leading-[1.05] truncate">
+              {room.name}
+            </h1>
+            <p className="font-mono text-mono-sm text-ink-3 mt-2 truncate">
+              {room.targetName}
+            </p>
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           {room.storageFolderPath && (
             <a
               href={`/api/storage/folder/${encodeURIComponent(room.storageFolderPath)}`}
               target="_blank"
               rel="noopener noreferrer"
-              className="flex items-center gap-2 px-4 py-2 bg-white border border-[#e2e8f0] text-[#131b2e] text-sm font-medium rounded-lg hover:bg-[#f8fafc] transition-colors"
             >
-              <Database className="w-4 h-4" />
-              Open in Storage
-              <ExternalLink className="w-3 h-3" />
+              <Button variant="secondary" icon={<Database className="w-4 h-4" />} iconRight={<ExternalLink className="w-3 h-3" />}>
+                Open in Box
+              </Button>
             </a>
           )}
-          <Button onClick={handleRunScan} loading={scanning}>
-            Run Scan
+          <Button onClick={handleRunScan} loading={scanning} icon={scanning ? undefined : <Radar className="w-4 h-4" />}>
+            {scanning ? 'Scanning…' : 'Run scan'}
           </Button>
         </div>
-      </div>
+      </header>
 
-      {/* Stats Row */}
-      <div className="grid grid-cols-4 gap-6 mb-8">
-        {stats.map((stat) => (
-          <div key={stat.label} className="bg-white border border-[#e2e8f0] rounded-2xl p-5">
-            <div className="flex items-center justify-between mb-3">
-              <span className="text-xs font-medium text-[#434655] uppercase tracking-wider">{stat.label}</span>
-              <stat.icon className="w-4 h-4 text-[#2563eb]" />
+      {/* Stats */}
+      <section>
+        <SectionHeader
+          number="I"
+          label="Vital signs"
+          meta={`As of ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`}
+          className="mb-5"
+        />
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-rule border border-rule">
+          {stats.map((s) => (
+            <div key={s.label} className="bg-surface-raised">
+              <StatCard label={s.label} value={s.value} icon={s.icon} />
             </div>
-            <div className="flex items-end justify-between">
-              <span className="text-3xl font-bold text-[#131b2e]">{stat.value}</span>
+          ))}
+        </div>
+      </section>
+
+      {/* Severity mix bar */}
+      {changes.length > 0 && (
+        <section>
+          <SectionHeader number="II" label="Severity mix" meta={`${changes.length} total`} className="mb-5" />
+          <div className="border border-rule bg-surface-raised p-5">
+            <div className="flex items-stretch h-2 mb-3 gap-px">
+              <div className="bg-ember-bright" style={{ flex: highCount || 0.001 }} />
+              <div className="bg-signal-bright" style={{ flex: mediumCount || 0.001 }} />
+              <div className="bg-ink-3" style={{ flex: lowCount || 0.001 }} />
+            </div>
+            <div className="grid grid-cols-3 gap-4">
+              <div>
+                <div className="font-mono text-mono-sm text-ink-3 uppercase tracking-archive">Critical</div>
+                <div className="font-display text-display-sm text-ink tabular">{highCount}</div>
+              </div>
+              <div>
+                <div className="font-mono text-mono-sm text-ink-3 uppercase tracking-archive">Notable</div>
+                <div className="font-display text-display-sm text-ink tabular">{mediumCount}</div>
+              </div>
+              <div>
+                <div className="font-mono text-mono-sm text-ink-3 uppercase tracking-archive">Minor</div>
+                <div className="font-display text-display-sm text-ink tabular">{lowCount}</div>
+              </div>
             </div>
           </div>
-        ))}
-      </div>
+        </section>
+      )}
 
-      <div className="grid grid-cols-12 gap-6">
-        {/* Left: Watched URLs */}
-        <div className="col-span-7">
-          <div className="bg-white border border-[#e2e8f0] rounded-2xl p-6">
-            <h2 className="text-lg font-semibold text-[#131b2e] mb-4">Watched URLs</h2>
+      {/* Two-column: URLs + changes */}
+      <div className="grid grid-cols-12 gap-8">
+        {/* Watched URLs */}
+        <section className="col-span-12 lg:col-span-7">
+          <SectionHeader
+            number="III"
+            label="Subjects under observation"
+            meta={`${watchedUrls.length} URLs`}
+            className="mb-5"
+          />
+          <div className="border border-rule bg-surface-raised">
             {watchedUrls.length === 0 ? (
-              <p className="text-sm text-[#434655]">No URLs added yet.</p>
+              <EmptyState
+                icon={<Globe className="w-5 h-5" strokeWidth={1.5} />}
+                title="No URLs filed"
+                description="Add URLs to start watching. Each one becomes a separate filing in this room."
+              />
             ) : (
               <table className="w-full">
                 <thead>
-                  <tr className="border-b border-[#e2e8f0]">
-                    <th className="pb-3 text-left text-xs font-medium text-[#434655] uppercase tracking-wider">URL</th>
-                    <th className="pb-3 text-left text-xs font-medium text-[#434655] uppercase tracking-wider">Page Type</th>
-                    <th className="pb-3 text-left text-xs font-medium text-[#434655] uppercase tracking-wider">Added</th>
+                  <tr className="border-b border-rule bg-paper-2">
+                    <th className="px-5 py-3 text-left font-mono text-mono-sm text-ink-3 uppercase tracking-archive">
+                      URL
+                    </th>
+                    <th className="px-5 py-3 text-left font-mono text-mono-sm text-ink-3 uppercase tracking-archive">
+                      Type
+                    </th>
+                    <th className="px-5 py-3 text-left font-mono text-mono-sm text-ink-3 uppercase tracking-archive">
+                      Filed
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
                   {watchedUrls.map((url) => (
-                    <tr key={url.id} className="border-b border-[#e2e8f0] last:border-0 hover:bg-[#f8fafc] transition-colors">
-                      <td className="py-4">
+                    <tr key={url.id} className="group border-b border-rule last:border-0 hover:bg-paper-2 transition-colors">
+                      <td className="px-5 py-4">
                         <div className="flex flex-col gap-1">
-                          <span className="text-sm text-[#131b2e] font-medium">{url.label || 'Unnamed'}</span>
-                          <span className="text-xs text-[#434655] font-mono truncate max-w-[300px]">{url.url}</span>
+                          <span className="font-body text-body-md text-ink">
+                            {url.label || 'Unnamed'}
+                          </span>
+                          <span className="font-mono text-mono-sm text-ink-3 truncate max-w-[300px]">
+                            {url.url}
+                          </span>
                         </div>
                       </td>
-                      <td className="py-4 text-sm text-[#434655] capitalize">{url.pageType}</td>
-                      <td className="py-4 text-sm text-[#434655]">
-                        {new Date(url.createdAt).toLocaleDateString()}
+                      <td className="px-5 py-4">
+                        <Badge variant="paper" size="sm">{url.pageType}</Badge>
+                      </td>
+                      <td className="px-5 py-4 font-mono text-mono-sm text-ink-3 tabular">
+                        {new Date(url.createdAt).toLocaleDateString('en-US', { month: 'short', day: '2-digit' })}
                       </td>
                     </tr>
                   ))}
@@ -201,35 +286,59 @@ export default function RoomDetailPage() {
               </table>
             )}
           </div>
-        </div>
+        </section>
 
-        {/* Right: Recent Changes */}
-        <div className="col-span-5">
-          <div className="bg-white border border-[#e2e8f0] rounded-2xl p-6">
-            <h2 className="text-lg font-semibold text-[#131b2e] mb-4">Recent Changes</h2>
-            <div className="space-y-4">
-              {changes.map((change) => (
-                <div key={change.id} className="flex items-start gap-4 pb-4 border-b border-[#e2e8f0] last:border-0 last:pb-0">
-                  <div className="w-24 flex-shrink-0">
-                    <div className="text-xs text-[#434655]">
-                      {new Date(change.createdAt).toLocaleDateString()}
-                    </div>
-                    <div className="text-xs text-[#434655]">
-                      {new Date(change.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </div>
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm text-[#131b2e] mb-2">{change.summary}</p>
-                    <SeverityBadge severity={change.severity} />
-                  </div>
-                </div>
-              ))}
-              {changes.length === 0 && (
-                <p className="text-sm text-[#434655]">No changes detected yet.</p>
-              )}
+        {/* Recent changes */}
+        <section className="col-span-12 lg:col-span-5">
+          <SectionHeader
+            number="IV"
+            label="Recent changes"
+            meta={`${changes.length} filed`}
+            className="mb-5"
+          />
+          {changes.length === 0 ? (
+            <div className="border border-rule bg-surface-raised">
+              <EmptyState
+                icon={<Clock className="w-5 h-5" strokeWidth={1.5} />}
+                title="No changes detected yet"
+                description="When something moves on a watched URL, the diff lands here with an AI interpretation."
+              />
             </div>
-          </div>
-        </div>
+          ) : (
+            <div className="border border-rule bg-surface-raised">
+              {changes.map((change, i) => (
+                <Link
+                  key={change.id}
+                  href={`/dashboard/changes/${change.id}`}
+                  className={[
+                    'block p-5 hover:bg-paper-2 transition-colors group',
+                    i < changes.length - 1 ? 'border-b border-rule' : '',
+                  ].join(' ')}
+                >
+                  <div className="flex items-start gap-4">
+                    <div className="text-right shrink-0">
+                      <div className="font-mono text-mono-sm text-ink-2 tabular">
+                        {new Date(change.createdAt).toLocaleDateString('en-US', { month: 'short', day: '2-digit' })}
+                      </div>
+                      <div className="font-mono text-mono-sm text-ink-4 tabular mt-0.5">
+                        {new Date(change.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
+                      </div>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-2">
+                        <SeverityBadge severity={change.severity} />
+                      </div>
+                      <p className="font-body text-body-md text-ink leading-snug line-clamp-2 group-hover:text-ink-2 transition-colors">
+                        {change.summary}
+                      </p>
+                    </div>
+                    <ArrowUpRight className="w-4 h-4 text-ink-3 group-hover:text-ink group-hover:-translate-y-0.5 group-hover:translate-x-0.5 transition-all shrink-0" />
+                  </div>
+                </Link>
+              ))}
+            </div>
+          )}
+        </section>
       </div>
     </div>
   );
