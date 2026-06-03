@@ -44,8 +44,8 @@ export default function ChangeDetailPage() {
           else throw new Error('Failed to fetch change');
           return;
         }
-        const json: ChangeAnalysis = await res.json();
-        setChange(json);
+        const json: { change: ChangeAnalysis } = await res.json();
+        setChange(json.change);
       } catch (err) {
         console.error('Change fetch error:', err);
         setError('Failed to load change');

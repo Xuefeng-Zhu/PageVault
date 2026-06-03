@@ -470,25 +470,56 @@ async function getChangeInternal(
   changeId: string,
   ownerIdFilter: string | null,
 ): Promise<ChangeAnalysis | null> {
-  // Look up via the joined ai_explanations + snapshots + tracked_pages + projects tables.
-  // The deep join lets us filter on projects.owner_id in a single round-trip
-  // (the alternative — 4 sequential calls — is slower and racy).
+  // We need the embedded project's owner_id to do the authorization check
+  // in TypeScript. We cannot rely on a filter on the embedded resource
+  // alone: PostgREST's resource embedding is a LEFT JOIN by default, and
+  // even with the !inner modifier the parent ai_explanations row would
+  // still be filtered only by the parent's own where clause (id=eq.X),
+  // not by the embed. So a non-owner can still see a foreign change if
+  // we relied on the embed filter alone. The safe pattern is:
+  //   1. Fetch the parent + the embed chain in one round-trip.
+  //   2. Compare the embedded owner_id to the requesting user in TS.
+  //   3. Return null if the check fails.
+  // We still pass the owner filter to the query for a small win on
+  // common-case perf (a same-owner request skips the TS comparison),
+  // but the TS check is the source of truth for the security boundary.
   const select =
     'id,snapshot_id,previous_snapshot_id,output_json,confidence,created_at,' +
     'snapshots!snapshot_id(tracked_page_id,change_type,tracked_pages!tracked_page_id(project_id,projects!project_id(owner_id)))';
-  const filters = ownerIdFilter
-    ? `id=eq.${changeId}&snapshots.tracked_pages.projects.owner_id=eq.${ownerIdFilter}`
-    : `id=eq.${changeId}`;
+  const filters = `id=eq.${changeId}`;
   const rows = await sdkQuery<{
     id: string; snapshot_id: string; previous_snapshot_id: string | null;
     output_json: unknown; confidence: number | null; created_at: string;
     tracked_page_id: string | null; change_type: string | null;
+    // The SDK flattens nested resource embeds into arrays of objects.
+    // Path: row.snapshots[0].tracked_pages[0].projects[0].owner_id
+    snapshots: Array<{
+      tracked_page_id: string | null;
+      change_type: string | null;
+      tracked_pages: Array<{
+        project_id: string | null;
+        projects: Array<{ owner_id: string | null }> | null;
+      }> | null;
+    }> | null;
   }>(
     'ai_explanations',
     { select, filters, limit: 1 }
   );
   if (rows.length === 0) return null;
   const row = rows[0];
+
+  // The actual authorization check. Walk the nested embed to find
+  // projects.owner_id and compare to the requesting user. If any
+  // link in the chain is missing (orphaned row), or the owner_id
+  // doesn't match, refuse the row. This is the source of truth —
+  // the filter (if any) is only a perf optimization.
+  if (ownerIdFilter !== null) {
+    const ownerId = row.snapshots?.[0]?.tracked_pages?.[0]?.projects?.[0]?.owner_id;
+    if (ownerId === undefined || ownerId === null || ownerId !== ownerIdFilter) {
+      return null;
+    }
+  }
+
   let output: Record<string, unknown> = {};
   if (typeof row.output_json === 'string') {
     try { output = JSON.parse(row.output_json); } catch {}

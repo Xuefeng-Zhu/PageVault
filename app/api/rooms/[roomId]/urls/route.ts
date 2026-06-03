@@ -8,7 +8,7 @@ import { requireSession } from '@/lib/apiAuth';
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ roomId: string }> }
-): Promise<NextResponse<import('@/types').WatchedUrl[] | ErrorResponse>> {
+): Promise<NextResponse<{ urls: import('@/types').WatchedUrl[] } | ErrorResponse>> {
   const session = await requireSession();
   if (session instanceof NextResponse) return session;
 
@@ -49,7 +49,7 @@ export async function POST(
     // Insert URLs
     const watchedUrls = await addWatchedUrls(roomId, rows);
 
-    return NextResponse.json(watchedUrls, { status: 201 });
+    return NextResponse.json({ urls: watchedUrls }, { status: 201 });
   } catch (error) {
     console.error('Failed to add URLs:', error);
     return NextResponse.json(

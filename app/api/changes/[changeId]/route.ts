@@ -7,7 +7,7 @@ import { requireSession } from '@/lib/apiAuth';
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ changeId: string }> }
-): Promise<NextResponse<import('@/types').ChangeAnalysis | ErrorResponse>> {
+): Promise<NextResponse<{ change: import('@/types').ChangeAnalysis } | ErrorResponse>> {
   const session = await requireSession();
   if (session instanceof NextResponse) return session;
 
@@ -26,7 +26,7 @@ export async function GET(
       );
     }
 
-    return NextResponse.json(change);
+    return NextResponse.json({ change });
   } catch (error) {
     console.error('Failed to get change:', error);
     return NextResponse.json(
