@@ -14,6 +14,7 @@
 // generate a unique `jobId` per run. The previous-snapshot lookup is by
 // (tracked_page_id, observed_at desc) so re-running won't double-insert.
 import { createHash } from 'node:crypto';
+import dns from 'node:dns/promises';
 import { enqueueNotification } from './notifications';
 import type {
   MemoryRoom,
@@ -64,6 +65,150 @@ function htmlToMarkdown(html: string): { title: string; markdown: string; text: 
   return { title, markdown: body, text };
 }
 
+// SSRF guard: validateCrawlUrl rejects URLs that point at internal,
+// private, loopback, link-local, or cloud-metadata addresses before any
+// fetch() is issued. crawlOne() always goes through this first.
+//
+// We block by inspecting the parsed hostname, and (for hostnames that
+// aren't literal IPs) we DNS-resolve and block if *any* returned address
+// is in a denied range. The DNS step defeats classic DNS-rebinding where
+// a public hostname resolves to an internal IP at fetch time.
+//
+// Exported helpers (isBlockedAddress, validateCrawlUrl) are covered by
+// lib/scan.test.ts. They are the public security boundary.
+
+/** True if the address is in any range we refuse to crawl. */
+export function isBlockedAddress(addr: string): boolean {
+  if (!addr) return false;
+  // Normalize IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) to their v4 form
+  // so the v4 blocklist catches them. node's `dns.lookup` returns these
+  // in mixed form depending on the resolver.
+  const v4Mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(addr);
+  if (v4Mapped) return isBlockedAddress(v4Mapped[1]);
+
+  // IPv6
+  if (addr.includes(':')) {
+    const lc = addr.toLowerCase();
+    if (lc === '::' || lc === '::1') return true;          // unspecified + loopback
+    if (lc.startsWith('fc') || lc.startsWith('fd')) return true; // unique-local fc00::/7
+    if (lc.startsWith('fe8') || lc.startsWith('fe9') ||
+        lc.startsWith('fea') || lc.startsWith('feb')) return true; // link-local fe80::/10
+    if (lc.startsWith('ff')) return true;                  // multicast ff00::/8
+    return false;
+  }
+
+  // IPv4
+  const parts = addr.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) {
+    return false; // not a parseable IPv4 — let the URL-level validator reject
+  }
+  const [a, b] = parts;
+  if (a === 0) return true;                              // 0.0.0.0/8
+  if (a === 10) return true;                             // 10.0.0.0/8
+  if (a === 127) return true;                            // 127.0.0.0/8 loopback
+  if (a === 169 && b === 254) return true;               // 169.254.0.0/16 link-local (incl. 169.254.169.254)
+  if (a === 172 && b >= 16 && b <= 31) return true;      // 172.16.0.0/12 RFC1918
+  if (a === 192 && b === 168) return true;               // 192.168.0.0/16
+  if (a === 100 && b >= 64 && b <= 127) return true;     // 100.64.0.0/10 CGNAT
+  if (a >= 224 && a <= 239) return true;                 // 224.0.0.0/4 multicast
+  if (a >= 240) return true;                             // 240.0.0.0/4 reserved + 255.255.255.255
+  return false;
+}
+
+/**
+ * Validate a URL before we crawl it. Throws on any blocked / malformed URL.
+ * The error message intentionally includes the offending host so that
+ * operators can debug "why was this URL rejected?" from a single stack
+ * line.
+ */
+export async function validateCrawlUrl(input: string): Promise<string> {
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    throw new Error(`Refusing to crawl: invalid URL "${input}"`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      `Refusing to crawl "${input}": protocol "${parsed.protocol}" is not http(s)`,
+    );
+  }
+  const hostname = parsed.hostname; // URL.hostname is the lowercased, bracket-stripped host
+  if (!hostname) {
+    throw new Error(`Refusing to crawl "${input}": missing hostname`);
+  }
+
+  // URL.hostname returns literal IPv6 hostnames with surrounding brackets
+  // (e.g. "[::1]") but lowercased. Strip them so the literal-IP probe
+  // and the blocklist see the bare address.
+  const bareHost = hostname.startsWith('[') && hostname.endsWith(']')
+    ? hostname.slice(1, -1)
+    : hostname;
+
+  // Treat `localhost` and other well-known hostnames that should never be
+  // reached from the server's network as blocked without a DNS lookup.
+  const lcHost = bareHost.toLowerCase();
+  if (
+    lcHost === 'localhost' ||
+    lcHost.endsWith('.localhost') ||
+    lcHost.endsWith('.local') ||
+    lcHost.endsWith('.internal') ||
+    lcHost.endsWith('.intranet')
+  ) {
+    throw new Error(
+      `Refusing to crawl "${input}": hostname "${bareHost}" points at loopback / internal namespace`,
+    );
+  }
+
+  // If the hostname is a literal IP, the blocklist is sufficient — no DNS
+  // is needed and a malicious client can't rebind a literal IP.
+  if (isLiteralIPv4(bareHost) || isLiteralIPv6(bareHost)) {
+    if (isBlockedAddress(bareHost)) {
+      throw new Error(
+        `Refusing to crawl "${input}": hostname "${bareHost}" is a blocked private/internal address`,
+      );
+    }
+    return input;
+  }
+
+  // Hostname is a DNS name — resolve it and check every returned address.
+  // dns.lookup with { all: true } returns all A + AAAA records.
+  let addrs: Array<{ address: string }>;
+  try {
+    addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
+  } catch (err) {
+    throw new Error(
+      `Refusing to crawl "${input}": DNS lookup failed for "${bareHost}" — ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  if (addrs.length === 0) {
+    throw new Error(`Refusing to crawl "${input}": DNS lookup returned no addresses for "${bareHost}"`);
+  }
+  for (const { address } of addrs) {
+    if (isBlockedAddress(address)) {
+      throw new Error(
+        `Refusing to crawl "${input}": hostname "${bareHost}" resolves to blocked private/internal address "${address}"`,
+      );
+    }
+  }
+  return input;
+}
+
+function isLiteralIPv4(host: string): boolean {
+  const parts = host.split('.');
+  if (parts.length !== 4) return false;
+  return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+}
+
+function isLiteralIPv6(host: string): boolean {
+  // A literal IPv6 (after URL.hostname strip-bracket normalization) must
+  // contain at least one colon and consist of hex / colon / dot-quad chars.
+  if (!host.includes(':')) return false;
+  return /^[0-9a-fA-F:.]{2,}$/.test(host);
+}
+
 // Direct HTTP fetch as a baseline crawler. Tries the Apify run-sync API
 // directly if creds are present, otherwise falls back to a plain fetch()
 // with HTML→Markdown extraction.
@@ -71,6 +216,13 @@ async function crawlOne(url: string): Promise<{
   url: string; title: string; markdown: string; text: string; capturedAt: string;
   apifyRunId: string | null;
 }> {
+  // HIGH-4: SSRF guard. The URL is user-supplied (lives in
+  // tracked_pages.source_url) and any fetch() in this function is from
+  // the Next.js server's network. Reject private / loopback / link-local /
+  // cloud-metadata targets before issuing a single byte of outbound
+  // traffic, and follow DNS resolution to defeat DNS-rebinding.
+  await validateCrawlUrl(url);
+
   const apifyToken = process.env.APIFY_API_TOKEN;
   const apifyActorId = process.env.APIFY_ACTOR_ID;
 
