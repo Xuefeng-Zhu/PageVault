@@ -43,7 +43,14 @@ export default function DashboardPage() {
         setRooms(data);
         setStats({
           totalRooms: data.length,
-          activeUrls: data.reduce((sum) => sum + 1, 0),
+          // Sum the actively-watched URLs across every room, not the room
+          // count. The previous reducer was `sum + 1`, which collapsed to
+          // `data.length` and made the "URLs watched" stat identical to
+          // the "Rooms" stat. Fixes HIGH-2 from docs/qa-bug-hunt.md.
+          activeUrls: data.reduce(
+            (sum, r) => sum + (r.watchedUrls?.length ?? 0),
+            0,
+          ),
           changesDetected: data.reduce((sum, r) => sum + r.highCount + r.mediumCount, 0),
         });
       } catch (err) {
