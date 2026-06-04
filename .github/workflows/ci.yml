@@ -1,0 +1,54 @@
+name: ci
+
+# Placeholder CI for PageVault.
+#
+# Runs on every push to any branch and on every pull request targeting
+# `main`. K-17 will expand this with caching, matrix builds, and InsForge
+# integration. The job below is intentionally minimal: install, typecheck,
+# lint, test, build. The `build` step is the slowest; on a healthy PR it
+# should pass in under a couple of minutes.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+        env:
+          # Build should not require live credentials — the app is wired
+          # for missing-credential mock fallbacks. If the build ever
+          # starts requiring secrets, fail loud here, not in prod.
+          NEXT_TELEMETRY_DISABLED: "1"
