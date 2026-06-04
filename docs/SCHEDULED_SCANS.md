@@ -27,9 +27,10 @@ When the cron fires, the InsForge schedule calls `POST /api/cron/scan-room/{room
 
 1. Verifies the secret against `CRON_SHARED_SECRET` in the server's environment
 2. Loads the one room (404 if missing)
-3. Calls `runScan(room)` — same pipeline as the manual Run Scan button
-4. Updates `last_run_at` on the matching `scan_schedules` row
-5. Returns the summary
+3. Looks up the matching enabled `scan_schedules` row. **If none exists** (the user disabled the schedule, or `DELETE /api/rooms/[id]/schedule` removed it), the endpoint returns `{ roomId, wrapperStatus: 'skipped', reason: 'no_enabled_schedule' }` and does NOT run the scan. This means a stale InsForge cron tick that survives a disable is a no-op rather than a wasted crawl/AI run.
+4. Calls `runScan(room)` — same pipeline as the manual Run Scan button
+5. Updates `last_run_at` on the matching `scan_schedules` row
+6. Returns the summary
 
 The per-room `runScan()` walks the room's watched URLs, fetches each (Apify if creds are configured, otherwise direct HTTP fetch), SHA-256 hashes the new markdown, compares to the previous snapshot, and if the hash differs:
 

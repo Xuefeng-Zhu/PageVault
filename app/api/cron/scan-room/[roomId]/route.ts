@@ -33,8 +33,12 @@ export async function POST(
     );
   }
 
-  // Look up the matching scan_schedules row to update last_run_at.
-  // Best-effort: a missing row shouldn't fail the scan.
+  // Look up the matching scan_schedules row to gate the scan AND update
+  // last_run_at. If no enabled row exists, treat this as a no-op and
+  // skip the scan entirely — this prevents stale InsForge cron ticks
+  // (left over after the user disabled the schedule or DELETE /api/rooms/[id]/schedule
+  // best-effort removed the InsForge schedule) from running
+  // crawls/AI work for a room that is supposed to be off.
   const srk = process.env.INSFORGE_SERVICE_ROLE_KEY!;
   const dbUrl = `${getInsforgeBaseUrl()}/api/database/records`;
   let scheduleId: string | null = null;
@@ -48,17 +52,22 @@ export async function POST(
       scheduleId = rows[0]?.id ?? null;
     }
   } catch {
-    // ignore; we'll skip last_run_at update
+    // fall through; treat as no enabled schedule
+  }
+  if (!scheduleId) {
+    return NextResponse.json({
+      roomId,
+      wrapperStatus: 'skipped',
+      reason: 'no_enabled_schedule',
+    });
   }
 
   const now = new Date().toISOString();
   try {
     const summary = await runScan(room);
-    if (scheduleId) {
-      updateScheduleLastRun(scheduleId, now).catch((e: unknown) =>
-        console.error('failed to update last_run_at:', e),
-      );
-    }
+    updateScheduleLastRun(scheduleId, now).catch((e: unknown) =>
+      console.error('failed to update last_run_at:', e),
+    );
     return NextResponse.json({ roomId, ...summary, wrapperStatus: 'ok' });
   } catch (err) {
     return NextResponse.json(

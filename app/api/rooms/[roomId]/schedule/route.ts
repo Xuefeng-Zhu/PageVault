@@ -45,10 +45,15 @@ async function findExistingScheduleId(name: string): Promise<string | null> {
 async function createOrUpdateInsforgeSchedule(
   existingId: string | null, name: string, cron: string, appUrl: string, secret: string, roomId: string,
 ): Promise<string | null> {
+  const url = `${appUrl}/api/cron/scan-room/${roomId}`;
   const headers = JSON.stringify({ 'x-cron-secret': secret });
+  // The update branch must retarget --url as well as --cron/--headers.
+  // Otherwise schedules that were created before scan-room existed
+  // (and thus point at /api/cron/scan-all) keep firing the all-room
+  // worker even after the user changes the cadence through this route.
   const args: string[] = existingId
-    ? ['schedules', 'update', existingId, '--cron', cron, '--headers', headers]
-    : ['schedules', 'create', '--name', name, '--cron', cron, '--url', `${appUrl}/api/cron/scan-room/${roomId}`, '--method', 'POST', '--headers', headers];
+    ? ['schedules', 'update', existingId, '--cron', cron, '--url', url, '--headers', headers]
+    : ['schedules', 'create', '--name', name, '--cron', cron, '--url', url, '--method', 'POST', '--headers', headers];
   const cmd = `npx @insforge/cli ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`;
   const out = await sh(cmd);
   const m = out.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
