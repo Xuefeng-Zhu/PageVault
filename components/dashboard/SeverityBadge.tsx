@@ -1,19 +1,30 @@
 'use client';
 
+import { Badge } from '@/components/ui/Badge';
+
+type Severity = 'high' | 'medium' | 'low';
+
 interface SeverityBadgeProps {
-  severity: 'high' | 'medium' | 'low';
+  severity: Severity;
+  withLabel?: boolean;
 }
 
-export function SeverityBadge({ severity }: SeverityBadgeProps) {
-  const styles = {
-    high: 'bg-error-container text-on-error-container',
-    medium: 'bg-secondary-container text-on-secondary-container',
-    low: 'bg-surface-container text-on-surface-variant',
+export function SeverityBadge({ severity, withLabel = true }: SeverityBadgeProps) {
+  const variantMap: Record<Severity, 'ember' | 'signal' | 'paper'> = {
+    high: 'ember',
+    medium: 'signal',
+    low: 'paper',
+  };
+
+  const labelMap: Record<Severity, string> = {
+    high: 'Critical',
+    medium: 'Notable',
+    low: 'Minor',
   };
 
   return (
-    <span className={`inline-flex items-center px-2 py-1 rounded-full text-label-sm font-medium capitalize ${styles[severity]}`}>
-      {severity}
-    </span>
+    <Badge variant={variantMap[severity]} size="sm" dot>
+      {withLabel ? labelMap[severity] : severity}
+    </Badge>
   );
 }

@@ -9,68 +9,127 @@ import {
   FileText,
   Settings,
   Database,
+  ScrollText,
+  Activity,
 } from 'lucide-react';
 
-const navItems = [
-  { href: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
-  { href: '/dashboard/rooms/new', icon: FolderOpen, label: 'Memory Rooms' },
-  { href: '#', icon: GitCompare, label: 'Changes' },
-  { href: '#', icon: FileText, label: 'Reports' },
-  { href: '#', icon: Settings, label: 'Settings' },
+const navSections = [
+  {
+    label: 'Workspace',
+    items: [
+      { href: '/dashboard', icon: LayoutDashboard, label: 'Overview', code: '01' },
+      { href: '/dashboard/rooms/new', icon: FolderOpen, label: 'Memory Rooms', code: '02' },
+      { href: '#changes', icon: GitCompare, label: 'Changes', code: '03', meta: '12' },
+      { href: '#reports', icon: FileText, label: 'Reports', code: '04' },
+    ],
+  },
+  {
+    label: 'System',
+    items: [
+      { href: '#activity', icon: Activity, label: 'Activity Log', code: 'A1' },
+      { href: '#settings', icon: Settings, label: 'Settings', code: 'A2' },
+    ],
+  },
 ];
 
 export function Sidebar() {
   const pathname = usePathname();
 
   const isActive = (href: string) => {
-    if (href === '/dashboard') {
-      return pathname === '/dashboard';
-    }
+    if (href === '/dashboard') return pathname === '/dashboard';
+    if (href.startsWith('#')) return false;
     return pathname.startsWith(href);
   };
 
   return (
-    <aside className="fixed h-screen w-[260px] left-0 top-0 bg-[#0f172a] flex flex-col py-6 px-4 z-50">
-      {/* Logo */}
-      <div className="flex items-center gap-3 mb-8 px-2">
-        <div className="w-10 h-10 rounded-lg bg-[#2563eb] flex items-center justify-center">
-          <Database className="w-5 h-5 text-white" />
-        </div>
-        <span className="font-semibold text-lg text-white">PageVault</span>
+    <aside
+      className="
+        fixed inset-y-0 left-0 z-40
+        hidden lg:flex w-72 flex-col
+        bg-paper text-ink
+        border-r border-rule
+      "
+    >
+      {/* === Brand === */}
+      <div className="px-6 pt-7 pb-6 border-b border-rule">
+        <Link href="/dashboard" className="flex items-center gap-3 group">
+          {/* Mark — composed glyph */}
+          <div className="relative w-10 h-10 flex items-center justify-center">
+            <div className="absolute inset-0 border border-ink" />
+            <div className="absolute inset-1.5 bg-ink" />
+            <Database className="relative w-4 h-4 text-paper" strokeWidth={1.75} />
+          </div>
+          <div className="flex flex-col leading-none">
+            <span className="font-display text-[1.375rem] text-ink tracking-[-0.02em]">PageVault</span>
+            <span className="font-mono text-[0.625rem] uppercase tracking-archive text-ink-3 mt-1">
+              The Archive · v0.1
+            </span>
+          </div>
+        </Link>
       </div>
 
-      {/* Navigation */}
-      <nav className="flex-1 space-y-1 overflow-y-auto">
-        {navItems.map((item) => (
-          <Link
-            key={item.href}
-            href={item.href}
-            className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200 relative ${
-              isActive(item.href)
-                ? 'text-white font-medium bg-white/10 before:absolute before:left-0 before:top-0 before:bottom-0 before:w-1 before:bg-[#2563eb] before:rounded-r'
-                : 'text-white/70 hover:text-white hover:bg-white/5'
-            }`}
-          >
-            <item.icon className="w-5 h-5" />
-            <span className="text-sm">{item.label}</span>
-          </Link>
+      {/* === Nav === */}
+      <nav className="flex-1 overflow-y-auto px-3 py-6 no-scrollbar">
+        {navSections.map((section, sIdx) => (
+          <div key={section.label} className={sIdx > 0 ? 'mt-7' : ''}>
+            <div className="section-label px-3 mb-2.5">
+              {section.label}
+            </div>
+            <ul className="space-y-px">
+              {section.items.map((item) => {
+                const active = isActive(item.href);
+                return (
+                  <li key={item.label}>
+                    <Link
+                      href={item.href}
+                      className={[
+                        'group flex items-center gap-3 px-3 py-2 transition-all duration-150 ease-archive',
+                        'border-l-2',
+                        active
+                          ? 'border-l-ink bg-surface text-ink'
+                          : 'border-l-transparent text-ink-3 hover:text-ink hover:bg-surface-sunken',
+                      ].join(' ')}
+                    >
+                      <item.icon
+                        className={[
+                          'w-4 h-4 shrink-0 transition-colors',
+                          active ? 'text-ink' : 'text-ink-3 group-hover:text-ink',
+                        ].join(' ')}
+                        strokeWidth={1.75}
+                      />
+                      <span className="flex-1 font-body text-body-md">{item.label}</span>
+                      <span className="font-mono text-mono-sm text-ink-4 tabular">
+                        {item.meta ?? item.code}
+                      </span>
+                    </Link>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
         ))}
       </nav>
 
-      {/* Footer - Usage Meter */}
-      <div className="mt-auto pt-6 border-t border-white/10 space-y-3">
-        <div className="px-3">
-          <div className="bg-white/5 rounded-xl p-4">
-            <p className="text-white/60 text-xs mb-2 uppercase tracking-wider font-medium">Snapshots this month</p>
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-white text-sm font-medium">Snapshots</span>
-              <span className="text-[#2563eb] font-semibold text-sm">7.8K / 10K</span>
-            </div>
-            <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
-              <div className="h-full bg-[#2563eb] w-[78%] rounded-full" />
-            </div>
-          </div>
+      {/* === Footer: Vault meter === */}
+      <div className="px-5 pt-5 pb-6 border-t border-rule">
+        <div className="section-label mb-3">
+          <ScrollText className="w-3.5 h-3.5" />
+          Vault Capacity
         </div>
+        <div className="flex items-baseline justify-between mb-2">
+          <span className="font-display text-display-sm text-ink tabular leading-none">7,842</span>
+          <span className="font-mono text-mono-sm text-ink-3 tabular">/ 10,000</span>
+        </div>
+        <div className="relative h-[3px] bg-rule overflow-hidden mb-2">
+          <div
+            className="absolute inset-y-0 left-0 bg-ink"
+            style={{ width: '78%' }}
+          />
+          <div className="absolute inset-y-0 left-0 right-0 bg-diagonal opacity-40" />
+        </div>
+        <p className="font-mono text-mono-sm text-ink-3">
+          Resets in <span className="text-ink">12 days</span>
+        </p>
       </div>
     </aside>
   );

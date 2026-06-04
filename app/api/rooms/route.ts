@@ -6,8 +6,8 @@ import {
   createRoomWithDefaults,
   listRoomsWithStats,
 } from '@/lib/insforge';
-import { validateRoomField, normalizeCategory } from '@/lib/validation';
-import { createStorageFolder } from '@/lib/box';
+import { validateRoomField, normalizeCategory, frequencyToCronExpression } from '@/lib/validation';
+import { createStorageFolder } from '@/lib/storage';
 import { requireSession } from '@/lib/apiAuth';
 
 export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorResponse>> {
@@ -83,10 +83,17 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
       userId,
     });
 
-    // Auto-create default scan schedule (daily 3am). Best-effort: if it
-    // fails the room still works; user can configure manually. AC3.
+    // Auto-create default scan schedule using the wizard's selected
+    // cadence. The user picked a frequency in the new-room form;
+    // honour it instead of always defaulting to daily 3am. If the
+    // frequency is missing or unrecognized, fall back to the
+    // historical default (daily 3am) so the rest of the flow keeps
+    // working.
+    const cron = frequencyToCronExpression(
+      (body as { frequency?: string }).frequency,
+    ) ?? '0 3 * * *';
     try {
-      await createRoomWithDefaults(room.id);
+      await createRoomWithDefaults(room.id, cron);
     } catch (schedErr) {
       console.error('Failed to create default schedule for room', room.id, schedErr);
     }

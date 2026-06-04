@@ -18,11 +18,11 @@ export function AppShell({ children }: AppShellProps) {
   };
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[#f8fafc]">
+    <div className="min-h-screen flex bg-paper text-ink relative">
       <Sidebar />
-      <div className="flex-1 flex flex-col overflow-hidden ml-[260px]">
+      <div className="flex-1 flex flex-col min-w-0 lg:pl-72">
         <TopBar onRunScan={handleRunScan} scanning={scanning} />
-        <main className="flex-1 overflow-auto p-6 mt-16">
+        <main className="flex-1 pt-20 px-6 lg:px-10 pb-16 max-w-[1440px] w-full mx-auto">
           {children}
         </main>
       </div>

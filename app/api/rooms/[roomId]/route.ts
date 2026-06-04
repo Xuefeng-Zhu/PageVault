@@ -2,16 +2,29 @@ import { NextRequest, NextResponse } from 'next/server';
 import type { ErrorResponse, RoomDetailResponse, ScanRun } from '@/types';
 import { getRoom, listWatchedUrls, listChanges } from '@/lib/insforge';
 import { getInsforgeClient } from '@/lib/env';
+import { requireSession } from '@/lib/apiAuth';
 
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ roomId: string }> },
 ): Promise<NextResponse<RoomDetailResponse | ErrorResponse>> {
+  const session = await requireSession();
+  if (session instanceof NextResponse) return session;
+
   try {
     const { roomId } = await params;
 
     const room = await getRoom(roomId);
     if (!room) {
+      return NextResponse.json(
+        { error: { code: 'NOT_FOUND', message: 'Room not found' } },
+        { status: 404 }
+      );
+    }
+
+    // Owner scoping. 404 (not 403) on a non-owned room is intentional —
+    // returning 403 would confirm the room exists for another user.
+    if (room.userId !== session.user.id) {
       return NextResponse.json(
         { error: { code: 'NOT_FOUND', message: 'Room not found' } },
         { status: 404 }

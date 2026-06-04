@@ -1,43 +1,85 @@
 'use client';
 
+import { Check } from 'lucide-react';
+
 interface StepperProps {
-  steps: { id: number; label: string; description: string }[];
+  steps: { id: number; label: string; description?: string; code?: string }[];
   currentStep: number;
+  className?: string;
 }
 
-export function Stepper({ steps, currentStep }: StepperProps) {
+export function Stepper({ steps, currentStep, className = '' }: StepperProps) {
   return (
-    <div className="flex items-center justify-between">
-      {steps.map((step, index) => (
-        <div key={step.id} className="flex items-center flex-1">
-          <div className="flex items-center">
-            <div
-              className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${
-                step.id <= currentStep
-                  ? 'bg-primary-container text-on-primary-container'
-                  : 'bg-surface-container text-on-surface-variant'
-              }`}
-            >
-              {step.id < currentStep ? (
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                </svg>
-              ) : (
-                step.id
-              )}
-            </div>
-            <div className="ml-3">
-              <div className={`text-body-md font-medium ${step.id <= currentStep ? 'text-on-surface' : 'text-on-surface-variant'}`}>
-                {step.label}
+    <ol className={`flex items-stretch w-full ${className}`}>
+      {steps.map((step, index) => {
+        const isDone = step.id < currentStep;
+        const isCurrent = step.id === currentStep;
+        const isFuture = step.id > currentStep;
+
+        return (
+          <li
+            key={step.id}
+            className="flex items-stretch flex-1 last:flex-none"
+          >
+            <div className="flex items-center gap-3 pr-4">
+              {/* Marker */}
+              <span
+                className={[
+                  'relative w-9 h-9 flex items-center justify-center shrink-0 transition-colors duration-200',
+                  isDone
+                    ? 'bg-ink text-paper border border-ink'
+                    : isCurrent
+                    ? 'bg-paper text-ink border-2 border-ink'
+                    : 'bg-paper text-ink-4 border border-rule',
+                ].join(' ')}
+              >
+                {isDone ? (
+                  <Check className="w-4 h-4" strokeWidth={2.5} />
+                ) : (
+                  <span className="font-display text-[0.95rem]">
+                    {String(step.id).padStart(2, '0')}
+                  </span>
+                )}
+                {isCurrent && (
+                  <span className="absolute -top-1 -right-1 w-2 h-2 bg-ember-bright pulse-dot" />
+                )}
+              </span>
+
+              {/* Label */}
+              <div className="flex flex-col leading-tight min-w-0">
+                <span
+                  className={[
+                    'font-mono text-mono-sm uppercase tracking-archive',
+                    isCurrent ? 'text-ink' : 'text-ink-3',
+                  ].join(' ')}
+                >
+                  Step {step.id} / {steps.length}
+                </span>
+                <span
+                  className={[
+                    'font-body text-body-md truncate',
+                    isFuture ? 'text-ink-3' : 'text-ink',
+                  ].join(' ')}
+                >
+                  {step.label}
+                </span>
               </div>
-              <div className="text-label-sm text-on-surface-variant">{step.description}</div>
             </div>
-          </div>
-          {index < steps.length - 1 && (
-            <div className={`flex-1 h-px mx-4 ${step.id < currentStep ? 'bg-primary-container' : 'bg-outline-variant'}`} />
-          )}
-        </div>
-      ))}
-    </div>
+
+            {/* Connector */}
+            {index < steps.length - 1 && (
+              <div className="flex items-center px-2">
+                <div
+                  className={[
+                    'h-px flex-1 min-w-[24px] transition-colors',
+                    step.id < currentStep ? 'bg-ink' : 'bg-rule',
+                  ].join(' ')}
+                />
+              </div>
+            )}
+          </li>
+        );
+      })}
+    </ol>
   );
 }

@@ -183,6 +183,54 @@ function generateId(): string {
   });
 }
 
+// Normalize one evidence item from output_json. Accepts the new
+// pipeline shape ({ before, after, explanation }) and the legacy
+// shape ({ old, new, explanation }). Always returns the new shape
+// so callers can rely on a single contract.
+function normalizeEvidenceItem(item: unknown): ChangeAnalysis['evidence'][number] {
+  if (!item || typeof item !== 'object') {
+    return { before: '', after: '', explanation: '' };
+  }
+  const e = item as Record<string, unknown>;
+  return {
+    before: String(e.before ?? e.old ?? ''),
+    after: String(e.after ?? e.new ?? ''),
+    explanation: String(e.explanation ?? ''),
+  };
+}
+
+// PostgREST resource-embed shape helper. For a many-to-one FK
+// (e.g. ai_explanations.snapshot_id -> snapshots.id), the embed
+// is normally returned as a single object — but the bare-array
+// form is also seen on some versions/configs. We need a
+// shape-agnostic way to walk the embed chain for the
+// authorization check below. Unwrap one level either way and
+// re-wrap as a 0-or-1 array.
+function readOwnerId(snapshotsField: unknown): string | null | undefined {
+  // Step 1: coerce row.snapshots to a single to-one object (or null).
+  const snap = Array.isArray(snapshotsField) ? snapshotsField[0] : snapshotsField;
+  if (!snap || typeof snap !== 'object') return null;
+  const snapObj = snap as { tracked_pages?: unknown };
+
+  // Step 2: coerce the .tracked_pages embed to a single to-one object.
+  const trackedPages = snapObj.tracked_pages;
+  const tp = Array.isArray(trackedPages) ? trackedPages[0] : trackedPages;
+  if (!tp || typeof tp !== 'object') return null;
+  const tpObj = tp as { projects?: unknown };
+
+  // Step 3: coerce the .projects embed to a single to-one object.
+  const projects = tpObj.projects;
+  const project = Array.isArray(projects) ? projects[0] : projects;
+  if (!project || typeof project !== 'object') return null;
+  const projectObj = project as { owner_id?: unknown };
+
+  // Step 4: read owner_id (PostgREST returns it as a string or null).
+  const ownerId = projectObj.owner_id;
+  if (typeof ownerId === 'string') return ownerId;
+  if (ownerId === null) return null;
+  return undefined; // malformed shape
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -447,18 +495,77 @@ export async function listWatchedUrls(roomId: string): Promise<WatchedUrl[]> {
 // when scan functionality is reintroduced.
 
 export async function getChange(changeId: string): Promise<ChangeAnalysis | null> {
-  // Look up via the joined ai_explanations + snapshots tables.
+  return getChangeInternal(changeId, /* ownerIdFilter */ null);
+}
+
+/**
+ * Like {@link getChange} but additionally filters by the owning user.
+ * Returns null if the change doesn't exist OR if the user doesn't own the
+ * project that owns the tracked page that owns the snapshot that the
+ * change explains. The auth check in the route should use 404 (not 403)
+ * for the not-owned case so a probe cannot confirm the change exists
+ * for some other user.
+ */
+export async function getChangeForUser(
+  changeId: string,
+  userId: string,
+): Promise<ChangeAnalysis | null> {
+  if (!userId) return null;
+  return getChangeInternal(changeId, userId);
+}
+
+async function getChangeInternal(
+  changeId: string,
+  ownerIdFilter: string | null,
+): Promise<ChangeAnalysis | null> {
+  // We need the embedded project's owner_id to do the authorization check
+  // in TypeScript. We cannot rely on a filter on the embedded resource
+  // alone: PostgREST's resource embedding is a LEFT JOIN by default, and
+  // even with the !inner modifier the parent ai_explanations row would
+  // still be filtered only by the parent's own where clause (id=eq.X),
+  // not by the embed. So a non-owner can still see a foreign change if
+  // we relied on the embed filter alone. The safe pattern is:
+  //   1. Fetch the parent + the embed chain in one round-trip.
+  //   2. Compare the embedded owner_id to the requesting user in TS.
+  //   3. Return null if the check fails.
+  // We still pass the owner filter to the query for a small win on
+  // common-case perf (a same-owner request skips the TS comparison),
+  // but the TS check is the source of truth for the security boundary.
+  const select =
+    'id,snapshot_id,previous_snapshot_id,output_json,confidence,created_at,' +
+    'snapshots!snapshot_id(tracked_page_id,change_type,tracked_pages!tracked_page_id(project_id,projects!project_id(owner_id)))';
+  const filters = `id=eq.${changeId}`;
   const rows = await sdkQuery<{
     id: string; snapshot_id: string; previous_snapshot_id: string | null;
     output_json: unknown; confidence: number | null; created_at: string;
     tracked_page_id: string | null; change_type: string | null;
+    // The SDK flattens nested resource embeds. The exact shape is
+    // version-dependent: a to-one FK is normally a single object,
+    // but on some PostgREST configs the SDK returns a 0-or-1
+    // array. We type it as `unknown` here and let readOwnerId()
+    // below normalize the shape.
+    snapshots: unknown;
   }>(
     'ai_explanations',
-    { select: 'id,snapshot_id,previous_snapshot_id,output_json,confidence,created_at,snapshots!snapshot_id(tracked_page_id,change_type)',
-      filters: `id=eq.${changeId}`, limit: 1 }
+    { select, filters, limit: 1 }
   );
   if (rows.length === 0) return null;
   const row = rows[0];
+
+  // PostgREST returns a to-one resource embed as a single object
+  // (not wrapped in an array) when the FK is many-to-one. The four
+  // FKs in this chain (ai_explanations -> snapshots -> tracked_pages
+  // -> projects) are all many-to-one, so the SDK may give us
+  // row.snapshots as either an object or an array depending on
+  // PostgREST version / config. Unwrap to the to-one shape first,
+  // then re-wrap as a 0-or-1 array for the walk.
+  if (ownerIdFilter !== null) {
+    const ownerId = readOwnerId(row.snapshots);
+    if (ownerId === undefined || ownerId === null || ownerId !== ownerIdFilter) {
+      return null;
+    }
+  }
+
   let output: Record<string, unknown> = {};
   if (typeof row.output_json === 'string') {
     try { output = JSON.parse(row.output_json); } catch {}
@@ -466,7 +573,15 @@ export async function getChange(changeId: string): Promise<ChangeAnalysis | null
     output = row.output_json as Record<string, unknown>;
   }
   const recommendedActions = Array.isArray(output.recommendedActions) ? output.recommendedActions as string[] : [];
-  const evidence = Array.isArray(output.evidence) ? output.evidence as unknown[] : [];
+  // Normalize the evidence shape. The current scan pipeline persists
+  // each evidence item as { type, old, new, explanation } in output_json
+  // (see lib/scan.ts:566-571) but the TypeScript contract (and the
+  // LLM system prompt) uses { before, after, explanation }. Without
+  // this normalization, the dashboard's e.before.length on a freshly
+  // persisted change would throw TypeError: cannot read properties
+  // of undefined. Read both shapes; prefer before/after.
+  const rawEvidence = Array.isArray(output.evidence) ? output.evidence as unknown[] : [];
+  const evidence = rawEvidence.map((e) => normalizeEvidenceItem(e));
   return {
     id: String(row.id),
     roomId: '',

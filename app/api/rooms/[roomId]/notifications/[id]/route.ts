@@ -64,7 +64,15 @@ export async function PATCH(
   if (!r.ok) {
     return NextResponse.json({ error: 'db_error' }, { status: 500 });
   }
-  return NextResponse.json({ ok: true });
+  // Re-fetch the updated row so the client gets the canonical
+  // server state. The doc/API.md contract is { subscription }, and
+  // a stale read here would risk the client displaying the old
+  // threshold after a successful update.
+  const updated = await getSubscription(id);
+  if (!updated) {
+    return NextResponse.json({ error: 'not_found_after_update' }, { status: 500 });
+  }
+  return NextResponse.json({ subscription: updated });
 }
 
 export async function DELETE(
@@ -82,5 +90,5 @@ export async function DELETE(
     method: 'DELETE',
     headers: { 'Authorization': `Bearer ${SRK()}` },
   });
-  return new NextResponse(null, { status: 204 });
+  return NextResponse.json({ deleted: true });
 }

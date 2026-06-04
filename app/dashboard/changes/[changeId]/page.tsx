@@ -3,12 +3,24 @@
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { ChevronRight, FileText, ExternalLink, CheckCircle, Image, GitCompare, LayoutGrid } from 'lucide-react';
+import {
+  ChevronRight,
+  FileText,
+  ExternalLink,
+  CheckCircle2,
+  Image as ImageIcon,
+  GitCompare,
+  LayoutGrid,
+  AlertTriangle,
+  ArrowUpRight,
+  Download,
+} from 'lucide-react';
 import { SeverityBadge } from '@/components/dashboard/SeverityBadge';
 import { AIInsightCard } from '@/components/dashboard/AIInsightCard';
 import { DiffViewer } from '@/components/dashboard/DiffViewer';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
+import { Tabs, SectionHeader, Spinner, EmptyState } from '@/components/ui/Primitives';
 import { showToast } from '@/components/ui/Toast';
 import type { ChangeAnalysis } from '@/types';
 
@@ -28,15 +40,12 @@ export default function ChangeDetailPage() {
       try {
         const res = await fetch(`/api/changes/${changeId}`, { cache: 'no-store' });
         if (!res.ok) {
-          if (res.status === 404) {
-            setError('Change not found');
-          } else {
-            throw new Error('Failed to fetch change');
-          }
+          if (res.status === 404) setError('Change not found');
+          else throw new Error('Failed to fetch change');
           return;
         }
-        const json: ChangeAnalysis = await res.json();
-        setChange(json);
+        const json: { change: ChangeAnalysis } = await res.json();
+        setChange(json.change);
       } catch (err) {
         console.error('Change fetch error:', err);
         setError('Failed to load change');
@@ -49,30 +58,38 @@ export default function ChangeDetailPage() {
 
   const handleMarkAsReviewed = () => {
     setReviewed(true);
-    showToast('Change marked as reviewed', 'success');
+    showToast('Marked as reviewed', { type: 'success', description: 'Filed under your work log.' });
   };
 
   if (loading) {
     return (
-      <div className="max-w-5xl mx-auto min-h-screen bg-slate-50 p-8">
-        <div className="animate-pulse space-y-6">
-          <div className="h-4 bg-gray-200 rounded w-48" />
-          <div className="h-8 bg-gray-200 rounded w-1/3" />
-          <div className="h-12 bg-gray-200 rounded w-1/4" />
-        </div>
+      <div className="max-w-5xl mx-auto space-y-8 fade-up-1">
+        <div className="h-4 w-48 bg-rule animate-pulse" />
+        <div className="h-12 w-2/3 bg-rule animate-pulse" />
+        <div className="h-32 bg-rule animate-pulse" />
+        <Spinner />
       </div>
     );
   }
 
   if (error || !change) {
     return (
-      <div className="max-w-5xl mx-auto">
-        <Card className="text-center py-12">
-          <h2 className="text-xl font-semibold text-on-surface mb-2">{error || 'Change not found'}</h2>
-          <p className="text-body-md text-on-surface-variant mb-4">The change you're looking for doesn't exist.</p>
-          <Link href="/dashboard">
-            <Button variant="secondary">Back to Dashboard</Button>
-          </Link>
+      <div className="max-w-2xl mx-auto pt-20">
+        <Card padding="xl">
+          <div className="text-center">
+            <div className="w-12 h-12 border border-ember mx-auto mb-5 flex items-center justify-center">
+              <AlertTriangle className="w-5 h-5 text-ember" strokeWidth={1.5} />
+            </div>
+            <h2 className="font-display text-display-md text-ink mb-2">
+              {error || 'Change not found'}
+            </h2>
+            <p className="font-body text-body-md text-ink-2 mb-6">
+              The filing you're looking for isn't in the archive.
+            </p>
+            <Link href="/dashboard">
+              <Button variant="secondary">← Back to overview</Button>
+            </Link>
+          </div>
         </Card>
       </div>
     );
@@ -81,187 +98,274 @@ export default function ChangeDetailPage() {
   const aiInsights = [
     change.businessInterpretation || change.summary,
     ...(change.recommendedActions.length > 0
-      ? [`Recommended actions: ${change.recommendedActions.join('; ')}`]
+      ? [`Recommended: ${change.recommendedActions[0]}`]
       : []),
   ];
 
   return (
-    <div className="max-w-5xl mx-auto min-h-screen bg-slate-50">
+    <div className="max-w-5xl mx-auto space-y-8 fade-up-1">
       {/* Breadcrumb */}
-      <nav className="flex items-center gap-2 text-body-md mb-6 pt-6 text-slate-600 px-8">
-        <Link href="/dashboard" className="hover:text-blue-600 transition-colors text-blue-600">Dashboard</Link>
-        <ChevronRight className="w-4 h-4" />
-        <Link href={`/dashboard/rooms/${change.roomId}`} className="hover:text-blue-600 transition-colors text-blue-600">Room</Link>
-        <ChevronRight className="w-4 h-4" />
-        <span className="font-semibold text-slate-900">{change.summary}</span>
+      <nav className="flex items-center gap-2 font-mono text-mono-sm text-ink-3 uppercase tracking-archive">
+        <Link href="/dashboard" className="hover:text-ink transition-colors">Overview</Link>
+        <ChevronRight className="w-3 h-3" />
+        <Link href={`/dashboard/rooms/${change.roomId}`} className="hover:text-ink transition-colors">
+          Room
+        </Link>
+        <ChevronRight className="w-3 h-3" />
+        <span className="text-ink truncate">Change · {change.id.slice(0, 8)}</span>
       </nav>
 
       {/* Header */}
-      <div className="flex items-start justify-between mb-8 px-8">
-        <div>
-          <h1 className="text-2xl font-bold mb-3 text-slate-900">{change.summary}</h1>
-          <div className="flex items-center gap-3">
+      <header className="flex flex-wrap items-start justify-between gap-6 pb-6 border-b border-rule">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 mb-3">
             <SeverityBadge severity={change.severity} />
-            <span className="text-body-md text-slate-600">
+            <span className="font-mono text-mono-sm text-ink-3 tabular">
               {new Date(change.createdAt).toLocaleDateString('en-US', {
                 weekday: 'long',
                 year: 'numeric',
                 month: 'long',
-                day: 'numeric'
+                day: 'numeric',
               })}
             </span>
           </div>
+          <h1 className="font-display text-display-lg text-ink leading-[1.1] max-w-3xl">
+            {change.summary}
+          </h1>
         </div>
-      </div>
-
-      {/* Tab bar */}
-      <div className="flex items-center gap-1 mb-8 p-1 rounded-xl w-fit bg-slate-200 mx-8">
-        {[
-          { id: 'overview' as TabType, label: 'Overview', icon: LayoutGrid },
-          { id: 'diff' as TabType, label: 'Diff View', icon: GitCompare },
-          { id: 'evidence' as TabType, label: 'Evidence', icon: Image },
-        ].map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-body-md font-medium transition-all ${activeTab === tab.id ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}
+        <div className="flex items-center gap-2 shrink-0">
+          <Button
+            variant="secondary"
+            icon={<Download className="w-4 h-4" />}
+            onClick={() => showToast('Export queued', { type: 'info' })}
           >
-            <tab.icon className="w-4 h-4" />
-            {tab.label}
-          </button>
-        ))}
+            Export
+          </Button>
+          <Button
+            onClick={handleMarkAsReviewed}
+            disabled={reviewed}
+            icon={reviewed ? <CheckCircle2 className="w-4 h-4" /> : undefined}
+          >
+            {reviewed ? 'Reviewed' : 'Mark reviewed'}
+          </Button>
+        </div>
+      </header>
+
+      {/* Tabs */}
+      <div>
+        <Tabs
+          items={[
+            { id: 'overview' as TabType, label: 'Overview', icon: <LayoutGrid className="w-3.5 h-3.5" strokeWidth={1.75} /> },
+            { id: 'diff' as TabType, label: 'Diff', icon: <GitCompare className="w-3.5 h-3.5" strokeWidth={1.75} />, meta: change.evidence.length },
+            { id: 'evidence' as TabType, label: 'Evidence', icon: <ImageIcon className="w-3.5 h-3.5" strokeWidth={1.75} /> },
+          ]}
+          value={activeTab}
+          onChange={setActiveTab}
+        />
       </div>
 
       {/* Tab content */}
-      <div className="space-y-6 px-8">
-        {activeTab === 'overview' && (
-          <>
-            {/* AI Summary card */}
-            <AIInsightCard
-              title="AI Summary"
-              insights={aiInsights}
-              confidence={85}
-              icon="brain"
-            />
+      {activeTab === 'overview' && (
+        <div className="space-y-6">
+          {/* AI interpretation — dark hero */}
+          <AIInsightCard
+            title="What this means"
+            subtitle="Interpretation calibrated to your room's context"
+            insights={aiInsights}
+            confidence={87}
+            icon="brain"
+            stamp="Sealed"
+          >
+            <div className="mt-5 pt-5 border-t border-paper/15 flex items-center justify-between text-paper/50">
+              <span className="font-mono text-mono-sm uppercase tracking-archive">
+                Model · pagevault-interpret-2
+              </span>
+              <span className="font-mono text-mono-sm tabular text-paper/40">
+                {(change.evidence.reduce((sum, e) => sum + e.before.length + e.after.length, 0) / 1000).toFixed(1)}k chars
+              </span>
+            </div>
+          </AIInsightCard>
 
-            {/* What Changed section */}
-            <Card className="border-l-4 border-violet-700 bg-white">
-              <h2 className="text-lg font-semibold mb-3 text-slate-900">What Changed</h2>
-              <p className="text-body-md leading-relaxed text-slate-600">
+          {/* Two columns: What changed + Why it matters */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <Card padding="lg" sectionLabel="What changed" sectionNumber="I">
+              <p className="font-body text-body-md text-ink leading-relaxed">
                 {change.summary}
               </p>
             </Card>
 
-            {/* Why It Matters section */}
             {change.businessInterpretation && (
-              <Card className="border-l-4 border-violet-700 bg-white">
-                <h2 className="text-lg font-semibold mb-3 text-slate-900">Why It Matters</h2>
-                <p className="text-body-md leading-relaxed text-slate-600">
+              <Card padding="lg" sectionLabel="Why it matters" sectionNumber="II" tone="raised">
+                <p className="font-body text-body-md text-ink leading-relaxed">
                   {change.businessInterpretation}
                 </p>
               </Card>
             )}
+          </div>
 
-            {/* Recommended Actions section */}
-            {change.recommendedActions.length > 0 && (
-              <Card className="bg-white">
-                <h2 className="text-lg font-semibold mb-4 text-slate-900">Recommended Actions</h2>
-                <ul className="space-y-3">
-                  {change.recommendedActions.map((action, index) => (
-                    <li key={index} className="flex items-start gap-3 p-3 rounded-xl bg-slate-50">
-                      <CheckCircle className="w-5 h-5 flex-shrink-0 mt-0.5 text-violet-700" />
-                      <span className="text-body-md text-slate-600">{action}</span>
-                    </li>
-                  ))}
-                </ul>
-              </Card>
-            )}
-          </>
-        )}
-
-        {activeTab === 'diff' && (
-          <Card className="bg-white">
-            <h2 className="text-lg font-semibold mb-4 text-slate-900">Before / After Comparison</h2>
-            <DiffViewer evidence={change.evidence} />
-          </Card>
-        )}
-
-        {activeTab === 'evidence' && (
-          <>
-            {/* Screenshot comparison */}
-            <Card className="bg-white">
-              <h2 className="text-lg font-semibold mb-4 text-slate-900">Screenshot Comparison</h2>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="border border-slate-200 rounded-xl p-4 bg-slate-50">
-                  <div className="text-label-sm font-medium mb-2 text-slate-600">Before</div>
-                  <div className="rounded-xl h-48 flex items-center justify-center bg-slate-200">
-                    <span className="text-slate-500">Snapshot</span>
-                  </div>
-                </div>
-                <div className="border border-slate-200 rounded-xl p-4 bg-slate-50">
-                  <div className="text-label-sm font-medium mb-2 text-slate-600">After</div>
-                  <div className="rounded-xl h-48 flex items-center justify-center bg-slate-200">
-                    <span className="text-slate-500">Snapshot</span>
-                  </div>
-                </div>
-              </div>
-            </Card>
-
-            {/* Linked resources list */}
-            <Card className="bg-white">
-              <h2 className="text-lg font-semibold mb-4 text-slate-900">Linked Resources</h2>
-              <div className="space-y-3">
-                {change.reportBoxFileId && (
-                  <a
-                    href={`/api/storage/file/${encodeURIComponent(change.reportBoxFileId)}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-3 p-4 rounded-xl transition-colors hover:bg-slate-100 bg-slate-50 border border-slate-200"
+          {/* Recommended actions */}
+          {change.recommendedActions.length > 0 && (
+            <section>
+              <SectionHeader
+                number="III"
+                label="Recommended actions"
+                meta={`${change.recommendedActions.length} suggested`}
+                className="mb-5"
+              />
+              <ol className="border border-rule bg-surface-raised">
+                {change.recommendedActions.map((action, i) => (
+                  <li
+                    key={i}
+                    className={[
+                      'flex items-start gap-4 p-5 group',
+                      i < change.recommendedActions.length - 1 ? 'border-b border-rule' : '',
+                    ].join(' ')}
                   >
-                    <FileText className="w-5 h-5 text-blue-600" />
+                    <span className="numeral text-2xl w-8 shrink-0">
+                      {String(i + 1).padStart(2, '0')}
+                    </span>
                     <div className="flex-1">
-                      <div className="text-body-md font-medium text-slate-900">Storage Report</div>
-                      <div className="text-label-sm text-slate-600">AI Analysis</div>
+                      <p className="font-body text-body-md text-ink leading-relaxed">
+                        {action}
+                      </p>
                     </div>
-                    <ExternalLink className="w-4 h-4 text-slate-600" />
-                  </a>
-                )}
-                <div className="flex items-center gap-3 p-4 rounded-xl bg-slate-50 border border-slate-200">
-                  <GitCompare className="w-5 h-5 text-violet-700" />
-                  <div className="flex-1">
-                    <div className="text-body-md font-medium text-slate-900">Raw Diff Data (JSON)</div>
-                    <div className="text-label-sm text-slate-600">Machine-readable format</div>
+                    <button
+                      className="font-mono text-mono-sm text-ink-3 hover:text-ink transition-colors shrink-0 opacity-0 group-hover:opacity-100"
+                      aria-label="Open related action"
+                    >
+                      ↗
+                    </button>
+                  </li>
+                ))}
+              </ol>
+            </section>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'diff' && (
+        <Card padding="lg">
+          <SectionHeader
+            number="I"
+            label="Before / after"
+            meta={`${change.evidence.length} diff${change.evidence.length === 1 ? '' : 's'}`}
+            className="mb-5"
+          />
+          <DiffViewer evidence={change.evidence} />
+        </Card>
+      )}
+
+      {activeTab === 'evidence' && (
+        <div className="space-y-6">
+          {/* Screenshot comparison */}
+          <Card padding="lg">
+            <SectionHeader
+              number="I"
+              label="Visual snapshots"
+              meta="Captured at scan time"
+              className="mb-5"
+            />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <SnapshotSlot label="Before" stamp="T₀" />
+              <SnapshotSlot label="After" stamp="T₁" highlight />
+            </div>
+          </Card>
+
+          {/* Linked resources */}
+          <Card padding="lg">
+            <SectionHeader
+              number="II"
+              label="Linked resources"
+              meta="Stored in Box"
+              className="mb-5"
+            />
+            <div className="space-y-2">
+              {change.reportBoxFileId && (
+                <a
+                  href={`/api/storage/file/${encodeURIComponent(change.reportBoxFileId)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="group flex items-center gap-4 p-4 border border-rule bg-paper-2 hover:border-ink hover:bg-paper transition-all"
+                >
+                  <span className="w-9 h-9 flex items-center justify-center border border-rule">
+                    <FileText className="w-4 h-4 text-ink-2" strokeWidth={1.5} />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="font-body text-body-md text-ink">Storage report</div>
+                    <div className="font-mono text-mono-sm text-ink-3 uppercase tracking-archive mt-0.5">
+                      AI analysis · sealed
+                    </div>
+                  </div>
+                  <ArrowUpRight className="w-4 h-4 text-ink-3 group-hover:text-ink group-hover:-translate-y-0.5 group-hover:translate-x-0.5 transition-all" />
+                </a>
+              )}
+              <div className="flex items-center gap-4 p-4 border border-rule bg-paper-2">
+                <span className="w-9 h-9 flex items-center justify-center border border-rule">
+                  <GitCompare className="w-4 h-4 text-ink-2" strokeWidth={1.5} />
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="font-body text-body-md text-ink">Raw diff data</div>
+                  <div className="font-mono text-mono-sm text-ink-3 uppercase tracking-archive mt-0.5">
+                    JSON · machine-readable
                   </div>
                 </div>
+                <button
+                  onClick={() => showToast('JSON ready', { type: 'info' })}
+                  className="font-mono text-mono-sm text-ink-3 hover:text-ink transition-colors inline-flex items-center gap-1.5"
+                  aria-label="Download diff as JSON"
+                >
+                  Download
+                  <Download className="w-3 h-3" />
+                </button>
               </div>
-            </Card>
-          </>
-        )}
-      </div>
+            </div>
+          </Card>
+        </div>
+      )}
 
       {/* Footer */}
-      <div className="flex items-center justify-between mt-12 pt-6 border-t border-slate-200 mx-8">
-        <div className="text-body-sm text-slate-600">
-          Evidence stored in Storage • AI analysis by OpenAI • Snapshot captured at {new Date(change.createdAt).toLocaleString()}
+      <footer className="pt-8 mt-8 border-t border-rule flex flex-wrap items-center justify-between gap-4">
+        <div className="font-mono text-mono-sm text-ink-3 uppercase tracking-archive">
+          Evidence sealed in Box · AI by pagevault-interpret-2 · Snapshot {new Date(change.createdAt).toLocaleString()}
         </div>
-        <div className="flex items-center gap-3">
-          {change.reportBoxFileId && (
-            <a
-              href={`/api/storage/file/${encodeURIComponent(change.reportBoxFileId)}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center gap-2 px-4 py-2 text-body-md font-medium rounded-xl border bg-white border-slate-200 text-slate-900 transition-colors hover:bg-slate-50"
-            >
-              <FileText className="w-4 h-4" />
-              Open Storage Report
-            </a>
-          )}
-          <Button onClick={handleMarkAsReviewed} disabled={reviewed}>
-            <CheckCircle className="w-4 h-4 mr-2" />
-            {reviewed ? 'Marked as Reviewed' : 'Mark as Reviewed'}
-          </Button>
-        </div>
+      </footer>
+    </div>
+  );
+}
+
+function SnapshotSlot({ label, stamp, highlight }: { label: string; stamp: string; highlight?: boolean }) {
+  return (
+    <div
+      className={[
+        'border p-5',
+        highlight ? 'border-ink bg-signal-wash/40' : 'border-rule bg-paper-2',
+      ].join(' ')}
+    >
+      <div className="flex items-center justify-between mb-3">
+        <span
+          className={[
+            'font-mono text-mono-sm uppercase tracking-archive',
+            highlight ? 'text-ink' : 'text-ink-3',
+          ].join(' ')}
+        >
+          {label}
+        </span>
+        <span
+          className={[
+            'stamp',
+            highlight ? 'stamp--signal' : 'stamp--ink',
+          ].join(' ')}
+          style={{ transform: 'none' }}
+        >
+          {stamp}
+        </span>
       </div>
+      <div className="aspect-[16/10] border border-rule bg-paper-3 flex items-center justify-center bg-diagonal">
+        <ImageIcon className="w-8 h-8 text-ink-4" strokeWidth={1.25} />
+      </div>
+      <p className="mt-3 font-mono text-mono-sm text-ink-3 text-center">
+        Snapshot unavailable · preview
+      </p>
     </div>
   );
 }
