@@ -299,19 +299,29 @@ export async function listRoomsWithStats(): Promise<RoomWithStats[]> {
   });
   const activePages = trackedPages.filter(p => p.active !== false);
 
-  // Fetch latest job for each tracked_page
+  // Fetch latest succeeded job per tracked_page in a single PostgREST round-trip.
+  // We pull a bounded batch of recent succeeded jobs (ordered newest-first), then
+  // bucket by tracked_page_id keeping only the first occurrence per group — that
+  // row is the most recent succeeded job for that page. This replaces an
+  // O(active_pages) sequential loop. The batch size is a safety cap: in practice
+  // a room has <500 active pages and each page has at most a handful of recent
+  // succeeded jobs, so 2000 comfortably covers the worst case while bounding
+  // response size.
+  const recentJobs = await sdkQuery<{
+    tracked_page_id: string;
+    finished_at: string | null;
+    status: string;
+  }>('public.snapshot_jobs', {
+    select: 'tracked_page_id,finished_at,status',
+    filters: 'status=eq.succeeded',
+    order: 'finished_at.desc',
+    limit: 2000,
+  });
   const jobsMap: Record<string, { finished_at: string | null }> = {};
-  for (const tp of activePages) {
-    const jobs = await sdkQuery<{
-      finished_at: string | null;
-      status: string;
-    }>('public.snapshot_jobs', {
-      select: 'finished_at,status',
-      filters: `tracked_page_id=eq.${tp.id}&status=eq.succeeded`,
-      order: 'finished_at.desc',
-      limit: 1,
-    });
-    if (jobs.length) jobsMap[tp.id] = jobs[0];
+  for (const job of recentJobs) {
+    if (jobsMap[job.tracked_page_id] === undefined) {
+      jobsMap[job.tracked_page_id] = { finished_at: job.finished_at };
+    }
   }
 
   // Batch-fetch explanations for high/medium counts via JS-side join.
