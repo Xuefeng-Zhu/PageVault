@@ -23,13 +23,13 @@ Custom cron expressions are supported via the "Edit" pencil button on the room p
 
 ## How scheduled scans work
 
-When the cron fires, the InsForge schedule calls `POST /api/cron/scan-all` with an `x-cron-secret` header. The endpoint:
+When the cron fires, the InsForge schedule calls `POST /api/cron/scan-room/{roomId}` with an `x-cron-secret` header. The endpoint:
 
 1. Verifies the secret against `CRON_SHARED_SECRET` in the server's environment
-2. Fetches all rooms with `scan_schedules.enabled = true`
-3. Runs each room's `runScan()` in parallel (cap = 3 concurrent)
-4. Updates `last_run_at` on each schedule after a successful run
-5. Returns a summary like `{ scanned: 3, results: [...] }`
+2. Loads the one room (404 if missing)
+3. Calls `runScan(room)` — same pipeline as the manual Run Scan button
+4. Updates `last_run_at` on the matching `scan_schedules` row
+5. Returns the summary
 
 The per-room `runScan()` walks the room's watched URLs, fetches each (Apify if creds are configured, otherwise direct HTTP fetch), SHA-256 hashes the new markdown, compares to the previous snapshot, and if the hash differs:
 
@@ -56,7 +56,7 @@ When you create a new room via the wizard, the new-room form asks for a frequenc
 The new-room POST handler:
 1. Creates the `projects` row (the room)
 2. Inserts a `scan_schedules` row with the chosen cron and `enabled = true`
-3. Registers an InsForge `schedules` entry named `pagevault-room-{roomId}` that calls `/api/cron/scan-all` with the cron secret
+3. Registers an InsForge `schedules` entry named `pagevault-room-{roomId}` that calls `/api/cron/scan-room/{roomId}` with the cron secret
 4. PATCHes the InsForge schedule ID back into `scan_schedules.insforge_schedule_id` for later update/delete
 
 If the InsForge registration fails (CLI error, missing creds), the room is still created and the DB row exists — the per-room schedule route can retry the InsForge registration when the user next visits the room.
@@ -81,7 +81,9 @@ A scan fires automatically based on the chosen cadence. To trigger one immediate
 
 All three endpoints enforce room ownership via `authorizeRoom()` (404 if room missing or not the session user's room — does not leak room existence).
 
-The cron worker is at `POST /api/cron/scan-all` and is **only callable with the shared secret**, not by signed-in users. The secret is in `.env.local` as `CRON_SHARED_SECRET` and is sent as the `x-cron-secret` header by InsForge Schedules.
+The cron worker is at `POST /api/cron/scan-room/{roomId}` and is **only callable with the shared secret**, not by signed-in users. The secret is in `.env.local` as `CRON_SHARED_SECRET` and is sent as the `x-cron-secret` header by InsForge Schedules.
+
+The legacy `POST /api/cron/scan-all` endpoint (scans every enabled room in one tick, parallel cap=3) is still available for manual "scan everything now" use cases and is not used by any InsForge schedule by default.
 
 ## Costs
 

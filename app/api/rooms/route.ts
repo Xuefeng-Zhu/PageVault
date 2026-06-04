@@ -134,7 +134,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
       const args = existingId
         ? ['schedules', 'update', existingId, '--cron', cron, '--headers', headers]
         : ['schedules', 'create', '--name', name, '--cron', cron,
-           '--url', `${appUrl}/api/cron/scan-all`, '--method', 'POST', '--headers', headers];
+           '--url', `${appUrl}/api/cron/scan-room/${room.id}`, '--method', 'POST', '--headers', headers];
       const cmd = `npx @insforge/cli ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`;
       const out = await execAsync(cmd, { cwd: process.cwd(), timeout: 30_000 });
       const m = out.stdout.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);

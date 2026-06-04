@@ -43,12 +43,12 @@ async function findExistingScheduleId(name: string): Promise<string | null> {
 }
 
 async function createOrUpdateInsforgeSchedule(
-  existingId: string | null, name: string, cron: string, appUrl: string, secret: string,
+  existingId: string | null, name: string, cron: string, appUrl: string, secret: string, roomId: string,
 ): Promise<string | null> {
   const headers = JSON.stringify({ 'x-cron-secret': secret });
   const args: string[] = existingId
     ? ['schedules', 'update', existingId, '--cron', cron, '--headers', headers]
-    : ['schedules', 'create', '--name', name, '--cron', cron, '--url', `${appUrl}/api/cron/scan-all`, '--method', 'POST', '--headers', headers];
+    : ['schedules', 'create', '--name', name, '--cron', cron, '--url', `${appUrl}/api/cron/scan-room/${roomId}`, '--method', 'POST', '--headers', headers];
   const cmd = `npx @insforge/cli ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`;
   const out = await sh(cmd);
   const m = out.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
@@ -122,7 +122,7 @@ export async function POST(
     let insforgeScheduleId: string | null = null;
     if (enabled) {
       insforgeScheduleId = await createOrUpdateInsforgeSchedule(
-        existingId, name, cronExpression, appUrl, process.env.CRON_SHARED_SECRET,
+        existingId, name, cronExpression, appUrl, process.env.CRON_SHARED_SECRET, roomId,
       );
     } else if (existingId) {
       try {
