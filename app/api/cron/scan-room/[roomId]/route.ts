@@ -34,25 +34,36 @@ export async function POST(
   }
 
   // Look up the matching scan_schedules row to gate the scan AND update
-  // last_run_at. If no enabled row exists, treat this as a no-op and
-  // skip the scan entirely — this prevents stale InsForge cron ticks
-  // (left over after the user disabled the schedule or DELETE /api/rooms/[id]/schedule
-  // best-effort removed the InsForge schedule) from running
-  // crawls/AI work for a room that is supposed to be off.
+  // last_run_at. We distinguish three outcomes:
+  //   1. fetch ok + zero rows -> 200 skipped, no runScan
+  //   2. fetch ok + one+ row  -> proceed to runScan
+  //   3. fetch failed / non-ok -> 5xx, surface the outage
+  // An earlier version of this code conflated (1) and (3), causing
+  // a DB outage to silently skip scans; InsForge doesn't retry on 200,
+  // so a 5xx is the right signal.
   const srk = process.env.INSFORGE_SERVICE_ROLE_KEY!;
   const dbUrl = `${getInsforgeBaseUrl()}/api/database/records`;
   let scheduleId: string | null = null;
+  let dbErr: string | null = null;
   try {
     const r = await fetch(
       `${dbUrl}/scan_schedules?project_id=eq.${roomId}&enabled=eq.true&select=id&limit=1`,
       { headers: { 'Authorization': `Bearer ${srk}` } },
     );
-    if (r.ok) {
+    if (!r.ok) {
+      dbErr = `db_lookup_${r.status}`;
+    } else {
       const rows = (await r.json()) as Array<{ id: string }>;
       scheduleId = rows[0]?.id ?? null;
     }
-  } catch {
-    // fall through; treat as no enabled schedule
+  } catch (e) {
+    dbErr = e instanceof Error ? e.message : String(e);
+  }
+  if (dbErr) {
+    return NextResponse.json(
+      { roomId, wrapperStatus: 'failed', reason: 'db_lookup_failed', error: dbErr },
+      { status: 500 },
+    );
   }
   if (!scheduleId) {
     return NextResponse.json({
@@ -65,9 +76,18 @@ export async function POST(
   const now = new Date().toISOString();
   try {
     const summary = await runScan(room);
-    updateScheduleLastRun(scheduleId, now).catch((e: unknown) =>
-      console.error('failed to update last_run_at:', e),
-    );
+    // Await the last_run_at update. The catch preserves the previous
+    // fire-and-forget semantics (we don't fail the route on a DB write
+    // error after a successful scan), but we DO wait for it to
+    // complete so serverless platforms don't drop the in-flight PATCH
+    // once the route returns. On long-lived Node servers (current
+    // PageVault deployment) this is functionally identical to
+    // fire-and-forget; the await is forward-compatible with serverless.
+    try {
+      await updateScheduleLastRun(scheduleId, now);
+    } catch (e) {
+      console.error('failed to update last_run_at:', e);
+    }
     return NextResponse.json({ roomId, ...summary, wrapperStatus: 'ok' });
   } catch (err) {
     return NextResponse.json(
