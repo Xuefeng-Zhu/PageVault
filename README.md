@@ -114,16 +114,38 @@ BOX_ROOT_FOLDER_ID=0
 
 Without any credentials, the application runs in **Demo Mode** with in-memory storage and mock integrations.
 
-## Setup
+## Quick Start
+
+The fastest way to bootstrap a fresh clone is the one-command setup
+script:
+
+```bash
+./scripts/dev-setup.sh
+```
+
+It checks your Node version (>= 20), copies `.env.example` to
+`.env.local` (and auto-enables the `INSFORGE_DEV_*` opt-ins on a fresh
+clone so the login page accepts the demo creds out of the box), runs
+`npm install`, and prints the next steps. It is idempotent: re-running
+it is safe, it will not clobber an existing `.env.local`, and it skips
+`npm install` when `node_modules/` is already present. Pass
+`--reinstall` to force a clean install or `--reset-env` to overwrite
+`.env.local` from `.env.example`.
+
+Prefer the manual path? The standard npm flow works too:
 
 ```bash
 # Install dependencies
 npm install
 
-# Run in development mode
+# Copy the env template and fill in your values
+cp .env.example .env.local
+$EDITOR .env.local
+
+# Run in development mode (http://localhost:3000)
 npm run dev
 
-# Run typecheck
+# Type check
 npm run typecheck
 
 # Run tests
@@ -135,6 +157,20 @@ npm run build
 # Start production server
 npm start
 ```
+
+For the full developer workflow (debugging, conventions, common tasks,
+and the list of every env var) see
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) and
+[`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
+
+### GitHub Codespaces / VS Code Dev Containers
+
+A `.devcontainer/devcontainer.json` is included for one-click Codespaces
+and VS Code "Reopen in Container" workflows. Open the repo in
+Codespaces (or run "Reopen in Container" in VS Code) and the dev
+environment is provisioned automatically: Node 20 base image, the
+setup script runs on create, typecheck runs as a smoke test, and port
+3000 is forwarded and labelled.
 
 ## Demo Mode
 
