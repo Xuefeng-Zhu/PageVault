@@ -10,7 +10,7 @@
 // "run everything" tick, but not the right call for per-room crons).
 import { NextRequest, NextResponse } from 'next/server';
 import { requireCronSecret } from '@/lib/cron-auth';
-import { getRoom, updateScheduleLastRun } from '@/lib/insforge';
+import { updateScheduleLastRun } from '@/lib/insforge';
 import { runScan } from '@/lib/scan';
 import { getInsforgeBaseUrl } from '@/lib/env';
 
@@ -36,15 +36,55 @@ export async function POST(
   }
 
   const { roomId } = await params;
-  const room = await getRoom(roomId);
-  if (!room) {
-    // 404 lets InsForge schedules' retry behaviour be observable in
-    // logs (vs. a 200/empty which would silently mask the issue).
+
+  // Look up the room via service-role REST. We deliberately do NOT
+  // use the SDK wrapper (getRoom from lib/insforge.ts) here because
+  // that wrapper logs SDK errors and returns [] on outage, which
+  // would then be misclassified as "room not found" and return 404
+  // during a transient DB/credential failure. The REST call below
+  // surfaces non-ok responses via !r.ok so we can return 5xx and
+  // let InsForge's scheduler log the outage.
+  const srk = process.env.INSFORGE_SERVICE_ROLE_KEY!;
+  const dbUrl = `${getInsforgeBaseUrl()}/api/database/records`;
+  let roomRows: Array<{ id: string; owner_id: string | null; name: string; box_root_folder_id: string | null; created_at: string }> = [];
+  let roomErr: string | null = null;
+  try {
+    const r = await fetch(
+      `${dbUrl}/projects?id=eq.${roomId}&select=id,owner_id,name,box_root_folder_id,created_at&limit=1`,
+      { headers: { 'Authorization': `Bearer ${srk}` } },
+    );
+    if (!r.ok) {
+      roomErr = `room_lookup_${r.status}`;
+    } else {
+      roomRows = await r.json();
+    }
+  } catch (e) {
+    roomErr = e instanceof Error ? e.message : String(e);
+  }
+  if (roomErr) {
+    return NextResponse.json(
+      { roomId, wrapperStatus: 'failed', reason: 'room_lookup_failed', error: roomErr },
+      { status: 500 },
+    );
+  }
+  if (roomRows.length === 0) {
     return NextResponse.json(
       { error: 'room_not_found', roomId },
       { status: 404 },
     );
   }
+  const p = roomRows[0];
+  const storageFolderPath = p.box_root_folder_id ?? null;
+  const room = {
+    id: p.id,
+    userId: p.owner_id ?? null,
+    name: p.name,
+    targetName: p.name,
+    category: 'custom' as const,
+    storageFolderPath,
+    boxFolderId: storageFolderPath,
+    createdAt: p.created_at,
+  };
 
   // Look up the matching scan_schedules row to gate the scan AND update
   // last_run_at. We distinguish three outcomes:
@@ -54,8 +94,6 @@ export async function POST(
   // An earlier version of this code conflated (1) and (3), causing
   // a DB outage to silently skip scans; InsForge doesn't retry on 200,
   // so a 5xx is the right signal.
-  const srk = process.env.INSFORGE_SERVICE_ROLE_KEY!;
-  const dbUrl = `${getInsforgeBaseUrl()}/api/database/records`;
   let scheduleId: string | null = null;
   let dbErr: string | null = null;
   try {
@@ -88,7 +126,7 @@ export async function POST(
 
   const now = new Date().toISOString();
   try {
-    const summary = await runScan(room);
+    const summary = await runScan(room, { triggerType: 'schedule' });
     // Await the last_run_at update. The catch preserves the previous
     // fire-and-forget semantics (we don't fail the route on a DB write
     // error after a successful scan), but we DO wait for it to

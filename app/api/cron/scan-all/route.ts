@@ -56,7 +56,7 @@ export async function POST(request: NextRequest) {
           results.push({ roomId: sched.project_id, status: 'skipped', reason: 'room_not_found' });
           continue;
         }
-        const summary = await runScan(room);
+        const summary = await runScan(room, { triggerType: 'schedule' });
         results.push({ roomId: sched.project_id, ...summary });
         // Update last_run_at (best-effort, do not fail the worker on DB error)
         updateScheduleLastRun(sched.id, now).catch((e: unknown) =>

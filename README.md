@@ -92,8 +92,8 @@ flowchart TB
   Scan -->|OpenAI-compatible| LLM
   Scan -->|upload raw markdown| Storage
   Storage -->|S3-compat| Insforge
-  ScanCron -->|HTTP + CRON_SECRET| Routes
-  NotifCron -->|HTTP + CRON_SECRET| Routes
+  ScanCron -->|HTTP + CRON_SHARED_SECRET| Routes
+  NotifCron -->|HTTP + CRON_SHARED_SECRET| Routes
   Middleware -->|protects| Pages
 ```
 
@@ -178,7 +178,7 @@ APIFY_API_TOKEN=your-apify-token
 APIFY_ACTOR_ID=your-actor-id
 
 # Cron auth — required for the scheduled-scan endpoints
-CRON_SECRET=any-long-random-string            # must match what the
+CRON_SHARED_SECRET=any-long-random-string            # must match what the
                                               # InsForge schedule sends
 
 # OpenAI-compatible LLM (change analysis) — optional, enables real AI
@@ -253,9 +253,9 @@ For a live end-to-end run against the real Apify and LLM, see
 | POST | `/api/rooms/[roomId]/notifications/[id]/test` | session | Send a test webhook |
 | DELETE | `/api/rooms/[roomId]/notifications/[id]` | session | Remove a subscription |
 | GET | `/api/changes/[changeId]` | session | Single change analysis detail |
-| POST | `/api/cron/scan-all` | `CRON_SECRET` | Run all due scheduled scans |
-| POST | `/api/cron/scan-room/[roomId]` | `CRON_SECRET` | Run a single room's scan |
-| POST | `/api/cron/notification-worker` | `CRON_SECRET` | Drain the notification outbox |
+| POST | `/api/cron/scan-all` | `CRON_SHARED_SECRET` | Run all due scheduled scans |
+| POST | `/api/cron/scan-room/[roomId]` | `CRON_SHARED_SECRET` | Run a single room's scan |
+| POST | `/api/cron/notification-worker` | `CRON_SHARED_SECRET` | Drain the notification outbox |
 | GET/POST | `/api/auth/[...nextauth]` | — | NextAuth handlers |
 
 For the full request/response shape, error envelope, and rate limits see
@@ -266,7 +266,7 @@ For the full request/response shape, error envelope, and rate limits see
 ```
 pagevault/
 ├── app/                          # Next.js App Router
-│   ├── api/                      # Route handlers (session or CRON_SECRET)
+│   ├── api/                      # Route handlers (session or CRON_SHARED_SECRET)
 │   │   ├── auth/[...nextauth]/   # NextAuth handler
 │   │   ├── rooms/                # Rooms CRUD, URLs, scan, schedule, notifications
 │   │   ├── changes/[changeId]/   # Change detail
@@ -393,7 +393,7 @@ The short version:
 
 1. Push to `main`; Vercel builds and deploys.
 2. In the InsForge dashboard, ensure the two scheduled functions
-   (`scan-all`, `notification-worker`) are registered with `CRON_SECRET`
+   (`scan-all`, `notification-worker`) are registered with `CRON_SHARED_SECRET`
    set in their headers.
 3. Smoke-test `POST /api/cron/scan-all` from the InsForge function
    console; expect a 200 and a `scan_jobs` row.
@@ -431,7 +431,7 @@ still treated as "present" — the real-call path will surface the
 
 ### Cron returns 401
 
-The InsForge schedule must send `CRON_SECRET` as a header (e.g.
+The InsForge schedule must send `CRON_SHARED_SECRET` as a header (e.g.
 `x-cron-secret: <value>`) and that value must match what's in the
 app's environment. `requireCronSecret()` in `lib/cron-auth.ts` is the
 gate; `docs/DEPLOYMENT.md` §"Scheduled scans" has the exact header
