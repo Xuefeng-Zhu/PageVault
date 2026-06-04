@@ -21,6 +21,8 @@ import { Badge } from '@/components/ui/Badge';
 import { Card } from '@/components/ui/Card';
 import { SectionHeader, EmptyState, Spinner, Progress } from '@/components/ui/Primitives';
 import { StatCard } from '@/components/dashboard/StatCard';
+import { SchedulePicker } from '@/components/dashboard/SchedulePicker';
+import { NotificationList, type NotificationSubscriptionView } from '@/components/dashboard/NotificationList';
 import type { RoomDetailResponse, WatchedUrl, ChangeAnalysis } from '@/types';
 
 export default function RoomDetailPage() {
@@ -30,6 +32,28 @@ export default function RoomDetailPage() {
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [scheduleCron, setScheduleCron] = useState<string | null>(null);
+  const [subscriptions, setSubscriptions] = useState<NotificationSubscriptionView[]>([]);
+
+  const refetchSchedule = async () => {
+    const r = await fetch(`/api/rooms/${roomId}/schedule`, { cache: 'no-store' });
+    if (r.ok) {
+      const d = await r.json();
+      setScheduleCron(d.schedule?.cronExpression ?? null);
+    } else {
+      setScheduleCron(null);
+    }
+  };
+
+  const refetchSubscriptions = async () => {
+    const r = await fetch(`/api/rooms/${roomId}/notifications`, { cache: 'no-store' });
+    if (r.ok) {
+      const d = await r.json();
+      setSubscriptions(d.subscriptions ?? []);
+    } else {
+      setSubscriptions([]);
+    }
+  };
 
   useEffect(() => {
     async function fetchRoom() {
@@ -53,6 +77,8 @@ export default function RoomDetailPage() {
       }
     }
     fetchRoom();
+    refetchSchedule();
+    refetchSubscriptions();
   }, [roomId]);
 
   const handleRunScan = async () => {
@@ -183,6 +209,15 @@ export default function RoomDetailPage() {
           </Button>
         </div>
       </header>
+
+      {/* Schedule picker (per-room scan cron) */}
+      <section>
+        <SchedulePicker
+          roomId={roomId}
+          currentCron={scheduleCron}
+          onChange={refetchSchedule}
+        />
+      </section>
 
       {/* Stats */}
       <section>
@@ -339,7 +374,16 @@ export default function RoomDetailPage() {
             </div>
           )}
         </section>
-      </div>
-    </div>
-  );
-}
+        </div>
+
+        {/* Notifications */}
+        <section>
+        <NotificationList
+         roomId={roomId}
+         subscriptions={subscriptions}
+         onChange={refetchSubscriptions}
+        />
+        </section>
+        </div>
+        );
+        }

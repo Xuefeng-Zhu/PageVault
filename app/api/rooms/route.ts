@@ -1,5 +1,7 @@
 // API route: GET /api/rooms (list rooms) and POST /api/rooms (create room)
 import { NextRequest, NextResponse } from 'next/server';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { ErrorResponse, RoomWithStats, MemoryRoom } from '@/types';
 import {
   createRoom as insforgeCreateRoom,
@@ -9,6 +11,8 @@ import {
 import { validateRoomField, normalizeCategory, frequencyToCronExpression } from '@/lib/validation';
 import { createStorageFolder } from '@/lib/storage';
 import { requireSession } from '@/lib/apiAuth';
+
+const execAsync = promisify(exec);
 
 export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorResponse>> {
   const session = await requireSession();
@@ -96,6 +100,64 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
       await createRoomWithDefaults(room.id, cron);
     } catch (schedErr) {
       console.error('Failed to create default schedule for room', room.id, schedErr);
+    }
+
+    // Also register the actual InsForge cron entry so the schedule
+    // actually fires. The DB row alone is aspirational; the InsForge
+    // schedule is what InsForge calls. We use the same `--name`
+    // convention as POST /api/rooms/[id]/schedule so the per-room
+    // schedule route's update flow can find it.
+    try {
+      const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+      const secret = process.env.CRON_SHARED_SECRET;
+      if (!secret) {
+        throw new Error('CRON_SHARED_SECRET not set; cannot register InsForge schedule');
+      }
+      const headers = JSON.stringify({ 'x-cron-secret': secret });
+      const name = `pagevault-room-${room.id}`;
+      // Find any existing schedule with this name first, so we don't
+      // create duplicates on retry. (mirrors app/api/rooms/[id]/schedule/route.ts)
+      const listOut = await execAsync(
+        `npx @insforge/cli schedules list --json 2>&1`,
+        { cwd: process.cwd(), timeout: 15_000 },
+      );
+      let existingId: string | null = null;
+      try {
+        const jsonMatch = listOut.stdout.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const list = JSON.parse(jsonMatch[0]);
+          const arr = Array.isArray(list) ? list : [list];
+          const found = arr.find((s: { name?: string }) => s.name === name);
+          existingId = found?.id ?? null;
+        }
+      } catch { /* fall through to create */ }
+      const args = existingId
+        ? ['schedules', 'update', existingId, '--cron', cron, '--headers', headers]
+        : ['schedules', 'create', '--name', name, '--cron', cron,
+           '--url', `${appUrl}/api/cron/scan-all`, '--method', 'POST', '--headers', headers];
+      const cmd = `npx @insforge/cli ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`;
+      const out = await execAsync(cmd, { cwd: process.cwd(), timeout: 30_000 });
+      const m = out.stdout.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
+      const insforgeScheduleId = m ? m[0] : existingId;
+      if (insforgeScheduleId) {
+        // PATCH the scan_schedules row to record the InsForge ID so
+        // POST /api/rooms/[id]/schedule can find it for update/delete.
+        await fetch(
+          `${process.env.INSFORGE_API_URL}/api/database/records/scan_schedules?project_id=eq.${room.id}`,
+          {
+            method: 'PATCH',
+            headers: {
+              'Authorization': `Bearer ${process.env.INSFORGE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ insforge_schedule_id: insforgeScheduleId }),
+          },
+        );
+      }
+    } catch (insforgeErr) {
+      console.error('Failed to register InsForge schedule for room', room.id, insforgeErr);
+      // Best-effort: don't fail room creation. The DB row exists, and
+      // the per-room schedule route can retry the InsForge registration.
     }
 
     return NextResponse.json(room, { status: 201 });
