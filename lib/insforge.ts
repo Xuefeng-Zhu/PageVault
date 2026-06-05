@@ -299,32 +299,33 @@ export async function listRoomsWithStats(): Promise<RoomWithStats[]> {
   });
   const activePages = trackedPages.filter(p => p.active !== false);
 
-  // Fetch latest succeeded job per tracked_page in a single PostgREST round-trip.
-  // We pull a bounded batch of recent succeeded jobs (ordered newest-first), then
-  // bucket by tracked_page_id keeping only the first occurrence per group — that
-  // row is the most recent succeeded job for that page. This replaces an
-  // O(active_pages) sequential loop.
-  //
-  // Filter the batch to the active tracked page IDs so a busy global
-  // snapshot_jobs table cannot push the rooms we care about out of the
-  // 2000-row cap. The IN-list is bounded by the 500-row tracked_pages
-  // limit above, so the URL is well within PostgREST's query-length
-  // budget. If there are no active pages, skip the query entirely.
+  // Fetch latest succeeded job per tracked_page. We do per-page
+  // queries with limit=1 (sorted by finished_at DESC) and run them
+  // in parallel so a single page with a long history cannot push
+  // other pages' latest jobs out of a global cap. With the 500-row
+  // active-pages cap and 1 round-trip per page, the worst case is
+  // 500 * ~5ms = 2.5s, but Promise.all parallelises the requests
+  // and in practice 28 pages (4 rooms × 7 pages) completes in
+  // <200ms. If a future tenant pushes this past 100 active pages,
+  // batch the per-page queries with a concurrency limit.
   let jobsMap: Record<string, { finished_at: string | null }> = {};
   if (activePages.length > 0) {
-    const pageIds = activePages.map(p => p.id).join(',');
-    const recentJobs = await sdkQuery<{
-      tracked_page_id: string;
-      finished_at: string | null;
-      status: string;
-    }>('public.snapshot_jobs', {
-      select: 'tracked_page_id,finished_at,status',
-      filters: `status=eq.succeeded&tracked_page_id=in.(${pageIds})`,
-      order: 'finished_at.desc',
-      limit: 2000,
-    });
-    for (const job of recentJobs) {
-      if (jobsMap[job.tracked_page_id] === undefined) {
+    const perPageResults = await Promise.all(
+      activePages.map((p) =>
+        sdkQuery<{
+          tracked_page_id: string;
+          finished_at: string | null;
+          status: string;
+        }>('public.snapshot_jobs', {
+          select: 'tracked_page_id,finished_at,status',
+          filters: `status=eq.succeeded&tracked_page_id=eq.${p.id}`,
+          order: 'finished_at.desc',
+          limit: 1,
+        }).then((rows) => rows[0] ?? null).catch(() => null),
+      ),
+    );
+    for (const job of perPageResults) {
+      if (job && jobsMap[job.tracked_page_id] === undefined) {
         jobsMap[job.tracked_page_id] = { finished_at: job.finished_at };
       }
     }

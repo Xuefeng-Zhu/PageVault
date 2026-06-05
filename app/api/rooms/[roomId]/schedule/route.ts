@@ -29,12 +29,27 @@ async function sh(cmd: string): Promise<string> {
 
 async function findExistingScheduleId(name: string): Promise<string | null> {
   try {
-    const out = await sh(`npx @insforge/cli schedules list --json 2>&1 | grep -o '{[^}]*}' | head -50`);
-    // The CLI may print plain text or JSON. Try to parse the table output.
-    const jsonMatch = out.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
-    const list = JSON.parse(jsonMatch[0]);
-    const arr = Array.isArray(list) ? list : [list];
+    // The CLI emits JSON in --json mode. The output is the JSON array
+    // (possibly surrounded by other text in --no-pretty mode), so we
+    // take the LAST line that starts with '[' or '{' and parse it.
+    // We don't try to grep-out individual objects because nested
+    // braces in metadata break naive '{...}' regexes.
+    const out = await sh(`npx @insforge/cli schedules list --json 2>&1`);
+    const lines = out.split('\n').reverse();
+    let parsed: unknown = null;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (!(trimmed.startsWith('[') || trimmed.startsWith('{'))) continue;
+      try {
+        parsed = JSON.parse(trimmed);
+        break;
+      } catch {
+        // try the next line
+      }
+    }
+    if (parsed === null) return null;
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
     const found = arr.find((s: { name?: string }) => s.name === name);
     return found?.id ?? null;
   } catch {
