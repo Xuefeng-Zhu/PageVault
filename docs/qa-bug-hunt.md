@@ -249,7 +249,7 @@ Per the QA worker's own summary: "46 tests pass across 2 files. Every finding ha
 ### HIGH-3: UUID collision in `uuid(prefix)` scan job id generator
 
 - **File:** lib/scan.ts:290-304
-- **Status:** open in the current working tree (engineering card t_03b76d18 reports the fix shipped as a `newId()` rename with 4/4 passing tests including a 10k-unique-ids acceptance criterion, but the current `lib/scan.ts` on the current branch still exports `uuid` and uses it at three call sites: 387, 478, 558)
+- **Status:** fixed (cherry-picked from `fix/high-3-race-condition-scan-job-id-collision-is-statistica` commit c2550cc; `lib/scan.ts` no longer exports `uuid`, three call sites use `newId()` from `lib/ids.ts`; 5/5 ids.test.ts tests pass including the 10k-unique-ids acceptance criterion)
 - **Code (current):**
   ```ts
   function uuid(prefix: string): string {
