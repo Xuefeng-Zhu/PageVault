@@ -170,7 +170,11 @@ describe('listRoomsWithStats — MEDIUM-4 regression (O(1) PostgREST round-trips
       expect(q).toContain('status=eq.succeeded');
       expect(q).toContain('order=finished_at.desc');
       expect(q).toContain('limit=1');
-      expect(q).toMatch(/tracked_page_id=eq\.[0-9a-f-]{8}/);
+      // Per-page filter is `tracked_page_id=eq.<anything-not-a-comma>`.
+      // Match anything that isn't a comma or query separator so this
+      // works for both UUID fixtures and the simpler `page-${i}` ids
+      // the test fixture uses.
+      expect(q).toMatch(/tracked_page_id=eq\.[^&,\s]+/);
     }
   });
 });
