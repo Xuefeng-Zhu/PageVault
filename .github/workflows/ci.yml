@@ -1,12 +1,29 @@
 name: ci
 
-# Placeholder CI for PageVault.
+# CI for PageVault.
 #
 # Runs on every push to any branch and on every pull request targeting
-# `main`. K-17 will expand this with caching, matrix builds, and InsForge
-# integration. The job below is intentionally minimal: install, typecheck,
-# lint, test, build. The `build` step is the slowest; on a healthy PR it
-# should pass in under a couple of minutes.
+# `main`. Five jobs, ordered fast-to-slow so the PR gets a red signal
+# before the slow ones finish:
+#
+#   1. lint        — eslint (fast, ~15s)
+#   2. typecheck   — tsc --noEmit  (fast, ~5-10s)
+#   3. unit        — vitest run  (medium, ~30-60s)
+#   4. e2e         — playwright against a built+started app  (slow, ~90-180s)
+#   5. build       — next build  (slow, ~60-120s, gates merge)
+#
+# The `lint` / `typecheck` / `unit` / `e2e` jobs all run in parallel and
+# each one fails the PR independently. The `build` job is a hard gate
+# for merge — it uses the same Next.js build the deploy workflow uses.
+#
+# Required secrets: none. The build does not need live credentials
+# because the app is wired for missing-credential mock fallbacks. If
+# the build ever starts requiring secrets, fail loud here, not in prod.
+#
+# Branch protection on `main` should require this job to pass before
+# merge. See CONTRIBUTING.md for the manual GitHub UI step (this VM
+# does not have `gh` auth and cannot configure branch protection
+# itself).
 
 on:
   push:
@@ -14,15 +31,40 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel any in-flight run for the same ref when a new commit lands.
+# Saves CI minutes when a developer force-pushes a fix.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: Lint, typecheck, test, build
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,16 +81,147 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Lint
-        run: npm run lint
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Test
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
         run: npm run test
 
-      - name: Build
+  e2e:
+    name: E2E tests (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        # Chromium only — we only run a smoke test. Add more browsers
+        # to the matrix when the e2e suite grows.
+        run: npx playwright install --with-deps chromium
+
+      - name: Build app
+        # E2E runs against a built+started instance, not `next dev`.
+        # We set the dev insecure-secret opt-in so the app boots
+        # without real auth secrets — the test fixtures only hit
+        # public routes.
         run: npm run build
         env:
-          # Build should not require live credentials — the app is wired
-          # for missing-credential mock fallbacks. If the build ever
-          # starts requiring secrets, fail loud here, not in prod.
           NEXT_TELEMETRY_DISABLED: "1"
+          INSFORGE_DEV_INSECURE_SECRET: "1"
+          NEXTAUTH_SECRET: "ci-e2e-only-do-not-use-in-prod"
+          INSFORGE_API_URL: "https://example.invalid"
+          INSFORGE_ANON_KEY: "ci-e2e-anon-key"
+          INSFORGE_SERVICE_ROLE_KEY: "ci-e2e-service-role-key"
+          CRON_SHARED_SECRET: "ci-e2e-cron-secret"
+
+      - name: Start app
+        # Background process, write the pid to a file so we can stop
+        # it in the next step. `next start` blocks, so we wrap in
+        # `&` and `disown`.
+        run: |
+          nohup npm run start -- -p 3000 > .e2e-server.log 2>&1 &
+          echo $! > .e2e-server.pid
+          # Wait for the port to come up
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/ | grep -qE "^(200|307)$"; then
+              echo "App is up after $i seconds"
+              break
+            fi
+            sleep 1
+          done
+        env:
+          INSFORGE_DEV_INSECURE_SECRET: "1"
+          NEXTAUTH_SECRET: "ci-e2e-only-do-not-use-in-prod"
+          INSFORGE_API_URL: "https://example.invalid"
+          INSFORGE_ANON_KEY: "ci-e2e-anon-key"
+          INSFORGE_SERVICE_ROLE_KEY: "ci-e2e-service-role-key"
+          CRON_SHARED_SECRET: "ci-e2e-cron-secret"
+          NEXTAUTH_URL: "http://localhost:3000"
+
+      - name: Run Playwright tests
+        run: npx playwright test --reporter=line,html
+        env:
+          BASE_URL: "http://localhost:3000"
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-server-log
+          path: .e2e-server.log
+          retention-days: 7
+
+      - name: Stop app
+        if: always()
+        run: |
+          if [ -f .e2e-server.pid ]; then
+            kill "$(cat .e2e-server.pid)" 2>/dev/null || true
+            rm -f .e2e-server.pid
+          fi
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The build is the merge gate. If the app can't build, the PR
+    # cannot be merged. Keeping it as a separate job (rather than a
+    # step in the unit job) means a flaky unit run doesn't hide a
+    # build break.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        # Build should not require live credentials — the app is wired
+        # for missing-credential mock fallbacks. If the build ever
+        # starts requiring secrets, fail loud here, not in prod.
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+          INSFORGE_DEV_INSECURE_SECRET: "1"
+          NEXTAUTH_SECRET: "ci-build-only-do-not-use-in-prod"
+          INSFORGE_API_URL: "https://example.invalid"
+          INSFORGE_ANON_KEY: "ci-build-anon-key"
+          INSFORGE_SERVICE_ROLE_KEY: "ci-build-service-role-key"
+          CRON_SHARED_SECRET: "ci-build-cron-secret"

@@ -1,5 +1,9 @@
 # PageVault — AI Memory Layer for the Web
 
+[![CI](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/ci.yml/badge.svg)](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/ci.yml)
+[![Deploy staging](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/deploy-staging.yml/badge.svg)](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/deploy-staging.yml)
+[![Deploy production](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/deploy-prod.yml/badge.svg)](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/deploy-prod.yml)
+
 > **Apify captures the web. Box stores the memory. AI explains the change.**
 
 PageVault is a Next.js (App Router) + TypeScript full-stack application that monitors public web pages using Apify, stores every snapshot and report as evidence in Box, persists metadata in an Insforge Postgres backend, and uses an OpenAI-compatible LLM to explain what changed and why it matters.

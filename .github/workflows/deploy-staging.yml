@@ -1,0 +1,180 @@
+name: deploy-staging
+
+# Deploy to staging on every push to main.
+#
+# Triggers on:
+#   - push to main
+#
+# Flow:
+#   1. Build the app with `next build`. If this fails we never call
+#      Vercel, saving a deploy-minute. (Vercel will rebuild in its
+#      own infrastructure, but a local build catches missing-
+#      credential build errors before we hand off.)
+#   2. Install the Vercel CLI.
+#   3. `vercel deploy --target=preview` to the staging URL.
+#   4. Smoke-test the deployed URL with the same checks the local
+#      e2e suite uses.
+#   5. Post a commit status.
+#
+# Required secrets (configured in the GitHub repo's settings):
+#   VERCEL_TOKEN         — Vercel account token (Settings -> Tokens).
+#   VERCEL_ORG_ID        — Vercel team ID. `vercel org ls` shows it.
+#   VERCEL_PROJECT_ID    — Vercel project ID. `vercel project ls`.
+#
+# The secrets are also used by deploy-prod.yml — keep them shared.
+# Vercel project-level env vars (the actual `INSFORGE_*`, etc.)
+# live in the Vercel dashboard, not in GitHub, so this workflow
+# does not need them.
+#
+# Branch protection on main should require the `ci / build` job to
+# pass before merge. Since this workflow triggers *after* the merge,
+# a red build would only fire if a maintainer pushed without PR
+# review — admin-only — and the local `npm run build` step catches
+# the same regressions CI would, so we don't re-run CI here.
+#
+# Cancel any in-flight staging deploy when a new commit lands on
+# main. Same concurrency group as the prod deploy so we don't
+# double-fire if both somehow trigger for the same SHA.
+concurrency:
+  group: deploy-staging-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+
+# Read-only is enough for the checkout. Vercel CLI uses a long-lived
+# token (VERCEL_TOKEN), not OIDC, so we don't need id-token: write.
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to Vercel preview (staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app
+        # Vercel will rebuild in its own infrastructure, but a
+        # local build catches missing-credential build errors before
+        # we hand the deploy off. If this fails we never call Vercel.
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
+      - name: Install Vercel CLI
+        run: npm install --no-save vercel@latest
+
+      - name: Verify Vercel secrets are present
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          # Failing loud here is better than a 30-second deploy that
+          # 403s at the end. See docs/runbook.md for how to mint these.
+          : "${VERCEL_TOKEN:?VERCEL_TOKEN is required}"
+          : "${VERCEL_ORG_ID:?VERCEL_ORG_ID is required}"
+          : "${VERCEL_PROJECT_ID:?VERCEL_PROJECT_ID is required}"
+          echo "Vercel secrets are present."
+
+      - name: Deploy to Vercel preview
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          # --target=preview  : deploy as a preview, not a production
+          #                     promotion. Production promotions
+          #                     happen via deploy-prod.yml on a
+          #                     `v*` tag.
+          # --yes             : skip the "set up new project" prompt
+          #                     on the first run.
+          # --confirm         : same.
+          # We capture stdout for the URL so we can post it as a
+          # commit status and as a step summary.
+          set -o pipefail
+          OUTPUT=$(npx vercel deploy --target=preview --yes --confirm \
+            --token "$VERCEL_TOKEN" 2>&1)
+          echo "$OUTPUT"
+          URL=$(echo "$OUTPUT" | grep -Eo 'https://[a-z0-9.-]+vercel\.app' | tail -n 1)
+          if [ -n "$URL" ]; then
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Staging deploy"
+              echo ""
+              echo "- URL: $URL"
+              echo "- Commit: $GITHUB_SHA"
+              echo "- Actor: $GITHUB_ACTOR"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Could not parse Vercel preview URL from output"
+            exit 1
+          fi
+
+      - name: Smoke-test the preview
+        # Hit the deployed URL with the same smoke checks the
+        # e2e job uses locally. Catches a class of "deploy
+        # succeeded but routing/auth regressed" failures.
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "No URL captured, skipping smoke test"
+            exit 0
+          fi
+          echo "Smoke-testing $URL"
+          # 1. Home page is reachable
+          HOME_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/")
+          echo "  /              -> $HOME_STATUS"
+          test "$HOME_STATUS" = "200" || { echo "::error::Home page returned $HOME_STATUS"; exit 1; }
+          # 2. Login page is reachable
+          LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/login")
+          echo "  /login         -> $LOGIN_STATUS"
+          test "$LOGIN_STATUS" = "200" || { echo "::error::Login page returned $LOGIN_STATUS"; exit 1; }
+          # 3. Dashboard is gated
+          DASH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/dashboard")
+          echo "  /dashboard     -> $DASH_STATUS  (expected 307)"
+          test "$DASH_STATUS" = "307" || { echo "::error::Dashboard returned $DASH_STATUS, expected 307"; exit 1; }
+          # 4. /api/rooms requires auth
+          ROOMS_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/api/rooms")
+          echo "  /api/rooms     -> $ROOMS_STATUS  (expected 401)"
+          test "$ROOMS_STATUS" = "401" || { echo "::error::api/rooms returned $ROOMS_STATUS, expected 401"; exit 1; }
+          echo "All smoke checks passed."
+
+      - name: Post deploy commit status
+        if: always()
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            STATE="success"
+            DESC="Deployed to staging"
+          else
+            STATE="failure"
+            DESC="Staging deploy failed"
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "$(jq -nc \
+              --arg state "$STATE" \
+              --arg desc "$DESC" \
+              --arg url "${URL:-}" \
+              --arg ctx "deploy/staging" \
+              '{state: $state, description: $desc, target_url: (if $url == "" then null else $url end), context: $ctx}')"
