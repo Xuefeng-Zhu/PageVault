@@ -88,6 +88,15 @@ describe('isBlockedAddress', () => {
   it('blocks IPv6 loopback (::1) and IPv4-mapped loopback (::ffff:127.0.0.1)', () => {
     expect(isBlockedAddress('::1')).toBe(true);
     expect(isBlockedAddress('::ffff:127.0.0.1')).toBe(true);
+    // Hex forms (the form new URL() normalizes the dotted-quad to when
+    // the trailing bytes contain leading zeros). Without these, a URL
+    // like http://[::ffff:127.0.0.1]/ was normalizeable to ::ffff:7f00:1
+    // and slipped past the dotted-quad-only regex. Covers loopback,
+    // private, and the cloud-metadata IP via the v4-mapped form.
+    expect(isBlockedAddress('::ffff:7f00:1')).toBe(true);      // 127.0.0.1
+    expect(isBlockedAddress('::ffff:0a0a:0a0a')).toBe(true);  // 10.10.10.10
+    expect(isBlockedAddress('::ffff:c0a8:0101')).toBe(true);  // 192.168.1.1
+    expect(isBlockedAddress('::ffff:a9fe:a9fe')).toBe(true);  // 169.254.169.254
   });
 
   it('blocks IPv6 unique-local fc00::/7', () => {

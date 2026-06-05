@@ -80,11 +80,54 @@ function htmlToMarkdown(html: string): { title: string; markdown: string; text: 
 /** True if the address is in any range we refuse to crawl. */
 export function isBlockedAddress(addr: string): boolean {
   if (!addr) return false;
-  // Normalize IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) to their v4 form
-  // so the v4 blocklist catches them. node's `dns.lookup` returns these
-  // in mixed form depending on the resolver.
-  const v4Mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(addr);
-  if (v4Mapped) return isBlockedAddress(v4Mapped[1]);
+  // Normalize IPv4-mapped IPv6 to their v4 form so the v4 blocklist
+  // catches them. Accepts all three common forms:
+  //   ::ffff:127.0.0.1   (dotted-quad; the form new URL() emits for
+  //                       many resolvers)
+  //   ::ffff:7f00:1      (compressed hex; what new URL() emits for
+  //                       the dotted-quad form when the trailing bytes
+  //                       contain leading zeros)
+  //   ::ffff:0:0:7f00:1  (fully expanded)
+  // node's `dns.lookup` returns these in mixed form depending on the
+  // resolver, so we expand the address to its full 8-group form first
+  // (via expandIPv6ForMapping), then detect the ::ffff: prefix and
+  // pull the 32-bit v4 address out of the trailing groups. The dotted-
+  // quad form is handled in a separate case from the hex form.
+  if (addr.includes(':')) {
+    const expanded = expandIPv6ForMapping(addr);
+    // Case 1: trailing dotted-quad in the last group, e.g.
+    //   "0000:0000:0000:0000:0000:0000:ffff:127.0.0.1" (6 leading zeros)
+    //   "0000:0000:0000:0000:0000:ffff:127.0.0.1"     (5 leading zeros,
+    //                                                   the canonical
+    //                                                   "::ffff:127.0.0.1" form)
+    // The `(?:0+:)+` pattern is non-capturing (so the dotted-quad in
+    // group 1 is the only captured group) and matches one or more
+    // `0xxx:` groups (the leading zero run), then requires the literal
+    // `ffff:`. (A plain `^0+:` won't work because regex quantifiers
+    // don't backtrack across colons — each `0+` greedily consumes the
+    // trailing colon of its group, so the next match attempt starts
+    // at the next group's `0`, never at the `f` of `ffff:`.)
+    const dottedMatch = /^(?:0+:)+ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(expanded);
+    if (dottedMatch) {
+      return isBlockedAddress(dottedMatch[1]);
+    }
+    // Case 2: trailing hex form (two 16-bit groups, e.g.
+    //   "0000:0000:0000:0000:0000:ffff:7f00:1"     (compressed)
+    //   "0000:0000:0000:0000:0000:ffff:0:7f00:1"   (expanded with one
+    //                                                     leading zero)
+    // The v4 address is split as `7f00` / `1` = (a, b) where the
+    // dotted form is a.b.c.d and a = 7f, b = 00, c = 00, d = 01.
+    // Both `7f00` and `1` (or `0` / `7f00` in the expanded form) are
+    // captured as non-capturing groups so group 1 / group 2 are
+    // unambiguous.
+    const hexMatch = /^(?:0+:)+ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(expanded);
+    if (hexMatch) {
+      const a = parseInt(hexMatch[1], 16);
+      const b = parseInt(hexMatch[2], 16);
+      const dot = `${(a >> 8) & 0xff}.${a & 0xff}.${(b >> 8) & 0xff}.${b & 0xff}`;
+      return isBlockedAddress(dot);
+    }
+  }
 
   // IPv6
   if (addr.includes(':')) {
@@ -196,6 +239,35 @@ export async function validateCrawlUrl(input: string): Promise<string> {
   return input;
 }
 
+/**
+ * Expand an IPv6 address to its full 8-group colon-hex form. Returns
+ * the input unchanged if it doesn't look like an IPv6 address. Handles
+ * the `::` shorthand by computing the missing zero groups. Used by
+ * isBlockedAddress() to normalize ::ffff: mappings before checking
+ * the v4 blocklist. (new URL() sometimes normalizes the dotted-quad
+ * form ::ffff:127.0.0.1 to the compressed hex form ::ffff:7f00:1,
+ * and the uncompressed form ::ffff:0:0:7f00:1 is also seen in the
+ * wild; we accept all three.)
+ */
+function expandIPv6ForMapping(addr: string): string {
+  if (!addr.includes(':')) return addr;
+  const lc = addr.toLowerCase();
+  // The `::` shorthand: split on the first `::` and pad to 8 groups.
+  const dci = lc.indexOf('::');
+  if (dci !== -1) {
+    const head = lc.slice(0, dci);
+    const tail = lc.slice(dci + 2);
+    const headParts = head === '' ? [] : head.split(':');
+    const tailParts = tail === '' ? [] : tail.split(':');
+    const missing = 8 - headParts.length - tailParts.length;
+    if (missing < 0) return addr; // malformed; let downstream reject
+    const full = [...headParts, ...Array(missing).fill('0'), ...tailParts];
+    return full.map((g) => g.padStart(4, '0')).join(':');
+  }
+  // No `::` shorthand: just zero-pad each group.
+  return lc.split(':').map((g) => g.padStart(4, '0')).join(':');
+}
+
 function isLiteralIPv4(host: string): boolean {
   const parts = host.split('.');
   if (parts.length !== 4) return false;
@@ -254,14 +326,44 @@ async function crawlOne(url: string): Promise<{
     console.warn(`[scan] Apify call failed for ${url}, falling back to direct fetch`);
   }
 
-  // Direct fetch path
-  const r = await fetch(url, {
-    headers: {
-      'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    },
-    redirect: 'follow',
-  });
+  // Direct fetch path. We use redirect: 'manual' so we can
+  // re-validate every Location header against the SSRF blocklist;
+  // the default 'follow' would silently redirect a public URL
+  // to http://169.254.169.254/ (cloud metadata) or http://127.0.0.1/
+  // (loopback) without re-running the private-address checks.
+  const MAX_REDIRECTS = 5;
+  let currentUrl = url;
+  let r: Response | null = null;
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    // SSRF guard: re-validate every hop. validateCrawlUrl() also
+    // does the DNS resolution + IP blocklist check, so a public
+    // hostname that resolves to a private address is caught here.
+    await validateCrawlUrl(currentUrl);
+    const res = await fetch(currentUrl, {
+      headers: {
+        'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      redirect: 'manual',
+    });
+    // Non-redirect: we have the final response.
+    if (res.status < 300 || res.status >= 400) {
+      r = res;
+      break;
+    }
+    // 3xx: read Location, loop.
+    const location = res.headers.get('location');
+    if (!location) {
+      // 3xx with no Location is malformed; treat as terminal.
+      r = res;
+      break;
+    }
+    // Resolve relative to the current URL.
+    currentUrl = new URL(location, currentUrl).toString();
+  }
+  if (!r) {
+    throw new Error(`Failed to fetch ${url}: too many redirects (limit ${MAX_REDIRECTS})`);
+  }
   if (!r.ok) throw new Error(`Failed to fetch ${url}: ${r.status} ${r.statusText}`);
   const html = await r.text();
   const { title, markdown, text } = htmlToMarkdown(html);

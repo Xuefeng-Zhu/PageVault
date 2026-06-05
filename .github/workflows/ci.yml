@@ -44,6 +44,21 @@ jobs:
 
       - name: Test
         run: npm run test
+        env:
+          # lib/scan.ts has a top-level guard that throws if
+          # INSFORGE_API_URL is unset, and the new lib/scan.test.ts
+          # imports from it. The guard refuses to run scans against
+          # an unknown InsForge tenant in production but CI is a
+          # test environment with mocked dns.lookup + mocked fetch,
+          # so we seed placeholder values here. Real integration
+          # tests (K-17) will use the project's test tenant.
+          INSFORGE_API_URL: "https://ci-placeholder.insforge.app"
+          INSFORGE_SERVICE_ROLE_KEY: "ci-placeholder-service-role-key-must-be-at-least-32-chars-long"
+          NEXT_PUBLIC_INSFORGE_ANON_KEY: "ci-placeholder-anon-key-must-be-at-least-32-chars-long"
+          CRON_SHARED_SECRET: "ci-placeholder-cron-secret-must-be-at-least-32-chars-long"
+          NEXTAUTH_SECRET: "ci-placeholder-nextauth-secret-must-be-at-least-32-chars-long"
+          INSFORGE_DEV_DEMO_AUTH: "1"
+          CI: "1"
 
       - name: Build
         run: npm run build
