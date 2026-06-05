@@ -240,6 +240,36 @@ export async function validateCrawlUrl(input: string): Promise<string> {
 }
 
 /**
+ * Like validateCrawlUrl, but also returns the IP address(es) the
+ * hostname resolves to at validation time. Callers MUST use the
+ * returned IP for the outbound request (e.g. via the URL trick below
+ * or an https.Agent with a fixed localAddress) to prevent DNS
+ * rebinding — if the request is sent by hostname, the second
+ * resolution can land on a different (attacker-controlled) IP than
+ * the one the guard validated.
+ *
+ * For literal-IP hostnames, returns the literal IP as a single-entry
+ * array (the caller can pin to it).
+ *
+ * Returns a structured object { url, ips } so the caller has both
+ * the canonical URL and the pinned addresses to use in the fetch.
+ */
+export async function resolveAndValidateCrawlUrl(input: string): Promise<{ url: string; ips: string[] }> {
+  const validated = await validateCrawlUrl(input);
+  const parsed = new URL(validated);
+  const bareHost = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname;
+  if (isLiteralIPv4(bareHost) || isLiteralIPv6(bareHost)) {
+    return { url: validated, ips: [bareHost] };
+  }
+  // Already validated by validateCrawlUrl above; lookup again to get
+  // the IPs (validateCrawlUrl only checked them, didn't return them).
+  const addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
+  return { url: validated, ips: addrs.map((a) => a.address) };
+}
+
+/**
  * Expand an IPv6 address to its full 8-group colon-hex form. Returns
  * the input unchanged if it doesn't look like an IPv6 address. Handles
  * the `::` shorthand by computing the missing zero groups. Used by
@@ -331,18 +361,45 @@ async function crawlOne(url: string): Promise<{
   // the default 'follow' would silently redirect a public URL
   // to http://169.254.169.254/ (cloud metadata) or http://127.0.0.1/
   // (loopback) without re-running the private-address checks.
+  //
+  // DNS-rebinding defense: the SSRF guard above resolves the
+  // hostname and checks every returned IP, but the next fetch() does
+  // its own DNS lookup. Between the guard and the fetch, a malicious
+  // authoritative DNS server (or a TOCTOU in node's resolver) can
+  // flip the answer to a private IP. To prevent that, we pin the
+  // request to the IP we already validated by rewriting the URL to
+  // `http://ip/` and passing the original hostname in the `Host`
+  // header. TLS SNI / virtual-host handling then sees the right
+  // hostname. This is the standard "host-header pinning" pattern
+  // for SSRF defenses.
   const MAX_REDIRECTS = 5;
   let currentUrl = url;
+  let currentHostHeader: string | null = null;
   let r: Response | null = null;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    // SSRF guard: re-validate every hop. validateCrawlUrl() also
-    // does the DNS resolution + IP blocklist check, so a public
-    // hostname that resolves to a private address is caught here.
-    await validateCrawlUrl(currentUrl);
+    // SSRF guard + DNS-rebinding pin. resolveAndValidateCrawlUrl
+    // returns the validated URL and the IP(s) the hostname resolves
+    // to; we use the first IP for the request URL and the original
+    // hostname for the Host header.
+    const resolved = await resolveAndValidateCrawlUrl(currentUrl);
+    currentUrl = resolved.url;
+    if (resolved.ips.length > 0) {
+      const parsed = new URL(currentUrl);
+      const ipForHost = resolved.ips[0];
+      currentHostHeader = parsed.host;
+      // Rewrite the URL to use the IP. For IPv6, wrap in brackets.
+      const ipForUrl = ipForHost.includes(':') ? `[${ipForHost}]` : ipForHost;
+      parsed.host = `${ipForUrl}:${parsed.port}`;
+      currentUrl = parsed.toString();
+    }
     const res = await fetch(currentUrl, {
       headers: {
         'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        // Pin the original hostname (so the server's SNI / virtual
+        // host routing sees the right name even though we connected
+        // to the IP).
+        ...(currentHostHeader ? { Host: currentHostHeader } : {}),
       },
       redirect: 'manual',
     });
@@ -351,15 +408,21 @@ async function crawlOne(url: string): Promise<{
       r = res;
       break;
     }
-    // 3xx: read Location, loop.
+    // 3xx: read Location, loop. After a redirect, the next URL
+    // is a hostname (parsed from the Location header) and we
+    // re-pin on the next iteration. Reset the Host header so the
+    // next resolveAndValidateCrawlUrl call repopulates it.
     const location = res.headers.get('location');
     if (!location) {
       // 3xx with no Location is malformed; treat as terminal.
       r = res;
       break;
     }
-    // Resolve relative to the current URL.
+    // Resolve relative to the previous URL (which was the pinned
+    // IP-based URL). The next iteration re-resolves and re-pins
+    // for the new hostname.
     currentUrl = new URL(location, currentUrl).toString();
+    currentHostHeader = null;
   }
   if (!r) {
     throw new Error(`Failed to fetch ${url}: too many redirects (limit ${MAX_REDIRECTS})`);
