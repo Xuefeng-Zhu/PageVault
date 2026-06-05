@@ -16,6 +16,7 @@
 | `INSFORGE_DEV_INSECURE_SECRET` | dev only | Auto-generate a random per-process JWT secret | normal behaviour (throws on missing `NEXTAUTH_SECRET`) | not set |
 | `APIFY_API_TOKEN` | optional | Real Apify crawler | Direct `fetch()` + HTML→Markdown fallback | not set |
 | `APIFY_ACTOR_ID` | optional | Which Apify Actor to call | Required if `APIFY_API_TOKEN` is set | — |
+| `APIFY_WEBHOOK_SECRET` | **yes** (prod, if Apify webhooks are enabled) | Shared secret Apify sends in the `X-Shared-Secret` header of completion webhooks. Required by the production `/functions/apify-webhook` edge function | Edge function returns 503 `service_unconfigured` for every request | — |
 | `OPENAI_API_KEY` | optional | OpenAI Chat Completions | Falls back to `OPENROUTER_API_KEY` if both are set | — |
 | `OPENAI_BASE_URL` | optional | Override the OpenAI base URL (for OpenRouter, custom endpoints) | `https://api.openai.com/v1` | `https://openai.com/v1` |
 | `OPENAI_MODEL` | optional | Which model the analyzer calls | `anthropic/claude-3.5-haiku` (via OpenRouter) or `gpt-4o-mini` (via OpenAI) | `gpt-4o-mini` |

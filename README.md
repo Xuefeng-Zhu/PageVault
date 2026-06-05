@@ -177,6 +177,13 @@ INSFORGE_ANON_KEY=your-anon-key                # required even when SRK is set
 APIFY_API_TOKEN=your-apify-token
 APIFY_ACTOR_ID=your-actor-id
 
+# Apify webhook shared secret — required for the production
+# `/functions/apify-webhook` edge function. Apify must send the same
+# value in the `X-Shared-Secret` header. Without this set, the
+# function returns 503 `service_unconfigured` for every request.
+# Generate with `openssl rand -base64 48`.
+APIFY_WEBHOOK_SECRET=any-long-random-string
+
 # Cron auth — required for the scheduled-scan endpoints
 CRON_SHARED_SECRET=any-long-random-string            # must match what the
                                               # InsForge schedule sends
