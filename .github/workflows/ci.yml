@@ -67,3 +67,17 @@ jobs:
           # for missing-credential mock fallbacks. If the build ever
           # starts requiring secrets, fail loud here, not in prod.
           NEXT_TELEMETRY_DISABLED: "1"
+          # lib/scan.ts has a top-level guard that throws at module load
+          # when INSFORGE_API_URL is unset, and `next build` imports
+          # API routes (e.g. app/api/cron/scan-all/route.ts) which
+          # transitively import lib/scan.ts. Seed the same placeholder
+          # values we use in the Test step. The build doesn't actually
+          # connect to InsForge (mock fallbacks fire for every other
+          # integration), it just needs the guard to not throw at load.
+          INSFORGE_API_URL: "https://ci-placeholder.insforge.app"
+          INSFORGE_SERVICE_ROLE_KEY: "ci-placeholder-service-role-key-must-be-at-least-32-chars-long"
+          NEXT_PUBLIC_INSFORGE_ANON_KEY: "ci-placeholder-anon-key-must-be-at-least-32-chars-long"
+          CRON_SHARED_SECRET: "ci-placeholder-cron-secret-must-be-at-least-32-chars-long"
+          NEXTAUTH_SECRET: "ci-placeholder-nextauth-secret-must-be-at-least-32-chars-long"
+          INSFORGE_DEV_DEMO_AUTH: "1"
+          CI: "1"
