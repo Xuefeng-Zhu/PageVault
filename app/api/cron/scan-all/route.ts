@@ -9,7 +9,20 @@ import { getInsforgeBaseUrl } from '@/lib/env';
 const MAX_CONCURRENT = 3;
 
 export async function POST(request: NextRequest) {
-  if (!requireCronSecret(request)) {
+  // MEDIUM-1 (docs/qa-bug-hunt.md): use the discriminated result
+  // from requireCronSecret so we can return 503 service_unconfigured
+  // for the "secret not set on the server" case, distinct from the
+  // 401 we return for "secret set but candidate wrong/missing". A
+  // boolean coercion here would conflate them and lose the
+  // operator-alerting signal that the deployment is misconfigured.
+  const auth = requireCronSecret(request);
+  if (!auth.ok) {
+    if (auth.reason === 'unconfigured') {
+      return NextResponse.json(
+        { error: 'service_unconfigured', detail: 'CRON_SHARED_SECRET is not set on the server' },
+        { status: 503 },
+      );
+    }
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
   }
 
@@ -43,7 +56,7 @@ export async function POST(request: NextRequest) {
           results.push({ roomId: sched.project_id, status: 'skipped', reason: 'room_not_found' });
           continue;
         }
-        const summary = await runScan(room);
+        const summary = await runScan(room, { triggerType: 'schedule' });
         results.push({ roomId: sched.project_id, ...summary });
         // Update last_run_at (best-effort, do not fail the worker on DB error)
         updateScheduleLastRun(sched.id, now).catch((e: unknown) =>

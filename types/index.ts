@@ -45,6 +45,15 @@ export interface RoomWithStats extends MemoryRoom {
   highCount: number;
   mediumCount: number;
   lastScanAt: string | null;
+  /**
+   * Source URLs actively watched for this room. Populated server-side by
+   * `listRoomsWithStats` from the `tracked_pages` table; only active rows
+   * (active !== false) are included. This is a list of plain URL strings,
+   * not `WatchedUrl` objects — the per-room detail route returns the full
+   * `WatchedUrl[]` shape, but the list endpoint only needs the count for
+   * dashboard stat cards.
+   */
+  watchedUrls: string[];
 }
 
 export interface WatchedUrl {

@@ -49,6 +49,12 @@ If you're new to PageVault, read in this order:
 - **[plans/2026-06-02-scheduled-scans-and-notifications.md](plans/2026-06-02-scheduled-scans-and-notifications.md)**
   — the implementation plan for scheduled scans and notifications, with
   verification steps per task. Useful when reading the cron code.
+- **[SCHEDULED_SCANS.md](SCHEDULED_SCANS.md)** — user-facing doc for the
+  scheduled-scans feature. How cron presets work, what the scan pipeline
+  does, costs, the API surface, and how to verify a scan ran.
+- **[NOTIFICATIONS.md](NOTIFICATIONS.md)** — user-facing doc for outbound
+  webhook notifications. Payload shape, HMAC signature verification,
+  thresholds, auto-disable semantics, Slack example, reliability model.
 - **[superpowers/specs/](../docs/superpowers/specs/)** — design specs for the
   same two features; what we wanted to build.
 - **[SYSTEM_DESIGN.md](../SYSTEM_DESIGN.md)** *(repo root)* — the

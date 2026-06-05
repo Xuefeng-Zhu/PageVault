@@ -51,25 +51,53 @@ async function dbGet(path: string): Promise<unknown[]> {
   return r.json();
 }
 
-// RPC endpoint for PostgREST stored procedures. Returns the parsed JSON
-// body on success, or null on non-ok. The endpoint path is relative to
-// the project's RPC base (which InsForge mounts at /api/database/rpc/).
-async function dbRpc(path: string, body: unknown): Promise<unknown | null> {
+// Discriminated result for RPC calls. MEDIUM-3 (qa-bug-hunt.md) requires
+// the worker to distinguish three outcomes that the old `unknown | null`
+// shape collapsed into one:
+//   - { ok: true,  value: T }   — RPC succeeded and returned a body
+//   - { ok: false, status, error } — RPC responded with non-2xx OR the
+//                                    fetch itself rejected (network)
+// `status: 0` is reserved for the network-failure case so callers can
+// tell a server-side problem from a transport problem at a glance.
+type RpcResult<T = unknown> =
+  | { ok: true; value: T | null }
+  | { ok: false; status: number; error: string };
+
+// RPC endpoint for PostgREST stored procedures. Returns a discriminated
+// result so callers can tell "RPC endpoint is down" (5xx / network) apart
+// from "RPC succeeded and returned a falsy/empty value" (204, 200 with
+// `false`, 200 with `null`).
+async function dbRpc(path: string, body: unknown): Promise<RpcResult> {
   const base = getInsforgeBaseUrl();
-  const r = await fetch(`${base}/api/database/rpc/${path}`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${SRK()}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) return null;
+  let r: Response;
+  try {
+    r = await fetch(`${base}/api/database/rpc/${path}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${SRK()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    // Network / TLS / DNS — surface as status=0 so the caller can 5xx.
+    const msg = err instanceof Error ? (err.message || err.name) : String(err);
+    return { ok: false, status: 0, error: `${path} RPC transport error: status=0 ${msg}` };
+  }
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    const snippet = text ? text.slice(0, 200) : '(empty)';
+    return {
+      ok: false,
+      status: r.status,
+      error: `${path} RPC failed: status=${r.status} body=${snippet}`,
+    };
+  }
   // 204 No Content for void functions; the body is empty
-  if (r.status === 204) return null;
+  if (r.status === 204) return { ok: true, value: null };
   const text = await r.text();
-  if (!text) return null;
-  try { return JSON.parse(text); } catch { return text; }
+  if (!text) return { ok: true, value: null };
+  try { return { ok: true, value: JSON.parse(text) }; } catch { return { ok: true, value: text }; }
 }
 
 // Called from lib/scan.ts after the ai_explanations insert.
@@ -90,20 +118,57 @@ export async function enqueueNotification(opts: {
   return { enqueued: rows.length };
 }
 
-// Returns the count of pending → delivered/failed.
-export async function drainOutbox(limit = 50): Promise<{ processed: number; succeeded: number; failed: number }> {
+// Drain result. Three explicit outcomes (MEDIUM-3):
+//   - { acquired: true,  no error } — we hold the lock, did the work.
+//   - { acquired: false, no error } — peer holds the lock, we skipped.
+//   - { acquired: true,  error: <string> } — RPC endpoint is down
+//                                          (5xx or network). We didn't
+//                                          acquire, but the flag is
+//                                          "true" so callers can tell
+//                                          "this tick was broken" apart
+//                                          from "another worker has it."
+//
+// The cron route surfaces `error` as 5xx so operator alerting fires.
+export type DrainResult = {
+  acquired: boolean;
+  processed: number;
+  succeeded: number;
+  failed: number;
+  error?: string;
+};
+
+// Returns the count of pending → delivered/failed, with explicit
+// acquisition and error states so the cron route can surface failures
+// as 5xx (MEDIUM-3).
+export async function drainOutbox(limit = 50): Promise<DrainResult> {
   // Acquire advisory lock via the public-schema wrapper. Returns the
   // scalar boolean directly (RPC endpoint, not the table endpoint).
-  const got = await dbRpc('acquire_notification_lock', { arg: 42 });
-  if (got !== true) {
-    return { processed: 0, succeeded: 0, failed: 0 };
+  const lockResult = await dbRpc('acquire_notification_lock', { arg: 42 });
+  if (!lockResult.ok) {
+    // RPC endpoint is down (5xx or network). Short-circuit with a
+    // structured error so the cron route can 5xx and operator
+    // alerting can fire. We do NOT attempt to query outbox rows or
+    // release a lock we never held. `acquired: true` here means
+    // "we attempted to acquire" (the alternative, false, is reserved
+    // for the healthy peer-hold case).
+    return {
+      acquired: true,
+      processed: 0,
+      succeeded: 0,
+      failed: 0,
+      error: lockResult.error,
+    };
+  }
+  if (lockResult.value !== true) {
+    // RPC succeeded, peer holds the lock. Not an error.
+    return { acquired: false, processed: 0, succeeded: 0, failed: 0 };
   }
 
   try {
     const rows = await dbGet(
       `notification_outbox?status=eq.pending&next_attempt_at=lte.${new Date().toISOString()}&order=next_attempt_at.asc&limit=${limit}&select=id,subscription_id,ai_explanation_id,attempts`,
     ) as Array<{ id: string; subscription_id: string; ai_explanation_id: string; attempts: number }>;
-    if (rows.length === 0) return { processed: 0, succeeded: 0, failed: 0 };
+    if (rows.length === 0) return { acquired: true, processed: 0, succeeded: 0, failed: 0 };
 
     let succeeded = 0;
     let failed = 0;
@@ -153,10 +218,14 @@ export async function drainOutbox(limit = 50): Promise<{ processed: number; succ
         failed++;
       }
     }
-    return { processed: rows.length, succeeded, failed };
+    return { acquired: true, processed: rows.length, succeeded, failed };
   } finally {
-    // Release the lock (best-effort, via the public-schema wrapper)
-    await dbRpc('release_notification_lock', { arg: 42 }).catch(() => undefined);
+    // Release the lock (best-effort, via the public-schema wrapper).
+    // We still swallow release errors — the lock is advisory and will
+    // time out — but we don't want a release failure to mask the work
+    // result with a 500.
+    const release = await dbRpc('release_notification_lock', { arg: 42 });
+    void release;
   }
 }
 

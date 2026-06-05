@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Calendar, Edit2 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -26,6 +26,20 @@ export function SchedulePicker({
   const [custom, setCustom] = useState(currentCron ?? '');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Sync the local custom input when the parent's currentCron prop
+  // resolves after first render. Without this, opening the custom
+  // editor on a room that already has a custom cron would show a
+  // blank field because the useState initializer only ran with
+  // currentCron === null. Use a separate tracking value so we only
+  // re-sync when the prop itself changes (not when the user is
+  // mid-edit and has a different local value).
+  const [lastSeenCron, setLastSeenCron] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    if (lastSeenCron !== currentCron) {
+      setCustom(currentCron ?? '');
+      setLastSeenCron(currentCron);
+    }
+  }, [currentCron, lastSeenCron]);
   const currentLabel = PRESETS.find((p) => p.cron === currentCron)?.label
     ?? (currentCron ? `Custom (${currentCron})` : 'Off');
 

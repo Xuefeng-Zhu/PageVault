@@ -5,11 +5,31 @@ import { requireCronSecret } from '@/lib/cron-auth';
 import { drainOutbox } from '@/lib/notifications';
 
 export async function POST(request: NextRequest) {
-  if (!requireCronSecret(request)) {
+  // MEDIUM-3 also picks up the discriminated auth shape from
+  // MEDIUM-1 (constant-time secret compare). Three outcomes:
+  //   ok          → proceed with the drain
+  //   mismatch    → 401 (wrong / missing header)
+  //   unconfigured → 503 (operator misconfig, distinct from 401 so
+  //                  alerting can tell "attacker probing" from
+  //                  "service not deployed yet")
+  const auth = requireCronSecret(request);
+  if (!auth.ok) {
+    if (auth.reason === 'unconfigured') {
+      return NextResponse.json(
+        { error: 'service_unconfigured', detail: 'CRON_SHARED_SECRET is not set on the server' },
+        { status: 503 },
+      );
+    }
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
   }
   try {
     const result = await drainOutbox(50);
+    // MEDIUM-3: surface RPC failures as 5xx so operator alerting fires.
+    // The worker no longer reports a healthy "no work" tick for a
+    // broken RPC endpoint — `error` is set only on real failures.
+    if (result.error) {
+      return NextResponse.json(result, { status: 500 });
+    }
     return NextResponse.json(result);
   } catch (err) {
     console.error('notification-worker error:', err);

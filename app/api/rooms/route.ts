@@ -1,5 +1,7 @@
 // API route: GET /api/rooms (list rooms) and POST /api/rooms (create room)
 import { NextRequest, NextResponse } from 'next/server';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { ErrorResponse, RoomWithStats, MemoryRoom } from '@/types';
 import {
   createRoom as insforgeCreateRoom,
@@ -9,6 +11,8 @@ import {
 import { validateRoomField, normalizeCategory, frequencyToCronExpression } from '@/lib/validation';
 import { createStorageFolder } from '@/lib/storage';
 import { requireSession } from '@/lib/apiAuth';
+
+const execAsync = promisify(exec);
 
 export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorResponse>> {
   const session = await requireSession();
@@ -98,6 +102,87 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
       console.error('Failed to create default schedule for room', room.id, schedErr);
     }
 
+    // The InsForge schedule registration is best-effort. The DB
+    // schedule row is created below (createRoomWithDefaults); the
+    // InsForge entry is what actually fires the cron. If
+    // NEXT_PUBLIC_APP_URL isn't set (e.g. local dev with the
+    // default .env.example), we skip the InsForge registration
+    // entirely and rely on the per-room schedule route to retry
+    // once the env is configured. The room itself is created
+    // normally.
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL;
+    if (!appUrl) {
+      console.warn(
+        'NEXT_PUBLIC_APP_URL is not set; skipping auto-registration of InsForge schedule for room',
+        room.id,
+        '— the per-room schedule route can retry once the env is configured.',
+      );
+    } else {
+      try {
+        const secret = process.env.CRON_SHARED_SECRET;
+        if (!secret) {
+          throw new Error('CRON_SHARED_SECRET not set; cannot register InsForge schedule');
+        }
+        const headers = JSON.stringify({ 'x-cron-secret': secret });
+        const name = `pagevault-room-${room.id}`;
+        // Find any existing schedule with this name first, so we don't
+        // create duplicates on retry. (mirrors app/api/rooms/[id]/schedule/route.ts)
+        const listOut = await execAsync(
+          `npx @insforge/cli schedules list --json 2>&1`,
+          { cwd: process.cwd(), timeout: 15_000 },
+        );
+        let existingId: string | null = null;
+        try {
+          // Mirror the findExistingScheduleId() in app/api/rooms/[id]/schedule/route.ts:
+          // scan stdout lines (reversed) for the first one that parses as
+          // valid JSON starting with '[' or '{'. This is robust to nested
+          // braces in metadata (functionUrl, headers, etc.) which break
+          // naive '{...}' regexes when the CLI emits a JSON array of
+          // objects.
+          const lines = listOut.stdout.split('\n').reverse();
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !(trimmed.startsWith('[') || trimmed.startsWith('{'))) continue;
+            try {
+              const list = JSON.parse(trimmed);
+              const arr = Array.isArray(list) ? list : [list];
+              const found = arr.find((s: { name?: string }) => s.name === name);
+              if (found && typeof found.id === 'string') {
+                existingId = found.id;
+                break;
+              }
+            } catch { /* try the next line */ }
+          }
+        } catch { /* fall through to create */ }
+        const url = `${appUrl}/api/cron/scan-room/${room.id}`;
+        const args = existingId
+          ? ['schedules', 'update', existingId, '--cron', cron, '--url', url, '--headers', headers]
+          : ['schedules', 'create', '--name', name, '--cron', cron, '--url', url, '--method', 'POST', '--headers', headers];
+        const cmd = `npx @insforge/cli ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`;
+        const out = await execAsync(cmd, { cwd: process.cwd(), timeout: 30_000 });
+        const m = out.stdout.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
+        const insforgeScheduleId = m ? m[0] : existingId;
+        if (insforgeScheduleId) {
+          // PATCH the scan_schedules row to record the InsForge ID so
+          // POST /api/rooms/[id]/schedule can find it for update/delete.
+          await fetch(
+            `${process.env.INSFORGE_API_URL}/api/database/records/scan_schedules?project_id=eq.${room.id}`,
+            {
+              method: 'PATCH',
+              headers: {
+                'Authorization': `Bearer ${process.env.INSFORGE_SERVICE_ROLE_KEY}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ insforge_schedule_id: insforgeScheduleId }),
+            },
+          );
+        }
+      } catch (insforgeErr) {
+        console.error('Failed to register InsForge schedule for room', room.id, insforgeErr);
+        // Best-effort: don't fail room creation. The DB row exists, and
+        // the per-room schedule route can retry the InsForge registration.
+      }
+    }
     return NextResponse.json(room, { status: 201 });
   } catch (error) {
     console.error('Failed to create room:', error);

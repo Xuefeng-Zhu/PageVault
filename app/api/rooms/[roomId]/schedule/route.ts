@@ -29,12 +29,27 @@ async function sh(cmd: string): Promise<string> {
 
 async function findExistingScheduleId(name: string): Promise<string | null> {
   try {
-    const out = await sh(`npx @insforge/cli schedules list --json 2>&1 | grep -o '{[^}]*}' | head -50`);
-    // The CLI may print plain text or JSON. Try to parse the table output.
-    const jsonMatch = out.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
-    const list = JSON.parse(jsonMatch[0]);
-    const arr = Array.isArray(list) ? list : [list];
+    // The CLI emits JSON in --json mode. The output is the JSON array
+    // (possibly surrounded by other text in --no-pretty mode), so we
+    // take the LAST line that starts with '[' or '{' and parse it.
+    // We don't try to grep-out individual objects because nested
+    // braces in metadata break naive '{...}' regexes.
+    const out = await sh(`npx @insforge/cli schedules list --json 2>&1`);
+    const lines = out.split('\n').reverse();
+    let parsed: unknown = null;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (!(trimmed.startsWith('[') || trimmed.startsWith('{'))) continue;
+      try {
+        parsed = JSON.parse(trimmed);
+        break;
+      } catch {
+        // try the next line
+      }
+    }
+    if (parsed === null) return null;
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
     const found = arr.find((s: { name?: string }) => s.name === name);
     return found?.id ?? null;
   } catch {
@@ -43,12 +58,17 @@ async function findExistingScheduleId(name: string): Promise<string | null> {
 }
 
 async function createOrUpdateInsforgeSchedule(
-  existingId: string | null, name: string, cron: string, appUrl: string, secret: string,
+  existingId: string | null, name: string, cron: string, appUrl: string, secret: string, roomId: string,
 ): Promise<string | null> {
+  const url = `${appUrl}/api/cron/scan-room/${roomId}`;
   const headers = JSON.stringify({ 'x-cron-secret': secret });
+  // The update branch must retarget --url as well as --cron/--headers.
+  // Otherwise schedules that were created before scan-room existed
+  // (and thus point at /api/cron/scan-all) keep firing the all-room
+  // worker even after the user changes the cadence through this route.
   const args: string[] = existingId
-    ? ['schedules', 'update', existingId, '--cron', cron, '--headers', headers]
-    : ['schedules', 'create', '--name', name, '--cron', cron, '--url', `${appUrl}/api/cron/scan-all`, '--method', 'POST', '--headers', headers];
+    ? ['schedules', 'update', existingId, '--cron', cron, '--url', url, '--headers', headers]
+    : ['schedules', 'create', '--name', name, '--cron', cron, '--url', url, '--method', 'POST', '--headers', headers];
   const cmd = `npx @insforge/cli ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`;
   const out = await sh(cmd);
   const m = out.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
@@ -115,14 +135,29 @@ export async function POST(
     if (!process.env.CRON_SHARED_SECRET) {
       return NextResponse.json({ error: { code: 'NO_SECRET', message: 'CRON_SHARED_SECRET not configured on server' } }, { status: 500 });
     }
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || `http://localhost:${process.env.PORT || 3000}`;
+    // The InsForge schedule's --url must point at a host that
+    // InsForge's cloud scheduler can actually reach. Falling back
+    // to localhost silently produces a schedule that InsForge can
+    // never invoke. Require the env var to be set; if it's not,
+    // log and return 500 so the operator knows to configure it.
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL;
+    if (!appUrl) {
+      console.warn(
+        'NEXT_PUBLIC_APP_URL is not set; cannot auto-register InsForge schedule for room',
+        roomId,
+      );
+      return NextResponse.json(
+        { error: { code: 'INTERNAL_ERROR', message: 'NEXT_PUBLIC_APP_URL is not configured; cannot register InsForge schedule' } },
+        { status: 500 },
+      );
+    }
     const name = `pagevault-room-${roomId}`;
     const existingId = await findExistingScheduleId(name);
 
     let insforgeScheduleId: string | null = null;
     if (enabled) {
       insforgeScheduleId = await createOrUpdateInsforgeSchedule(
-        existingId, name, cronExpression, appUrl, process.env.CRON_SHARED_SECRET,
+        existingId, name, cronExpression, appUrl, process.env.CRON_SHARED_SECRET, roomId,
       );
     } else if (existingId) {
       try {

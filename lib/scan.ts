@@ -383,7 +383,11 @@ async function uploadEvidence(
 // Main entry point
 // ============================================================================
 
-export async function runScan(room: MemoryRoom): Promise<ScanSummary> {
+export async function runScan(
+  room: MemoryRoom,
+  options: { triggerType?: 'manual' | 'schedule' | 'box_webhook' | 'retry' } = {},
+): Promise<ScanSummary> {
+  const triggerType = options.triggerType ?? 'manual';
   const jobId = uuid('a');
   const startedAt = new Date().toISOString();
 
@@ -404,7 +408,7 @@ export async function runScan(room: MemoryRoom): Promise<ScanSummary> {
   await dbInsert('snapshot_jobs', {
     id: jobId,
     tracked_page_id: watchedUrls[0].id, // one job per scan; pages are linked via snapshots
-    trigger_type: 'manual',
+    trigger_type: triggerType,
     status: 'running',
     requested_at: startedAt,
   });
