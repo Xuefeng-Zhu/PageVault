@@ -1,0 +1,1074 @@
+openapi: 3.1.0
+info:
+  title: PageVault Public API
+  version: 0.1.0-beta
+  summary: HTTP API for the PageVault web-change watcher
+  description: |
+    The PageVault API gives a signed-in user CRUD on "memory rooms"
+    (named targets the user is watching), on the watched URLs in each
+    room, on manual and scheduled scans of those URLs, and on the
+    per-room change analysis and notification subscriptions. A small
+    surface of cron-triggered endpoints drives scheduled scans and
+    notification delivery from the InsForge Schedules cloud.
+
+    **Public contract.** This document is the source of truth for
+    response shapes and status codes. If the live route handlers
+    disagree with this spec, the code wins and the spec is a bug.
+
+    **Conventions.**
+
+    - All requests and responses are JSON. The only exception is
+      `204 No Content` for `DELETE /api/rooms/{roomId}/schedule`.
+    - Authentication is by NextAuth session cookie. All user routes
+      under `/api/rooms/**` and `/api/changes/**` require a valid
+      session. The cron routes under `/api/cron/**` require an
+      `x-cron-secret` header that matches the server's
+      `CRON_SHARED_SECRET` env var.
+    - All error responses (except where noted in the cron section)
+      use the envelope:
+        `{ "error": { "code": "UPPER_SNAKE", "message": "human readable", "field": "optional" } }`
+    - Same-origin only; no CORS headers.
+  contact:
+    name: PageVault Engineering
+  license:
+    name: MIT
+    url: https://github.com/example/pagevault/blob/main/LICENSE
+
+servers:
+  - url: https://app.pagevault.example
+    description: Production (placeholder)
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: rooms
+    description: Memory rooms (named targets being watched)
+  - name: urls
+    description: Watched URLs within a room
+  - name: scans
+    description: Manual and scheduled scan triggers
+  - name: changes
+    description: Detected changes and their AI briefs
+  - name: schedule
+    description: Per-room scan schedule
+  - name: notifications
+    description: Per-room webhook subscriptions and test fire
+  - name: cron
+    description: InsForge Schedules-cron-driven endpoints (operator-only)
+  - name: auth
+    description: NextAuth.js endpoints
+
+security: []   # most routes require session; cron routes require a header
+
+# ─────────────────────────────────────────────────────────────────
+# Paths
+# ─────────────────────────────────────────────────────────────────
+paths:
+  # ─── rooms ─────────────────────────────────────────────────────
+  /api/rooms:
+    get:
+      tags: [rooms]
+      summary: List the caller's rooms with stats
+      description: |
+        Returns every room owned by the signed-in user, decorated
+        with high/medium counts, the last scan time, and the list of
+        watched URLs. The handler queries via the service-role
+        client (which is not pre-filtered by RLS) and scopes to the
+        caller's user id in JS.
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: Array of rooms with stats
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RoomWithStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [rooms]
+      summary: Create a new room
+      description: |
+        Creates a `projects` row owned by the signed-in user, an
+        InsForge Storage folder for the room's evidence, and a
+        default `scan_schedules` row. Best-effort: registers an
+        InsForge Schedules cron entry that targets
+        `/api/cron/scan-room/{roomId}`.
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRoomInput' }
+      responses:
+        '201':
+          description: Room created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemoryRoom' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500':
+          description: Storage folder creation failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  code: STORAGE_ERROR
+                  message: Failed to create storage folder for the room
+
+  /api/rooms/{roomId}:
+    get:
+      tags: [rooms]
+      summary: Get a room's detail (room + watched URLs + latest scan + recent changes)
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      responses:
+        '200':
+          description: Room detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoomDetailResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ─── urls ──────────────────────────────────────────────────────
+  /api/rooms/{roomId}/urls:
+    post:
+      tags: [urls]
+      summary: Add 1-100 watched URLs to a room
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddUrlsInput' }
+      responses:
+        '201':
+          description: URLs added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  urls:
+                    type: array
+                    items: { $ref: '#/components/schemas/WatchedUrl' }
+                required: [urls]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ─── scans ─────────────────────────────────────────────────────
+  /api/rooms/{roomId}/scan:
+    post:
+      tags: [scans]
+      summary: Run a manual scan of every watched URL in the room
+      description: |
+        Synchronous. Typically 30-90 seconds for a room with 10
+        watched URLs. The scan hashes each URL's content, uploads
+        every snapshot to InsForge Storage (no mock fallback), and
+        runs the LLM call for any URL whose hash changed. Emits one
+        `notification_outbox` row per enabled subscription per
+        change.
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      responses:
+        '200':
+          description: Scan summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: Scan failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  code: SCAN_FAILED
+                  message: 'crawl failed: <upstream error>'
+
+  # ─── changes ───────────────────────────────────────────────────
+  /api/rooms/{roomId}/changes:
+    get:
+      tags: [changes]
+      summary: List the room's changes (most recent 50)
+      description: |
+        The `?limit=` query param advertised in earlier versions of
+        this spec is NOT honored. The route hardcodes `limit=50`.
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      responses:
+        '200':
+          description: Changes list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  changes:
+                    type: array
+                    items: { $ref: '#/components/schemas/ChangeAnalysis' }
+                required: [changes]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/changes/{changeId}:
+    get:
+      tags: [changes]
+      summary: Get a single change by id (with AI brief, evidence, and recommended actions)
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: changeId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Change
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  change: { $ref: '#/components/schemas/ChangeAnalysis' }
+                required: [change]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ─── schedule ──────────────────────────────────────────────────
+  /api/rooms/{roomId}/schedule:
+    get:
+      tags: [schedule]
+      summary: Get the room's schedule
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      responses:
+        '200':
+          description: Schedule (or null when none exists)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleGetResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [schedule]
+      summary: Set the room's schedule
+      description: |
+        Validates the cron expression, registers/updates the
+        InsForge Schedules cron entry, and persists the
+        `scan_schedules` row.
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetScheduleInput' }
+      responses:
+        '200':
+          description: Schedule set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleSetResponse' }
+        '400':
+          description: Cron expression is not 5 fields
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  code: INVALID_CRON
+                  message: cronExpression must be 5 fields
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: Server-side config (CRON_SHARED_SECRET or NEXT_PUBLIC_APP_URL) missing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                no_secret:
+                  value:
+                    error:
+                      code: NO_SECRET
+                      message: CRON_SHARED_SECRET not configured on server
+                no_app_url:
+                  value:
+                    error:
+                      code: INTERNAL_ERROR
+                      message: NEXT_PUBLIC_APP_URL is not configured; cannot register InsForge schedule
+    delete:
+      tags: [schedule]
+      summary: Remove the room's schedule
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      responses:
+        '204':
+          description: Schedule deleted (no body)
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ─── notifications ─────────────────────────────────────────────
+  /api/rooms/{roomId}/notifications:
+    get:
+      tags: [notifications]
+      summary: List the room's notification subscriptions
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      responses:
+        '200':
+          description: Subscriptions list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptions:
+                    type: array
+                    items: { $ref: '#/components/schemas/NotificationSubscription' }
+                required: [subscriptions]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [notifications]
+      summary: Create a new subscription
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSubscriptionInput' }
+      responses:
+        '201':
+          description: Subscription created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: '#/components/schemas/NotificationSubscription' }
+                required: [subscription]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  code: DB_ERROR
+                  message: '<truncated DB error body>'
+
+  /api/rooms/{roomId}/notifications/{id}:
+    patch:
+      tags: [notifications]
+      summary: Update a subscription
+      description: |
+        Any subset of `config`, `severityThreshold`, `enabled`. The
+        route re-fetches the row after the PATCH so the response
+        always reflects the canonical server state.
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatchSubscriptionInput' }
+      responses:
+        '200':
+          description: Subscription updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: '#/components/schemas/NotificationSubscription' }
+                required: [subscription]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: DB error or post-PATCH fetch failed (envelope deviation — bare string)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                required: [error]
+              examples:
+                db_error: { value: { error: 'db_error' } }
+                not_found_after_update: { value: { error: 'not_found_after_update' } }
+    delete:
+      tags: [notifications]
+      summary: Delete a subscription
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Subscription deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: boolean, enum: [true] }
+                required: [deleted]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/rooms/{roomId}/notifications/{id}/test:
+    post:
+      tags: [notifications]
+      summary: Fire a synthetic webhook to the subscription's URL
+      description: |
+        Sends `event: 'change.detected'` with a synthetic payload.
+        Returns 200 on a 2xx receiver response, 502 on a receiver
+        error or network failure.
+      security:
+        - sessionAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Receiver accepted the test payload
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationTestResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502':
+          description: Receiver error or network failure
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationTestResult' }
+
+  # ─── cron ──────────────────────────────────────────────────────
+  /api/cron/scan-all:
+    post:
+      tags: [cron]
+      summary: Run every enabled scheduled scan
+      description: |
+        Invoked by the InsForge Schedules cron. Scans up to 3 rooms
+        concurrently. Returns per-room result entries; does NOT
+        stop on individual failures.
+      security:
+        - cronSecretHeader: []
+      responses:
+        '200':
+          description: Bulk tick completed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanAllResult' }
+        '401':
+          description: Secret is set but header is wrong/missing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: ['unauthorized'] }
+                required: [error]
+        '500':
+          description: DB error fetching schedules
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: ['db_error'] }
+                required: [error]
+        '503':
+          description: CRON_SHARED_SECRET is unset on the server
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: ['service_unconfigured'] }
+                  detail: { type: string }
+                required: [error, detail]
+              example:
+                error: service_unconfigured
+                detail: CRON_SHARED_SECRET is not set on the server
+
+  /api/cron/scan-room/{roomId}:
+    post:
+      tags: [cron]
+      summary: Per-room scheduled scan tick
+      description: |
+        Invoked by the per-room InsForge Schedules cron entry
+        (`pagevault-room-{roomId}`). Scans ONLY the specified room.
+        Skips if the room has no enabled schedule. The DB write
+        for `last_run_at` is awaited (forward-compat with
+        serverless platforms).
+      security:
+        - cronSecretHeader: []
+      parameters:
+        - $ref: '#/components/parameters/RoomId'
+      responses:
+        '200':
+          description: Tick result (scan ran, skipped, or failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanRoomResult' }
+        '401':
+          description: Secret is set but header is wrong/missing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: ['unauthorized'] }
+                required: [error]
+        '404':
+          description: Room not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: ['room_not_found'] }
+                  roomId: { type: string }
+                required: [error, roomId]
+        '500':
+          description: Scan failed, or DB lookup failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanRoomResult' }
+        '503':
+          description: CRON_SHARED_SECRET is unset on the server
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: ['service_unconfigured'] }
+                  detail: { type: string }
+                required: [error, detail]
+
+  /api/cron/notification-worker:
+    post:
+      tags: [cron]
+      summary: Drain the notification outbox
+      description: |
+        Invoked by the per-minute InsForge Schedules cron.
+        Acquires a Postgres advisory lock (id 42) so only one
+        worker drains at a time. Returns the lock-acquisition
+        state plus the per-tick counters. The MEDIUM-3 fix
+        surfaces RPC failures as 5xx so operator alerting can
+        fire.
+      security:
+        - cronSecretHeader: []
+      responses:
+        '200':
+          description: Drain completed (healthy)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DrainOutboxResult' }
+        '401':
+          description: Secret is set but header is wrong/missing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: ['unauthorized'] }
+                required: [error]
+        '500':
+          description: RPC endpoint outage or worker error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DrainOutboxResult' }
+        '503':
+          description: CRON_SHARED_SECRET is unset on the server
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: ['service_unconfigured'] }
+                  detail: { type: string }
+                required: [error, detail]
+
+  # ─── auth ──────────────────────────────────────────────────────
+  /api/auth/{nextauthSegment}:
+    get:
+      tags: [auth]
+      summary: NextAuth.js catch-all (signin / signout / session / csrf / providers / callback)
+      description: |
+        Proxied through NextAuth. The credentials provider is
+        configured in `lib/auth.ts`. The CSRF token must accompany
+        POST requests to `/api/auth/signin` and the
+        `/api/auth/callback/*` routes.
+      parameters:
+        - name: nextauthSegment
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: NextAuth response (varies by route) }
+    post:
+      tags: [auth]
+      summary: NextAuth.js POST endpoint
+      parameters:
+        - name: nextauthSegment
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: NextAuth response (varies by route) }
+        '401': { description: Invalid credentials }
+
+# ─────────────────────────────────────────────────────────────────
+# Components
+# ─────────────────────────────────────────────────────────────────
+components:
+  securitySchemes:
+    sessionAuth:
+      type: apiKey
+      in: cookie
+      name: next-auth.session-token
+      description: |
+        NextAuth session cookie. Issued by
+        `POST /api/auth/callback/credentials` after a successful
+        `signIn`. CSRF token required for non-GET requests
+        (NextAuth-managed via the `next-auth.csrf-token` cookie).
+    cronSecretHeader:
+      type: apiKey
+      in: header
+      name: x-cron-secret
+      description: |
+        Must match `process.env.CRON_SHARED_SECRET` on the
+        server. Constant-time comparison. Required for every
+        `/api/cron/**` route.
+
+  parameters:
+    RoomId:
+      name: roomId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: The room id (uuid).
+
+  responses:
+    Unauthorized:
+      description: No valid session
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: Authentication required
+    NotFound:
+      description: Room not found OR not owned by the caller
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error:
+              code: NOT_FOUND
+              message: Room not found
+    ValidationError:
+      description: Request body failed validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: name must be 1-200 characters
+              field: name
+    InternalError:
+      description: Unexpected server failure
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: Failed to retrieve rooms
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, description: 'UPPER_SNAKE_CASE machine-readable code' }
+            message: { type: string, description: 'Human-readable message' }
+            field: { type: string, description: 'For VALIDATION_ERROR, the input field that failed' }
+
+    Category:
+      type: string
+      enum: [competitor, vendor, policy, docs, custom]
+
+    PageType:
+      type: string
+      enum: [homepage, pricing, docs, changelog, careers, terms, privacy, trust, unknown]
+
+    Severity:
+      type: string
+      enum: [low, medium, high]
+
+    ChangeType:
+      type: string
+      enum: [pricing, positioning, feature, legal, security, hiring, docs, minor, unknown]
+
+    ScanStatus:
+      type: string
+      enum: [queued, running, completed, failed]
+
+    MemoryRoom:
+      type: object
+      required: [id, userId, name, targetName, category, storageFolderPath, boxFolderId, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid, nullable: true }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        targetName: { type: string, minLength: 1, maxLength: 200 }
+        category: { $ref: '#/components/schemas/Category' }
+        storageFolderPath: { type: string, nullable: true, description: 'InsForge Storage folder path' }
+        boxFolderId: { type: string, nullable: true, description: 'Deprecated; back-compat mirror of storageFolderPath', deprecated: true }
+        createdAt: { type: string, format: date-time }
+
+    RoomWithStats:
+      allOf:
+        - $ref: '#/components/schemas/MemoryRoom'
+        - type: object
+          required: [highCount, mediumCount, lastScanAt, watchedUrls]
+          properties:
+            highCount: { type: integer, minimum: 0 }
+            mediumCount: { type: integer, minimum: 0 }
+            lastScanAt: { type: string, format: date-time, nullable: true }
+            watchedUrls:
+              type: array
+              description: 'Active source URLs being watched for the room. Plain URL strings, not WatchedUrl objects.'
+              items: { type: string, format: uri }
+
+    WatchedUrl:
+      type: object
+      required: [id, roomId, url, label, pageType, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        roomId: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        label: { type: string, nullable: true, maxLength: 200 }
+        pageType: { $ref: '#/components/schemas/PageType' }
+        createdAt: { type: string, format: date-time }
+
+    ScanRun:
+      type: object
+      required: [id, roomId, status, apifyRunId, startedAt, completedAt, errorMessage]
+      properties:
+        id: { type: string, format: uuid }
+        roomId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/ScanStatus' }
+        apifyRunId: { type: string, nullable: true }
+        startedAt: { type: string, format: date-time, nullable: true, description: 'Always null in the GET /api/rooms/[roomId] latestScan projection.' }
+        completedAt: { type: string, format: date-time, nullable: true }
+        errorMessage: { type: string, nullable: true, description: 'Always null in the GET /api/rooms/[roomId] latestScan projection.' }
+
+    EvidenceItem:
+      type: object
+      required: [before, after, explanation]
+      properties:
+        before: { type: string, description: 'Snippet of the previous snapshot' }
+        after: { type: string, description: 'Snippet of the current snapshot' }
+        explanation: { type: string, description: 'Why this snippet matters' }
+
+    ChangeAnalysis:
+      type: object
+      required:
+        - id
+        - roomId
+        - watchedUrlId
+        - previousSnapshotId
+        - currentSnapshotId
+        - severity
+        - changeType
+        - summary
+        - businessInterpretation
+        - recommendedActions
+        - evidence
+        - storageKey
+        - storageUrl
+        - reportBoxFileId
+        - createdAt
+      properties:
+        id: { type: string, format: uuid }
+        roomId: { type: string, format: uuid }
+        watchedUrlId: { type: string, format: uuid }
+        previousSnapshotId: { type: string, format: uuid, nullable: true }
+        currentSnapshotId: { type: string, format: uuid, nullable: true }
+        severity: { $ref: '#/components/schemas/Severity' }
+        changeType: { $ref: '#/components/schemas/ChangeType' }
+        summary: { type: string }
+        businessInterpretation: { type: string, nullable: true }
+        recommendedActions:
+          type: array
+          items: { type: string }
+        evidence:
+          type: array
+          items: { $ref: '#/components/schemas/EvidenceItem' }
+        storageKey: { type: string, nullable: true, description: 'InsForge Storage key for the change report markdown' }
+        storageUrl: { type: string, format: uri, nullable: true }
+        reportBoxFileId: { type: string, nullable: true, description: 'Deprecated back-compat mirror of storageKey', deprecated: true }
+        createdAt: { type: string, format: date-time }
+
+    ScanSummary:
+      type: object
+      required: [scanRunId, status, snapshotsCaptured, changesCreated]
+      properties:
+        scanRunId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/ScanStatus' }
+        snapshotsCaptured: { type: integer, minimum: 0 }
+        changesCreated: { type: integer, minimum: 0 }
+
+    RoomDetailResponse:
+      type: object
+      required: [room, watchedUrls, latestScan, changes]
+      properties:
+        room: { $ref: '#/components/schemas/MemoryRoom' }
+        watchedUrls:
+          type: array
+          items: { $ref: '#/components/schemas/WatchedUrl' }
+        latestScan:
+          oneOf:
+            - $ref: '#/components/schemas/ScanRun'
+            - type: 'null'
+        changes:
+          type: array
+          items: { $ref: '#/components/schemas/ChangeAnalysis' }
+
+    UrlEntryInput:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, format: uri, description: 'Absolute http:// or https:// URL' }
+        label: { type: string, maxLength: 200 }
+        pageType:
+          oneOf:
+            - $ref: '#/components/schemas/PageType'
+            - type: string
+          description: 'PageType enum or free-form string; normalized server-side.'
+
+    AddUrlsInput:
+      type: object
+      required: [urls]
+      properties:
+        urls:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/UrlEntryInput' }
+
+    CreateRoomInput:
+      type: object
+      required: [name, targetName]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        targetName: { type: string, minLength: 1, maxLength: 200 }
+        category: { $ref: '#/components/schemas/Category' }
+        frequency:
+          type: string
+          enum: ['1', '6', '24', '168']
+          description: |
+            Pre-sets the default schedule cron.
+            1 = hourly, 6 = every 6h, 24 = daily 02:00 UTC,
+            168 = weekly Sun 02:00 UTC.
+            Unrecognised values fall back to daily 02:00 UTC.
+        urls:
+          type: array
+          items: { $ref: '#/components/schemas/UrlEntryInput' }
+          description: 'Currently IGNORED by the route. Use POST /api/rooms/{roomId}/urls after creation.'
+
+    SetScheduleInput:
+      type: object
+      required: [cronExpression]
+      properties:
+        cronExpression:
+          type: string
+          description: '5-field cron expression (e.g. `0 2 * * *`). Validated by a basic 5-field regex.'
+        enabled: { type: boolean, default: true }
+
+    ScheduleGetResponse:
+      type: object
+      required: [schedule]
+      properties:
+        schedule:
+          oneOf:
+            - $ref: '#/components/schemas/ScheduleRecord'
+            - type: 'null'
+
+    ScheduleSetResponse:
+      type: object
+      required: [schedule]
+      properties:
+        schedule: { $ref: '#/components/schemas/ScheduleRecord' }
+
+    ScheduleRecord:
+      type: object
+      required: [roomId, cronExpression, enabled, insforgeScheduleId]
+      properties:
+        roomId: { type: string, format: uuid }
+        cronExpression: { type: string }
+        enabled: { type: boolean }
+        insforgeScheduleId: { type: string, nullable: true, description: 'The InsForge Schedules cron id' }
+
+    NotificationSubscription:
+      type: object
+      required: [id, projectId, channel, config, severityThreshold, enabled, consecutiveFailures, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        projectId: { type: string, format: uuid }
+        channel: { type: string, enum: [webhook] }
+        config:
+          type: object
+          required: [url]
+          properties:
+            url: { type: string, format: uri }
+            secret: { type: string, description: 'HMAC secret for signing the payload' }
+        severityThreshold: { $ref: '#/components/schemas/Severity' }
+        enabled: { type: boolean }
+        consecutiveFailures: { type: integer, minimum: 0 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CreateSubscriptionInput:
+      type: object
+      required: [channel, config]
+      properties:
+        channel: { type: string, enum: [webhook] }
+        config:
+          type: object
+          required: [url]
+          properties:
+            url: { type: string, format: uri, description: 'Must be https://' }
+            secret: { type: string }
+        severityThreshold:
+          oneOf:
+            - $ref: '#/components/schemas/Severity'
+          default: medium
+
+    PatchSubscriptionInput:
+      type: object
+      description: |
+        Any subset of `config`, `severityThreshold`, `enabled`.
+        Note: the route has a known bug where
+        `severityThreshold: 'low'` is silently dropped because the
+        code uses `if (body.severityThreshold)` (truthy check). The
+        fix is `if (body.severityThreshold !== undefined)`.
+      properties:
+        config:
+          type: object
+          properties:
+            url: { type: string, format: uri }
+            secret: { type: string }
+        severityThreshold: { $ref: '#/components/schemas/Severity' }
+        enabled: { type: boolean }
+
+    NotificationTestResult:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        error: { type: string, description: 'Present when ok=false (502 status)' }
+
+    ScanAllResult:
+      type: object
+      required: [scanned, results]
+      properties:
+        scanned: { type: integer, minimum: 0 }
+        results:
+          type: array
+          items:
+            type: object
+            required: [roomId, status]
+            properties:
+              roomId: { type: string, format: uuid }
+              scanRunId: { type: string, format: uuid }
+              status: { type: string, enum: [completed, failed, skipped, queued, running] }
+              snapshotsCaptured: { type: integer, minimum: 0 }
+              changesCreated: { type: integer, minimum: 0 }
+              reason: { type: string, description: 'When status=skipped (e.g. "room_not_found")' }
+              error: { type: string, description: 'When status=failed' }
+
+    ScanRoomResult:
+      type: object
+      required: [roomId, wrapperStatus]
+      properties:
+        roomId: { type: string, format: uuid }
+        scanRunId: { type: string, format: uuid, description: 'Present when wrapperStatus=ok' }
+        status: { $ref: '#/components/schemas/ScanStatus', description: 'Present when wrapperStatus=ok' }
+        snapshotsCaptured: { type: integer, minimum: 0 }
+        changesCreated: { type: integer, minimum: 0 }
+        wrapperStatus: { type: string, enum: [ok, skipped, failed] }
+        reason: { type: string, description: 'When wrapperStatus=skipped (e.g. "no_enabled_schedule") or wrapperStatus=failed with reason="db_lookup_failed" | "room_lookup_failed"' }
+        error: { type: string, description: 'When wrapperStatus=failed' }
+
+    DrainOutboxResult:
+      type: object
+      required: [acquired, processed, succeeded, failed]
+      properties:
+        acquired: { type: boolean, description: 'true if this worker got the lock; false if a peer holds it' }
+        processed: { type: integer, minimum: 0 }
+        succeeded: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+        error: { type: string, description: 'Set on RPC outage; route returns 500 in this case' }
