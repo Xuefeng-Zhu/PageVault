@@ -20,6 +20,13 @@ cp .env.example .env.local
 # Edit .env.local — see ENVIRONMENT.md for the full reference.
 # Minimum: INSFORGE_API_URL, INSFORGE_ANON_KEY, NEXTAUTH_SECRET.
 # Generate a dev NEXTAUTH_SECRET with: openssl rand -base64 32
+#
+# Note: NEXTAUTH_SECRET is mandatory. The auth module (lib/auth.ts)
+# refuses to start without it to prevent silent JWT-key rotation
+# on process restart. If you want a no-setup demo, set:
+#   INSFORGE_DEV_INSECURE_SECRET=*** (any non-empty value)
+# This generates a per-process random secret — sessions will NOT
+# survive restarts. NEVER set this in production.
 
 # 4. Run migrations
 # The project does not have a migration runner. Open the InsForge SQL

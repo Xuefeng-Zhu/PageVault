@@ -112,16 +112,21 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
       // InsForge's cloud scheduler can actually reach. Falling back
       // to http://localhost:3000 silently produces a schedule that
       // InsForge can never invoke — the room appears scheduled in
-      // the UI but never actually scans. Require the env var to be
-      // set; if it's not, log and skip the InsForge registration
-      // (the DB row is still created and the per-room schedule
-      // route can retry once the env is configured).
+      // the UI but never actually scans. Fail the response (500)
+      // when the env var is missing so the operator sees the
+      // problem immediately rather than discovering it days later
+      // when the schedule never fires. The DB row is still created
+      // and the per-room schedule route can retry once the env is
+      // configured; the 500 is the operator's signal to set the
+      // env var and re-invoke the schedule route.
       const appUrl = process.env.NEXT_PUBLIC_APP_URL;
       if (!appUrl) {
-        console.warn(
-          'NEXT_PUBLIC_APP_URL is not set; skipping auto-registration of InsForge schedule for room',
-          room.id,
-          '— the schedule will not fire until this is configured and the per-room schedule route is re-invoked.',
+        return NextResponse.json(
+          {
+            error: 'NEXT_PUBLIC_APP_URL not configured; room created but InsForge schedule was not registered. Set NEXT_PUBLIC_APP_URL and POST to /api/rooms/[id]/schedule to enable scheduling.',
+            room: { id: room.id, name: room.name },
+          },
+          { status: 500 },
         );
       } else {
         const secret = process.env.CRON_SHARED_SECRET;

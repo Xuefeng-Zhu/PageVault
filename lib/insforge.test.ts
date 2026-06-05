@@ -152,23 +152,25 @@ describe('listRoomsWithStats — MEDIUM-4 regression (O(1) PostgREST round-trips
     expect(room.watchedUrls).toHaveLength(3);
   });
 
-  it('keeps the snapshot_jobs query bounded by status=eq.succeeded and a finite limit', async () => {
+  it('keeps the snapshot_jobs queries scoped per active page with limit=1', async () => {
+    // Round 6 (commit b0fa9ee) changed listRoomsWithStats from one
+    // global batched query to N per-page queries. The test from
+    // round 5 (commit c026b2f) asserted the batched shape and is
+    // now obsolete. We replace it with an assertion matching the
+    // per-page shape: each tracked_page_id=eq.<uuid> snapshot_jobs
+    // call has limit=1, status=eq.succeeded, and order=finished_at.desc.
     mocks.from.mockImplementation(routeFixture(makeFixture(2)));
     await listRoomsWithStats();
-    // The snapshot_jobs call must use the bucketed query shape:
-    // a single global query with status filter, order=finished_at.desc,
-    // and a finite limit. The old buggy call had a per-page
-    // `tracked_page_id=eq.<id>` filter and `limit=1`. We assert the
-    // call does NOT have a per-page tracked_page_id filter.
-    const jobsCall = (mocks.from.mock.calls as unknown[][])
+    const jobsCalls = (mocks.from.mock.calls as unknown[][])
       .map((c) => String(c[0]))
-      .find((q) => q.startsWith('snapshot_jobs?'));
-    expect(jobsCall).toBeDefined();
-    expect(jobsCall).toContain('status=eq.succeeded');
-    expect(jobsCall).toContain('order=finished_at.desc');
-    expect(jobsCall).toMatch(/limit=\d+/);
-    // Per-page filter would be `tracked_page_id=eq.<uuid>`; the new
-    // shape must not match a single-UUID filter pattern.
-    expect(jobsCall).not.toMatch(/tracked_page_id=eq\.[0-9a-f-]{8}/);
+      .filter((q) => q.startsWith('snapshot_jobs?'));
+    // One query per active page (2 in this fixture).
+    expect(jobsCalls).toHaveLength(2);
+    for (const q of jobsCalls) {
+      expect(q).toContain('status=eq.succeeded');
+      expect(q).toContain('order=finished_at.desc');
+      expect(q).toContain('limit=1');
+      expect(q).toMatch(/tracked_page_id=eq\.[0-9a-f-]{8}/);
+    }
   });
 });
