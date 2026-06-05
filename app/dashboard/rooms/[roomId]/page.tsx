@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import {
@@ -35,7 +35,7 @@ export default function RoomDetailPage() {
   const [scheduleCron, setScheduleCron] = useState<string | null>(null);
   const [subscriptions, setSubscriptions] = useState<NotificationSubscriptionView[]>([]);
 
-  const refetchSchedule = async () => {
+  const refetchSchedule = useCallback(async () => {
     const r = await fetch(`/api/rooms/${roomId}/schedule`, { cache: 'no-store' });
     if (r.ok) {
       const d = await r.json();
@@ -43,9 +43,9 @@ export default function RoomDetailPage() {
     } else {
       setScheduleCron(null);
     }
-  };
+  }, [roomId]);
 
-  const refetchSubscriptions = async () => {
+  const refetchSubscriptions = useCallback(async () => {
     const r = await fetch(`/api/rooms/${roomId}/notifications`, { cache: 'no-store' });
     if (r.ok) {
       const d = await r.json();
@@ -53,7 +53,7 @@ export default function RoomDetailPage() {
     } else {
       setSubscriptions([]);
     }
-  };
+  }, [roomId]);
 
   useEffect(() => {
     async function fetchRoom() {
@@ -79,7 +79,7 @@ export default function RoomDetailPage() {
     fetchRoom();
     refetchSchedule();
     refetchSubscriptions();
-  }, [roomId]);
+  }, [roomId, refetchSchedule, refetchSubscriptions]);
 
   const handleRunScan = async () => {
     setScanning(true);
