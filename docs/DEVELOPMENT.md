@@ -24,9 +24,11 @@ cp .env.example .env.local
 # Note: NEXTAUTH_SECRET is mandatory. The auth module (lib/auth.ts)
 # refuses to start without it to prevent silent JWT-key rotation
 # on process restart. If you want a no-setup demo, set:
-#   INSFORGE_DEV_INSECURE_SECRET=*** (any non-empty value)
-# This generates a per-process random secret — sessions will NOT
-# survive restarts. NEVER set this in production.
+#   INSFORGE_DEV_INSECURE_SECRET=1
+# (the literal digit 1 — that's the exact value the resolver
+# checks, NOT any non-empty string). This generates a per-process
+# random secret — sessions will NOT survive restarts. NEVER set
+# this in production.
 
 # 4. Run migrations
 # The project does not have a migration runner. Open the InsForge SQL

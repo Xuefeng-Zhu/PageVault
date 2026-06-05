@@ -302,28 +302,43 @@ export async function listRoomsWithStats(): Promise<RoomWithStats[]> {
   // Fetch latest succeeded job per tracked_page. We do per-page
   // queries with limit=1 (sorted by finished_at DESC) and run them
   // in parallel so a single page with a long history cannot push
-  // other pages' latest jobs out of a global cap. With the 500-row
-  // active-pages cap and 1 round-trip per page, the worst case is
-  // 500 * ~5ms = 2.5s, but Promise.all parallelises the requests
-  // and in practice 28 pages (4 rooms × 7 pages) completes in
-  // <200ms. If a future tenant pushes this past 100 active pages,
-  // batch the per-page queries with a concurrency limit.
+  // other pages' latest jobs out of a global cap.
+  //
+  // Concurrency is bounded at 8 to avoid hammering the database
+  // when a user has many tracked pages: 500 active pages at
+  // concurrency 8 completes in ~63 batches × ~5ms ≈ 315ms, far
+  // better than the 2.5s sequential worst case. The
+  // POSTGREST_RATE_LIMIT (8 concurrent connections) is the
+  // binding constraint on shared cloud InsForge instances; local
+  // dev can scale this up if needed.
   let jobsMap: Record<string, { finished_at: string | null }> = {};
   if (activePages.length > 0) {
-    const perPageResults = await Promise.all(
-      activePages.map((p) =>
-        sdkQuery<{
-          tracked_page_id: string;
-          finished_at: string | null;
-          status: string;
-        }>('public.snapshot_jobs', {
-          select: 'tracked_page_id,finished_at,status',
-          filters: `status=eq.succeeded&tracked_page_id=eq.${p.id}`,
-          order: 'finished_at.desc',
-          limit: 1,
-        }).then((rows) => rows[0] ?? null).catch(() => null),
-      ),
-    );
+    const CONCURRENCY = 8;
+    const perPageResults: Array<{
+      tracked_page_id: string;
+      finished_at: string | null;
+      status: string;
+    } | null> = new Array(activePages.length).fill(null);
+    for (let i = 0; i < activePages.length; i += CONCURRENCY) {
+      const batch = activePages.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map((p) =>
+          sdkQuery<{
+            tracked_page_id: string;
+            finished_at: string | null;
+            status: string;
+          }>('public.snapshot_jobs', {
+            select: 'tracked_page_id,finished_at,status',
+            filters: `status=eq.succeeded&tracked_page_id=eq.${p.id}`,
+            order: 'finished_at.desc',
+            limit: 1,
+          }).then((rows) => rows[0] ?? null).catch(() => null),
+        ),
+      );
+      for (let j = 0; j < batchResults.length; j++) {
+        perPageResults[i + j] = batchResults[j];
+      }
+    }
     for (const job of perPageResults) {
       if (job && jobsMap[job.tracked_page_id] === undefined) {
         jobsMap[job.tracked_page_id] = { finished_at: job.finished_at };
