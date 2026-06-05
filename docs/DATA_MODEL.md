@@ -1,9 +1,12 @@
 # Data Model
 
 > **Last updated:** 2026-06-02 · view this against commit `3b0f2ca` for accuracy.
-> **Source of truth:** the SQL in [`db/migration.sql`](../db/migration.sql) and
-> the per-feature files in [`db/migrations/`](../db/migrations). This doc is a
-> commentary, not a replacement.
+> **Source of truth:** [`db/schema.sql`](../db/schema.sql) (the single
+> canonical, idempotent migration). The Mermaid ER diagram is in
+> [`db/ER.md`](../db/ER.md). The legacy `db/migration.sql` and the
+> `db/migrations/2026-06-02-*.sql` files are preserved at
+> [`db/legacy/`](../db/legacy/) for `git blame` and are **not** the
+> current source. This doc is a commentary, not a replacement.
 
 ## ER diagram
 
@@ -319,19 +322,23 @@ malicious caller and a row insert**. The fix is in
 
 ## Migrations
 
-Migrations live in `db/migrations/` and are **forward-only**. The
-project does not have a migration runner; the operator runs each file
-in order via the InsForge SQL editor or the CLI.
+There is a single canonical migration: [`db/schema.sql`](../db/schema.sql).
+It is **idempotent** (every `CREATE` uses `IF NOT EXISTS`, every `ALTER`
+uses `DO` blocks, every function uses `CREATE OR REPLACE`) and is safe
+to re-run on top of a partial application. The legacy numbered
+migrations are preserved at [`db/legacy/`](../db/legacy/) for history
+and are **not** runnable.
 
-Order of application:
+To apply or re-apply the schema:
 
-1. `db/migration.sql` — the seven base tables + RLS
-2. `db/migrations/2026-06-02-scan-schedules.sql`
-3. `db/migrations/2026-06-02-notification-tables.sql`
-4. `db/migrations/2026-06-02-notification-advisory-lock.sql`
+```bash
+npx @insforge/cli db import db/schema.sql
+```
 
-If you add a new migration, prefix the file with `YYYY-MM-DD-` and
-append the file path to the list above.
+When the schema changes, edit `db/schema.sql` in place — do **not** file
+a new dated migration under `db/migrations/` (the directory no longer
+exists). Update `db/ER.md` in the same commit so the ER diagram stays
+in sync.
 
 ## TypeScript ↔ SQL mapping
 

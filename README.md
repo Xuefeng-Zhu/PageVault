@@ -266,7 +266,18 @@ On any failure after step 1, the run is marked `failed` with an error message.
 
 ## Database Schema
 
-See `db/migration.sql` for the full schema. Five tables:
+The canonical, idempotent PageVault schema lives in [`db/schema.sql`](db/schema.sql)
+(10 tables, RLS policies on user-scoped tables, RPC helpers, audit columns).
+See [`db/ER.md`](db/ER.md) for the Mermaid ER diagram. The legacy SQL files
+(`db/migration.sql` and the per-feature add-ons) are preserved at
+`db/legacy/` for `git blame` and are **not** runnable — see
+[`db/legacy/README.md`](db/legacy/README.md) for the supersession note.
+
+> **Note:** the table list below predates the canonical schema and uses
+> older working names. For the authoritative table inventory, RLS
+> policies, and column definitions, always read `db/schema.sql` directly.
+> Tracking issue: bring this README section up to date with the canonical
+> schema in a follow-up doc-correctness pass.
 
 - `memory_rooms` — the rooms you create
 - `watched_urls` — URLs being monitored per room

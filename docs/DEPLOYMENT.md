@@ -151,25 +151,23 @@ When a scan detects a change:
 
 ## Database migrations
 
-The project does **not** have a migration runner. To apply a new
-migration:
+The project does **not** have a numbered migration directory. There is a
+single canonical, idempotent schema file — [`db/schema.sql`](../db/schema.sql).
+It is safe to re-run on top of a partially-applied database (every
+`CREATE` uses `IF NOT EXISTS`, every `ALTER` uses `DO` blocks, every
+function uses `CREATE OR REPLACE`).
 
-1. Use the InsForge SQL editor in the dashboard, or
-2. Use the InsForge CLI:
-   ```bash
-   npx @insforge/cli db exec --file db/migrations/2026-06-02-*.sql
-   ```
+To apply it:
 
-Migrations are forward-only. Order matters. Current order:
+```bash
+npx @insforge/cli db import db/schema.sql
+```
 
-1. `db/migration.sql` (7 base tables + RLS)
-2. `db/migrations/2026-06-02-scan-schedules.sql`
-3. `db/migrations/2026-06-02-notification-tables.sql`
-4. `db/migrations/2026-06-02-notification-advisory-lock.sql`
-
-When you add a new migration, file it as
-`db/migrations/YYYY-MM-DD-kebab-case.sql` and update
-[DATA_MODEL.md §Migrations](DATA_MODEL.md).
+When the schema changes, edit `db/schema.sql` in place — never file a
+new dated migration under `db/migrations/` (the directory no longer
+exists). The legacy per-feature add-ons are preserved at `db/legacy/`
+for `git blame` and are **not** runnable; see
+[`db/legacy/README.md`](../db/legacy/README.md).
 
 ## Smoke-testing the deploy
 
