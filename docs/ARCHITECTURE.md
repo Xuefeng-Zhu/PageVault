@@ -1,267 +1,102 @@
-# Architecture
+# PageVault — Technical Architecture
 
-> **Last updated:** 2026-06-02 · view this against commit `3b0f2ca` for accuracy.
-> **Pair with:** [`SYSTEM_DESIGN.md`](../SYSTEM_DESIGN.md) at the repo root —
-> that doc is the design intent (Mermaid, contract examples, cost models);
-> this doc is the **implementation** view (what's actually wired today).
+> **Last updated:** 2026-06-05 · intended to stay at 1–2 pages.
+> **This is the system view.** Detailed implementation lives in `docs/SYSTEM_DESIGN.md`,
+> `docs/DATA_MODEL.md`, `docs/API.md`, `docs/COMPONENTS.md`, `docs/DEPLOYMENT.md`,
+> `docs/ENVIRONMENT.md` (per `docs/00-INDEX.md`).
 
-## One-paragraph summary
+## 1. Stack
 
-PageVault is a Next.js 14 App Router application that runs scheduled web-page
-scans, hashes the captured content, and asks an LLM to explain any change in
-plain English. The control plane is InsForge Postgres (projects, rooms,
-snapshots, change analyses, notification subscriptions, and the cron
-outbox). The evidence plane is InsForge Storage (raw markdown snapshots
-under `pagevault-evidence/<room>/snapshots/<date>/<file>`). The web-crawl
-plane is Apify when credentials are present, or a built-in
-HTML→Markdown extractor when they aren't. The LLM plane is an
-OpenAI-compatible chat completions API — by default OpenRouter's
-`anthropic/claude-3.5-haiku`, with `OPENAI_API_KEY` as a fallback. Two
-InsForge cron jobs (`scan-all` and `notification-worker`) drive the
-scheduled scan and outbound notification flows.
+| Layer | Choice | Justification |
+| --- | --- | --- |
+| Framework | **Next.js 15.5 App Router** (`package.json`) | Inherited from scaffold; RSC + route handlers + middleware in one runtime. |
+| Language | **TypeScript 5.5** | Inherited. Catches the room/URL/scan-row shape mismatches at compile time. |
+| UI | **React 18 + Tailwind 3.4** (pinned) | Inherited. Tailwind pinned to 3.4 because 4.x is a breaking change. |
+| Backend | **InsForge** (Postgres + Auth + Storage + Schedules) | Single managed backend for DB, evidence storage, and cron — collapses three SaaS dependencies into one. |
+| Web crawl | **Apify** `website-content-crawler` Actor | Inherited; falls back to a direct `fetch()` + HTML→Markdown in `lib/scan.ts` when `APIFY_*` creds are missing. |
+| LLM | **OpenAI-compatible chat completions** | InsForge AI gateway proxies to OpenRouter (`anthropic/claude-3.5-haiku` by default; `OPENAI_API_KEY` direct is a fallback). Cascade pattern: haiku primary, sonnet on `severity=high` or `confidence<0.85`. |
+| Auth | **NextAuth** (credentials provider + InsForge) | Inherited. Dev demo creds via `INSFORGE_DEV_INSECURE_SECRET`; production uses real NextAuth + InsForge JWT. |
+| Storage evidence | **InsForge Storage** (bucket `pagevault-evidence`) | Holds raw markdown snapshots under `pagevault/<room>/snapshots/<date>/<slug>.md`. Card calls this "Box" — the **column** is still `box_root_folder_id` for back-compat, but the **backend** is InsForge Storage (see `lib/storage.ts`). |
+| Test | **Vitest + fast-check** | Inherited. Property tests on the diff and validation modules. |
 
-## The five planes
+## 2. Module boundaries (`lib/*`)
 
+The card listed `insforge, apify, box, ai, diff, scan, seed, env, validation`. The actual scaffold consolidates some of these — `apify` + `ai` are inlined into `lib/scan.ts` (crawler + analyzer), `box` is replaced by `lib/storage.ts` (InsForge Storage), and there is no `lib/seed.ts` (seeding is `scripts/seed_via_api.py`). The real `lib/` map is:
+
+- **`lib/insforge.ts`** — The only data-access module. Wraps `@insforge/sdk` (`createClient({ baseUrl, anonKey })`) with a `sdkQuery(table, {select, filters, order, limit, offset})` helper. All DB reads/writes go through here. Implements the row-to-domain mappers (`toMemoryRoom`, `toWatchedUrl`, `toScanRun`, `toPageSnapshot`, `toChangeAnalysis`) and the multi-table list-changes join pattern.
+- **`lib/scan.ts`** — The scan orchestrator. Owns `runScan(room)`: validates the crawl URL (SSRF guard — `validateCrawlUrl` blocks literal IPv4/IPv6 in 127/8, ::1, 169.254/16, 10/8, etc.), picks Apify vs direct-fetch, calls `extractExcerpt` to bound prompt size, hashes content with `lib/diff`, uploads evidence via `lib/storage`, persists `snapshots` + `ai_explanations` rows, and updates `snapshot_jobs.status` to `succeeded`. Also inlines the OpenAI/OpenRouter call (`callLlm`) with placeholder-key detection.
+- **`lib/storage.ts`** — InsForge Storage wrapper. Exports `EVIDENCE_BUCKET = 'pagevault-evidence'`, `STORAGE_ROOT = 'pagevault'`, `hasStorageCreds()`, and `createStorageFolder(name, parentPath?)`. Uploads always persist **both** `url` and `key` (the `key` is required for RLS-protected reads).
+- **`lib/diff.ts`** — Pure functions for change detection: `normalizeText`, `hashContent` (SHA-256), `hasMeaningfulChange(previous, current)` (cheap pre-LLM gate), and `extractSimpleDiff` for the human-readable excerpt.
+- **`lib/validation.ts`** — Zod-free input validation for room and URL create/update forms. Exports `validateRoomField`, `validateUrlEntry`, `validateUrlBatch`, `frequencyToCronExpression`, `buildWatchedUrlRows`. All errors returned as `ValidationResult<T>` for the route handler to map to 400s.
+- **`lib/auth.ts`** — NextAuth config: `authOptions` (credentials provider), `resolveNextAuthSecret()`, dev-demo opt-in constants, `tryDevDemoAuth` / `signInWithInsForge`. Throws on startup if `NEXTAUTH_SECRET` is missing in production.
+- **`lib/apiAuth.ts`** — `requireSession()` helper for route handlers. Returns either the session or a `NextResponse` 401, so route code stays linear.
+- **`lib/cron-auth.ts`** — `requireCronSecret(request)` for `app/api/cron/*` routes. Discriminated result: 503 service_unconfigured vs 401 unauthorized.
+- **`lib/notifications.ts`** — The outbox: `enqueueNotification` (called from scan on a real change), `drainOutbox(limit)` (the cron worker reads pending rows, dispatches webhooks/email, records success/failure), and a `dbRpc` helper that talks to the `public` security-definer wrappers (PostgREST can't call `pg_*` directly).
+- **`lib/env.ts`** — Credential detection: `getInsforgeClient()`, `hasApifyCreds()`, `hasAiCreds()`, `getInsforgeBaseUrl()`. A credential is "present" only when it is a non-empty string after trimming — malformed values are still treated as present so they surface as real-call errors, not silent fallbacks.
+
+## 3. Data flow — manual scan (User → API)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User (browser)
+    participant NX as Next.js<br/>(app/dashboard + app/api)
+    participant SC as lib/scan.ts
+    participant AP as Apify<br/>(website-content-crawler)
+    participant ST as lib/storage.ts<br/>(InsForge Storage)
+    participant DB as lib/insforge.ts<br/>(PostgREST via @insforge/sdk)
+    participant AI as LLM<br/>(OpenAI / OpenRouter)
+    U->>NX: Click "Run scan" on room page
+    NX->>NX: requireSession() (lib/apiAuth)
+    NX->>SC: POST /api/rooms/[roomId]/scan → runScan(room)
+    SC->>SC: validateCrawlUrl(url) — SSRF guard
+    SC->>AP: hasApifyCreds() ? crawlOne(url) : direct fetch + HTML→MD
+    AP-->>SC: markdown + title
+    SC->>SC: sha256(markdown) → compare to previous snapshot
+    alt hash matches previous
+        SC->>DB: insert snapshots { change_type: 'none' }
+        SC-->>NX: return scan summary
+    else hash differs (real change)
+        SC->>ST: uploadEvidence(folder, snapshots/<date>/<slug>.md, markdown)
+        ST-->>SC: { key, url }
+        SC->>DB: insert snapshots
+        SC->>DB: read previous snapshot markdown
+        SC->>AI: callLlm(system, userPrompt) — haiku or sonnet
+        AI-->>SC: { severity, summary, evidence[], confidence }
+        SC->>DB: insert ai_explanations
+        SC->>DB: update snapshot_jobs.status = 'succeeded'
+    end
+    SC-->>NX: ScanSummary
+    NX-->>U: render summary + navigate to /changes/[id]
 ```
-                        ┌─────────────────────┐
-                        │      Browser        │
-                        │  (Next.js RSC+CSR)  │
-                        └─────────┬───────────┘
-                                  │  HTTPS (Next.js route handlers)
-                                  ▼
-   ┌──────────────────────────────────────────────────────────────┐
-   │                       Next.js App                            │
-   │  ┌────────────────────┐  ┌────────────────────────────────┐  │
-   │  │  app/dashboard/    │  │  app/api/                      │  │
-   │  │  (RSC + client)    │  │  (route handlers)             │  │
-   │  │  pages, layouts    │  │  requireSession + cron-secret  │  │
-   │  └────────────────────┘  └────────┬───────────────────────┘  │
-   └──────────────────────────────────┬─┴──────────────────────────┘
-                                      │ SDK / fetch
-        ┌─────────────────────────────┼─────────────────────────────┐
-        │                             │                             │
-        ▼                             ▼                             ▼
-┌──────────────┐            ┌──────────────────┐         ┌──────────────────┐
-│   InsForge   │            │      Apify       │         │  OpenAI-compat   │
-│   Postgres   │            │   website-       │         │  Chat API        │
-│  (PostgREST) │            │   content-       │         │  (OpenRouter /   │
-│              │            │   crawler        │         │   OpenAI / other)│
-└──────┬───────┘            └────────┬─────────┘         └────────┬─────────┘
-       │                             │                            │
-       │                             └─────────────┬──────────────┘
-       │                                           │
-       │             ┌──────────────────┐          │
-       │             │  InsForge        │          │
-       │             │  Storage         │          │
-       │             │  (evidence)      │          │
-       │             └──────────────────┘          │
-       │                                          │
-       │  ┌────────────────────┐                 │
-       │  │ InsForge Schedules │ ←───────────────┘
-       │  │ (cron triggers)    │
-       │  │  /api/cron/scan-all     every 1 min
-       │  │  /api/cron/notification-worker  every 1 min
-       │  └────────────────────┘
-       │
-       ▼
-   [ Webhook receiver → user's URL ]   (notification_subscriptions → notification_outbox)
-```
 
-## Component breakdown
+The same `runScan(room)` is invoked by the **scheduled** path (`/api/cron/scan-all`, authenticated via `x-cron-secret` header) — that route iterates rooms with `frequency_cron` set, fans out with `MAX_CONCURRENT=3`, and updates `last_run_at` on each.
 
-### 1. Next.js app (`app/`, `components/`, `lib/`)
+## 4. Deployment topology
 
-- **Pages** under `app/dashboard/` are server components that fetch via
-  `/api/*` route handlers. Pages under `app/dashboard/*/[id]/page.tsx` are
-  also client components because they need `useSession()` and run-scan
-  buttons. See [COMPONENTS.md](COMPONENTS.md) for the visual layer.
-- **Route handlers** under `app/api/` are the only place that talks to
-  InsForge directly. Two auth patterns:
-  - **User routes** (everything under `/api/rooms/...`, `/api/changes/...`)
-    call `requireSession()` from `lib/apiAuth.ts` and 401 on failure.
-  - **Cron routes** (`/api/cron/scan-all`, `/api/cron/notification-worker`)
-    call `requireCronSecret(request)` from `lib/cron-auth.ts` and 401 on
-    failure.
-- **Middleware** (`middleware.ts`) only protects `/dashboard/*` via
-  NextAuth's `withAuth`. It does **not** protect `/api/*` — that's the
-  job of the route handlers' `requireSession()` calls.
-- **Library layer** (`lib/`) is the business logic. See
-  [COMPONENTS.md §lib](COMPONENTS.md) for the file-by-file map.
+| Component | Where it runs | Trigger |
+| --- | --- | --- |
+| Next.js app (UI + API routes) | **Vercel** (or any Node host that can run Next 15) | HTTP from browsers, plus HTTPS to InsForge Schedules cron |
+| Postgres (`projects`, `tracked_pages`, `snapshots`, `ai_explanations`, `snapshot_jobs`, `notification_outbox`, `notification_subscriptions`) | **InsForge managed Postgres** at `wga6k9at.us-east.insforge.app` | SDK + PostgREST at `/api/database/records/{table}` |
+| Evidence storage (`pagevault-evidence` bucket) | **InsForge Storage** | SDK `client.storage.from(...).upload(...)` from `lib/storage.ts` |
+| Scheduled scans | **InsForge Schedules** cron job → POSTs `/api/cron/scan-all` with `x-cron-secret` | Cron tick (e.g. every 15 min) |
+| Notification worker | **InsForge Schedules** cron job → POSTs `/api/cron/notification-worker` | Cron tick (e.g. every 5 min) |
+| Web crawl (Apify) | **Apify cloud** (`api.apify.com`) | `lib/scan.ts` calls Apify REST when `APIFY_*` creds present; falls back to direct fetch otherwise |
+| LLM | **OpenAI API** (when `OPENAI_API_KEY` real) or **OpenRouter** via InsForge AI gateway (default — set up with `npx @insforge/cli ai setup`) | `lib/scan.ts` `callLlm()` |
 
-### 2. InsForge Postgres (control plane)
+The Vercel → InsForge pairing was the design intent (see `docs/DEPLOYMENT.md`). Any Node host works as long as it can reach `INSFORGE_API_URL`, `api.apify.com`, and the LLM base URL.
 
-Seven base tables + two feature tables. Full reference in
-[DATA_MODEL.md](DATA_MODEL.md). Quick map:
+## 5. Key trade-offs
 
-| Table | One-line purpose |
-|---|---|
-| `projects` | A user's "memory room" (a watchlist of URLs to track) |
-| `tracked_pages` | One URL inside a project |
-| `snapshot_jobs` | A single scan run (manual, schedule, or webhook) |
-| `snapshots` | A captured page version (hash + raw markdown + metadata) |
-| `artifacts` | Files in InsForge Storage linked to a snapshot (currently unused) |
-| `ai_explanations` | The LLM's structured analysis of a snapshot-vs-snapshot diff |
-| `webhook_events` | Idempotency log for inbound webhooks (Apify / Box) |
-| `scan_schedules` | Per-project cron expression + InsForge schedule id |
-| `notification_subscriptions` | Per-project outbound webhook subscriptions |
-| `notification_outbox` | Durable outbox rows drained by the cron worker |
+- **Evidence is durably stored in InsForge Storage on every change** (not a CDN or a signed S3 URL). Apify/Inference/UI latency in the critical path is acceptable because evidence durability is non-negotiable for a "memory" product; alternatives considered were S3 + pre-signed URLs (rejected: loses the InsForge-managed RLS story) and local-disk (rejected: not durable across Vercel function invocations).
+- **PostgREST multi-call JOIN in JS** (3 sequential PostgREST calls + JS join in `lib/insforge.ts listChanges`) instead of a SQL JOIN or an RPC. Rejected alternatives: a PostgREST `rpc` wrapper function (rejected: adds a migration and a deploy step for a query that only runs on the changes page), and pushing the join down to a view (rejected: RLS posture makes view-based authz hard to reason about). The 3-call cost is bounded by `limit=100` and the page only renders once per room view.
+- **Direct `fetch()` HTML→Markdown fallback** in `lib/scan.ts` when Apify creds are missing (inherited from scaffold). Rejected alternatives: always-required Apify (rejected: blocks local dev), and a heavyweight HTML→MD library like Turndown at the route layer (rejected: ships more bytes for an identical result on most pages). The fallback is intentionally simple — it's a dev convenience, not a production crawler.
+- **LLM is a black box inside `lib/scan.ts`** rather than its own module. Rejected: a separate `lib/ai.ts` would have been more testable, but the prompt is co-evolved with the scan pipeline (excerpt sizing, severity escalation rules) and pulling it out hid more than it revealed. `callLlm` is a private function with a clear signature; the test surface is the public `runScan` end-to-end tests.
 
-> **Note on `box_*` column names:** the schema was migrated from "Box" to
-> "InsForge Storage" but column names like `box_root_folder_id`,
-> `box_page_folder_id`, `box_file_id`, `report_box_file_id` are kept for
-> back-compat. They now hold InsForge Storage paths/keys. Don't rename
-> them in a new migration — both `lib/insforge.ts` and the legacy
-> `boxFolderId`/`boxFileId` aliases depend on the names.
+## 6. Open questions (blocking downstream cards)
 
-### 3. Apify (crawl plane)
-
-`lib/scan.ts:crawlOne()` first tries Apify if both
-`APIFY_API_TOKEN` and `APIFY_ACTOR_ID` are set, then falls back to a
-direct `fetch()` + a built-in HTML→Markdown extractor. The Apify
-integration is a thin shim: it calls
-`https://api.apify.com/v2/acts/<ACTOR_ID>/run-sync-get-dataset-items` and
-expects the actor to return cleaned markdown.
-
-The legacy `lib/apify.ts` is **dead code** (no callers) and is scheduled
-for removal in the post-P0 cleanup. Don't import from it.
-
-### 4. LLM (explain plane)
-
-`lib/scan.ts:callLlm()` is the only LLM caller. It:
-
-1. Picks the key: `OPENAI_API_KEY` if it's a real key (length ≥ 30, no
-   `...` placeholder), otherwise `OPENROUTER_API_KEY`.
-2. Picks the base URL: `OPENAI_BASE_URL` if set, otherwise
-   `https://api.openai.com/v1` for OpenAI or `https://openrouter.ai/api/v1`
-   for OpenRouter.
-3. Picks the model: `OPENAI_MODEL` if set, otherwise
-   `anthropic/claude-3.5-haiku` (the recommended model per
-   [LLM_MODEL_RESEARCH.md](LLM_MODEL_RESEARCH.md)).
-4. Sends the diff (previous + current markdown excerpt) and a strict
-   system prompt that asks for `response_format: { type: 'json_object' }`.
-5. Validates the response against the `ChangeAnalysisResult` type and
-   truncates strings to fit DB column widths.
-
-The current model recommendation, the rationale, and the eval harness are
-all in [LLM_MODEL_RESEARCH.md](LLM_MODEL_RESEARCH.md).
-
-### 5. InsForge Storage (evidence plane)
-
-`lib/scan.ts:uploadEvidence()` uploads the raw markdown of every new
-snapshot to the `pagevault-evidence` bucket under
-`<storageFolderPath>/snapshots/<YYYY-MM-DD>/snapshot-<ms>.md`. The key
-and public URL are persisted on the `snapshots` row (in legacy
-`box_snapshot_folder_id` for back-compat).
-
-If the upload fails the scan still completes — the snapshot is recorded
-but the evidence file is missing. This is by design: a transient
-Storage outage shouldn't fail the scan. Operators see the missing file
-in the change detail page.
-
-### 6. InsForge Schedules (cron plane)
-
-Two cron jobs configured via the InsForge CLI:
-
-| Endpoint | Cadence | Auth | Purpose |
-|---|---|---|---|
-| `POST /api/cron/scan-all` | every 1 minute | `x-cron-secret` header | Iterates all enabled `scan_schedules`, runs a scan for each, updates `last_run_at`. |
-| `POST /api/cron/notification-worker` | every 1 minute | `x-cron-secret` header | Drains the `notification_outbox` table. |
-
-Both are documented in detail in [DEPLOYMENT.md](DEPLOYMENT.md) and
-the implementation plan in
-[plans/2026-06-02-scheduled-scans-and-notifications.md](plans/2026-06-02-scheduled-scans-and-notifications.md).
-
-## Authentication and authorization
-
-Three distinct auth surfaces:
-
-| Surface | Mechanism | Source of truth |
-|---|---|---|
-| **Browser → dashboard pages** | NextAuth `withAuth` middleware | `middleware.ts` |
-| **Browser → API routes** | `requireSession()` helper | `lib/apiAuth.ts` |
-| **InsForge cron → API routes** | `x-cron-secret` header check | `lib/cron-auth.ts` |
-
-> **The middleware does NOT cover `/api/*`.** Every API route that mutates
-> or returns user data must call `requireSession()` itself. The audit in
-> `docs/audits/2026-06-02-codebase-audit.md` (S-1) flagged this; the
-> fix is in `security/p0-fixes`.
-
-For the NEXTAUTH_SECRET, see [ENVIRONMENT.md](ENVIRONMENT.md) and
-[SECURITY.md](../SECURITY.md). The short version: there is no
-hardcoded fallback. Missing secret in production throws at startup.
-Dev-only opt-in via `INSFORGE_DEV_INSECURE_SECRET=1`.
-
-## Request lifecycle: a manual scan
-
-1. **User clicks "Run scan"** on the room detail page. The page calls
-   `POST /api/rooms/<id>/scan`.
-2. The route handler calls `requireSession()` (401 on miss) and
-   `getRoom(id)` from `lib/insforge.ts` (404 on miss).
-3. It calls `runScan(room)` from `lib/scan.ts`.
-4. `runScan` creates a `snapshot_jobs` row with `status='running'`.
-5. For each watched URL, it calls `scanOne`:
-   - Crawls via Apify or direct fetch
-   - SHA-256-hashes the markdown
-   - If hash matches the previous snapshot, skips (cost-saver)
-   - Uploads markdown to InsForge Storage
-   - Inserts a `snapshots` row
-   - Calls the LLM with the previous + current excerpt
-   - Inserts an `ai_explanations` row
-6. After the loop, `scan_jobs` is updated to `status='succeeded'`.
-7. `lib/scan.ts` calls `enqueueNotification()` which inserts rows into
-   `notification_outbox` for each enabled subscription on the project.
-8. The route handler returns `{ scanRunId, status, snapshotsCaptured, changesCreated }`.
-9. **Within the next minute** the InsForge `notification-worker` cron
-   picks up the outbox rows, acquires the advisory lock, and dispatches
-   the webhook(s) via the `webhook` channel.
-
-## Key design decisions
-
-### Why a Postgres outbox instead of firing the webhook inline?
-
-Inline webhooks fail silently when the receiver is down. An outbox + cron
-worker gives us:
-
-- **At-least-once delivery** (rows aren't deleted until `delivered`).
-- **Backoff / retry** (`attempts`, `next_attempt_at` columns).
-- **Failure auto-disable** (10 consecutive failures → `enabled = false`).
-- **Operator visibility** (`SELECT * FROM notification_outbox WHERE
-  status = 'pending'`).
-
-### Why an advisory lock in the worker?
-
-Two cron workers can run concurrently (InsForge doesn't guarantee a
-single in-flight invocation per schedule). Without the lock they'd race
-on the same outbox rows. The lock id (`42`) is a magic number; the
-`acquire_notification_lock` and `release_notification_lock` functions
-are wrappers around `pg_try_advisory_lock` in the `public` schema
-because PostgREST doesn't expose `pg_catalog` functions directly.
-
-### Why a content-hash cost-saver before the LLM call?
-
-Most pages don't change between scans. Hashing the markdown and skipping
-the LLM call when the hash matches the previous snapshot saves the
-dominant cost of a scan. This is documented in
-SYSTEM_DESIGN.md §3.3 ("cascade architecture") and validated in
-[LLM_MODEL_RESEARCH.md](LLM_MODEL_RESEARCH.md).
-
-### Why OpenRouter as the default LLM?
-
-`anthropic/claude-3.5-haiku` via OpenRouter is the best price/quality
-ratio for the structured-output extraction task that `lib/scan.ts`
-performs. Full rationale, with benchmarks, is in
-[LLM_MODEL_RESEARCH.md](LLM_MODEL_RESEARCH.md).
-
-## Open architecture questions
-
-- ⚠️ **The "Artifacts" table is currently unused.** `lib/scan.ts` doesn't
-  write to it. It exists for the future case where we want to record
-  per-snapshot file metadata separately from the `snapshots` row.
-- ⚠️ **`webhook_events` has no writer.** The Apify webhook handler in
-  `functions/apify-webhook.ts` doesn't log there. It will, once the
-  inbound-webhook flow is fully wired.
-- ⚠️ **The `exec()` call in `app/api/rooms/[roomId]/schedule/route.ts`**
-  is a known concern. It shells out to the InsForge CLI to manage
-  schedules. Long-term we want a real SDK call. See
-  `docs/audits/2026-06-02-codebase-audit.md` finding S-* for the
-  remediation plan.
+1. **Storage naming.** The DB column is `box_root_folder_id` and the card calls the storage "Box". The actual backend is InsForge Storage (per `lib/storage.ts`). Do we (a) keep the column name forever for back-compat, (b) add a `storage_root_path` column and dual-write, or (c) rename and write a one-time migration? **Affects:** t_77c7b919, t_9c78688a (any consumer that reads/writes this column).
+2. **Auth provider.** Currently NextAuth credentials-only. Card t_77c7b919 may need OAuth (GitHub/Google) before multi-user. Until then the `auth.users(id)` reference in RLS policies never fires (the app uses anon/service-role keys that bypass RLS — see insforge skill "RLS reality check"), so authz is enforced in app code via `getRoom()` + `userId` checks.
+3. **Seed strategy.** The scaffold has no `lib/seed.ts`. Seeding today is `scripts/seed_via_api.py` (Python + service-role key against the public PostgREST endpoint — the only reliable path because of cross-session DB isolation between the CLI and the SDK). Should we (a) keep the Python script, (b) add a `/api/admin/seed` route gated by `CRON_SHARED_SECRET`, or (c) move seeding into a TS module called from a CLI script? **Affects:** t_9c78688a (any test that needs deterministic seed data).
+4. **DB schema drift between docs and reality.** `SYSTEM_DESIGN.md` and `DATA_MODEL.md` are out of date in places (`snapshots.created_at` doesn't exist — use `observed_at`; `ai_explanations` has no `severity` column — read from `output_json`). The scan pipeline was already corrected; the docs still need a pass.
+5. **Cascade escalation policy.** `lib/scan.ts callLlm` picks haiku-or-sonnet today, but the prompt doesn't yet drive the "if confidence < 0.85, retry with sonnet" path — that's a deferred TODO in the scan pipeline. The card t_9c78688a likely needs this before the AI gateway is used in production traffic.
