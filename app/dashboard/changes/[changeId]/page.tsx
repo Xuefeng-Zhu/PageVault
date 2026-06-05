@@ -34,6 +34,46 @@ export default function ChangeDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>('overview');
   const [reviewed, setReviewed] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  // US-008: download the signed evidence bundle. The server returns
+  // application/zip with Content-Disposition: attachment, so a
+  // plain anchor download would work too — but using fetch() gives
+  // us a chance to surface a 404 / 500 toast if the export fails.
+  async function handleExportEvidence() {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const res = await fetch(`/api/changes/${changeId}/export`, { cache: 'no-store' });
+      if (!res.ok) {
+        const message = res.status === 404
+          ? 'Change not found — it may have been deleted.'
+          : res.status === 401
+            ? 'You need to sign in to export evidence.'
+            : 'Export failed. Please try again.';
+        showToast(message, { type: 'error' });
+        return;
+      }
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      // Fall back to a stable filename if the server didn't set one.
+      const cd = res.headers.get('Content-Disposition') ?? '';
+      const match = cd.match(/filename="?([^";]+)"?/);
+      a.download = match?.[1] ?? `pagevault-evidence-${changeId}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(objectUrl);
+      showToast('Evidence bundle downloaded', { type: 'success' });
+    } catch (err) {
+      console.error('Evidence export error:', err);
+      showToast('Export failed — check your connection.', { type: 'error' });
+    } finally {
+      setExporting(false);
+    }
+  }
 
   useEffect(() => {
     async function fetchChange() {
@@ -137,9 +177,10 @@ export default function ChangeDetailPage() {
           <Button
             variant="secondary"
             icon={<Download className="w-4 h-4" />}
-            onClick={() => showToast('Export queued', { type: 'info' })}
+            loading={exporting}
+            onClick={handleExportEvidence}
           >
-            Export
+            Export evidence
           </Button>
           <Button
             onClick={handleMarkAsReviewed}
