@@ -16,6 +16,7 @@
 import { createHash } from 'node:crypto';
 import dns from 'node:dns/promises';
 import { enqueueNotification } from './notifications';
+import { sanitizeMarkdown, sanitizeTitle } from './sanitize';
 import type {
   MemoryRoom,
   PageSnapshot,
@@ -28,7 +29,14 @@ import type {
 // Lightweight HTML→Markdown-ish extractor. We avoid pulling in a heavy
 // readability library — for the Apify-equivalent baseline this is enough:
 // strip tags, drop scripts/styles/nav, collapse whitespace, preserve line breaks.
-function htmlToMarkdown(html: string): { title: string; markdown: string; text: string } {
+//
+// Exported for HIGH-1 regression tests: lib/scan.test.ts exercises the
+// full HTML→sanitized-text flow on adversarial inputs. Callers in
+// production should keep applying `sanitizeTitle` and `sanitizeMarkdown`
+// (lib/sanitize.ts) to the output — `htmlToMarkdown` does most of the
+// HTML-tag stripping already, but the sanitizer is the persistence-
+// layer guarantee and the one the HIGH-1 tests pin.
+export function htmlToMarkdown(html: string): { title: string; markdown: string; text: string } {
   // Extract <title>
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = titleMatch ? titleMatch[1].trim() : '';
@@ -609,7 +617,20 @@ async function scanOne(
 ): Promise<{ snapshot: PageSnapshot | null; change: NewChangeAnalysis | null }> {
   // 1. Crawl the URL
   const crawled = await crawlOne(wp.source_url);
-  const mdHash = createHash('sha256').update(crawled.markdown).digest('hex');
+  // HIGH-1: sanitize the crawl output before we hash it or persist it.
+  // The crawler fetches arbitrary user-supplied URLs, so a malicious
+  // page can put `<script>alert(1)</script>` in its `<title>` or in
+  // the body. We strip script blocks, HTML comments, stray HTML tags,
+  // and control characters here, and apply the length caps the schema
+  // expects (TITLE_MAX_CHARS=500, MARKDOWN_MAX_CHARS=50_000 — see
+  // lib/sanitize.ts). Hashing the *sanitized* markdown means two
+  // crawls that differ only in scripts / whitespace hash the same —
+  // that's a feature, not a bug: the stored snapshot is what
+  // changes, not the raw HTML.
+  const cleanTitle = sanitizeTitle(crawled.title);
+  const cleanMarkdown = sanitizeMarkdown(crawled.markdown);
+  const cleanText = sanitizeMarkdown(crawled.text);
+  const mdHash = createHash('sha256').update(cleanMarkdown).digest('hex');
 
   // 2. Look up the previous snapshot for this page
   const prevRows = (await dbGet(
@@ -622,12 +643,14 @@ async function scanOne(
     return { snapshot: null, change: null };
   }
 
-  // 4. Upload evidence to InsForge Storage (best-effort)
+  // 4. Upload evidence to InsForge Storage (best-effort). Use the
+  // sanitized markdown so an attacker-controlled page cannot put a
+  // <script> in the long-term evidence blob either.
   const safeFileName = `snapshot-${Date.now()}.md`;
   const uploaded = await uploadEvidence(
     room.storageFolderPath ?? room.boxFolderId ?? '',
     safeFileName,
-    crawled.markdown,
+    cleanMarkdown,
   );
 
   // 5. Insert the new snapshot
@@ -640,10 +663,18 @@ async function scanOne(
     observed_at: observedAt,
     final_url: crawled.url,
     canonical_url: crawled.url,
-    page_title: crawled.title || crawled.url,
+    // HIGH-1: cleanTitle is the sanitizer-capped, tag-stripped title.
+    // The legacy `|| crawled.url` fallback still applies for a page
+    // whose title is empty even after sanitization (e.g. server
+    // returns <title></title>).
+    page_title: cleanTitle || crawled.url,
     http_status: 200,
     markdown_hash: mdHash,
-    markdown_text: crawled.markdown.slice(0, 50000), // cap at 50KB to keep rows small
+    // HIGH-1: cleanMarkdown is already capped at MARKDOWN_MAX_CHARS
+    // (50_000) inside sanitizeMarkdown, so no further slice is
+    // needed. We keep it as `cleanMarkdown` (not `crawled.markdown`)
+    // so the stored text is the sanitized version.
+    markdown_text: cleanMarkdown,
     change_type: prev ? 'textual' : 'none', // refined by AI if change detected
     box_snapshot_folder_id: uploaded
       ? `pagevault/${(room.storageFolderPath || room.boxFolderId || '').replace(/^pagevault\//, '')}/snapshots/${observedAt.slice(0, 10)}/`
@@ -660,8 +691,12 @@ async function scanOne(
         watchedUrlId: wp.id,
         scanRunId: jobId,
         url: crawled.url,
-        title: crawled.title,
-        textContent: crawled.text,
+        // HIGH-1: return the sanitized title/text so anything that
+        // surfaces this PageSnapshot downstream (the API response,
+        // the change-detail page, the LLM evidence render) gets
+        // scrubbed HTML, not raw attacker input.
+        title: cleanTitle,
+        textContent: cleanText,
         contentHash: mdHash,
         storageKey: uploaded?.key ?? null,
         storageUrl: uploaded?.url ?? null,
@@ -674,9 +709,11 @@ async function scanOne(
 
   // 7. Call the LLM
   const prevExcerpt = extractExcerpt(prev.markdown_text || '', 800);
-  const liveExcerpt = extractExcerpt(crawled.markdown, 1200);
+  // HIGH-1: feed the LLM the sanitized markdown + title so the
+  // "evidence" it quotes back to us cannot carry <script> tags.
+  const liveExcerpt = extractExcerpt(cleanMarkdown, 1200);
   const userPrompt = `Tracked page: ${crawled.url}
-Title: ${crawled.title || crawled.url}
+Title: ${cleanTitle || crawled.url}
 
 === PREVIOUS ===
 ${prevExcerpt || '(no previous text excerpt available)'}
@@ -698,7 +735,7 @@ Analyze the change. Return JSON only.`;
     return {
       snapshot: {
         id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId: jobId,
-        url: crawled.url, title: crawled.title, textContent: crawled.text,
+        url: crawled.url, title: cleanTitle, textContent: cleanText,
         contentHash: mdHash, storageKey: uploaded?.key ?? null,
         storageUrl: uploaded?.url ?? null, boxFileId: uploaded?.key ?? null,
         capturedAt: observedAt,
@@ -766,7 +803,7 @@ Analyze the change. Return JSON only.`;
   return {
     snapshot: {
       id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId: jobId,
-      url: crawled.url, title: crawled.title, textContent: crawled.text,
+      url: crawled.url, title: cleanTitle, textContent: cleanText,
       contentHash: mdHash, storageKey: uploaded?.key ?? null,
       storageUrl: uploaded?.url ?? null, boxFileId: uploaded?.key ?? null,
       capturedAt: observedAt,

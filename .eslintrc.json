@@ -1,7 +1,14 @@
 {
   "extends": ["next/core-web-vitals"],
   "rules": {
-    "@next/next/no-html-link-for-pages": "off"
+    "@next/next/no-html-link-for-pages": "off",
+    "no-restricted-syntax": [
+      "error",
+      {
+        "selector": "JSXAttribute[name.name='dangerouslySetInnerHTML']",
+        "message": "dangerouslySetInnerHTML is banned in this project (HIGH-1). It would render any HTML stored in snapshots.markdown_text or page_title as raw markup, defeating the lib/sanitize.ts persistence-layer protection. If you have a genuine, narrow use case (e.g. rendering trusted, server-built HTML with no user content), discuss with the team first; otherwise render text with {variable} so React escapes it."
+      }
+    ]
   },
   "ignorePatterns": [
     "node_modules/",

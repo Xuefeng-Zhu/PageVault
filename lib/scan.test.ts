@@ -8,8 +8,35 @@
 // before any outbound fetch) which rejects URLs whose hostname resolves
 // to a private / loopback / link-local / cloud-metadata / multicast /
 // reserved address.
-import { describe, it, expect, vi } from 'vitest';
+//
+// Also covers HIGH-1: persistence-layer sanitization. A page whose
+// `<title>` or body contains `<script>alert(1)</script>` must have the
+// payload stripped before it lands in `snapshots.markdown_text` or
+// `page_title`. We test this by piping the HTML through
+// `htmlToMarkdown` and then `sanitizeTitle` / `sanitizeMarkdown` — the
+// same two calls `scanOne()` makes before `dbInsert`.
+import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { isBlockedAddress } from './scan';
+import { sanitizeMarkdown, sanitizeTitle } from './sanitize';
+
+// Importing lib/scan.ts at the top level triggers a module-load throw
+// when INSFORGE_API_URL is unset (see lib/scan.ts line 444-446: the
+// scan module refuses to load against an unknown InsForge tenant).
+// The HIGH-1 tests in this file don't need the InsForge base URL —
+// they only need `htmlToMarkdown` (an exported pure function) — so
+// we set the env var to a placeholder before the dynamic import.
+// The same trick is used by the existing SSRF tests, which also do
+// their scan.ts work via dynamic import.
+beforeAll(() => {
+  if (!process.env.INSFORGE_API_URL) {
+    process.env.INSFORGE_API_URL = 'https://test.invalid';
+  }
+});
+
+async function loadHtmlToMarkdown(): Promise<typeof import('./scan').htmlToMarkdown> {
+  const mod = await import('./scan');
+  return mod.htmlToMarkdown;
+}
 
 // The URL-level tests (validateCrawlUrl) need to control what dns.lookup
 // returns so they don't hit the real network. We use vi.hoisted() to share
@@ -208,5 +235,100 @@ describe('validateCrawlUrl (DNS rebinding defense)', () => {
     const v = await loadValidateCrawlUrl();
     await expect(v('http://nxdomain.example.com/'))
       .rejects.toThrow(/DNS lookup failed/i);
+  });
+});
+
+describe('HIGH-1: snapshot text is sanitized before dbInsert (lib/scan.ts:scanOne)', () => {
+  // The HIGH-1 acceptance criterion is: a crawled page with
+  // `<script>alert(1)</script>` in the title or markdown has the
+  // payload stripped before the dbInsert call.
+  //
+  // We test the *pipeline* the scan actually runs:
+  //   HTML → htmlToMarkdown() → sanitizeTitle() + sanitizeMarkdown()
+  //
+  // That mirrors what scanOne() does in production (lib/scan.ts
+  // scanOne step 1 → step "5. Insert the new snapshot"). If a future
+  // refactor removes the sanitizer from the scan pipeline, this
+  // test still passes (it's testing the two functions, not the
+  // wiring) — the lint rule and the snapshot row format pin the
+  // wiring separately. The point of this test is to assert the
+  // *contract*: adversarial HTML in → safe plain text out.
+  it('strips <script>alert(1)</script> from a malicious <title>', async () => {
+    const htmlToMarkdown = await loadHtmlToMarkdown();
+    const html = `<!doctype html>
+<html>
+  <head><title><script>alert(1)</script></title></head>
+  <body><p>Hello</p></body>
+</html>`;
+    const { title } = htmlToMarkdown(html);
+    // htmlToMarkdown takes the raw text between <title> and </title>,
+    // which includes the <script>...</script> payload. The sanitizer
+    // is what removes it.
+    const safe = sanitizeTitle(title);
+    expect(safe).not.toContain('<');
+    expect(safe).not.toContain('>');
+    expect(safe.toLowerCase()).not.toContain('script');
+    expect(safe).not.toContain('alert(1)');
+  });
+
+  it('strips a <script> block from the body and clamps the stored text', async () => {
+    const htmlToMarkdown = await loadHtmlToMarkdown();
+    const html = `<html>
+  <head><title>Pricing</title></head>
+  <body>
+    <h1>Our Pricing</h1>
+    <p>Welcome to <script>alert(1)</script> the pricing page.</p>
+  </body>
+</html>`;
+    const { markdown, text } = htmlToMarkdown(html);
+    const safeMarkdown = sanitizeMarkdown(markdown);
+    const safeText = sanitizeMarkdown(text);
+    expect(safeMarkdown.toLowerCase()).not.toContain('script');
+    expect(safeMarkdown).not.toContain('alert(1)');
+    expect(safeText.toLowerCase()).not.toContain('script');
+    expect(safeText).not.toContain('alert(1)');
+    // The legitimate content survived.
+    expect(safeMarkdown).toContain('Our Pricing');
+    expect(safeMarkdown).toContain('pricing page');
+  });
+
+  it('clamps a 1MB malicious title to TITLE_MAX_CHARS', async () => {
+    const htmlToMarkdown = await loadHtmlToMarkdown();
+    // 1 MB of `x` in the title field — the schema's text type accepts
+    // this, but the sanitizer caps it so the row stays small.
+    const huge = 'x'.repeat(1_000_000);
+    const html = `<html><head><title>${huge}</title></head><body></body></html>`;
+    const { title } = htmlToMarkdown(html);
+    const safe = sanitizeTitle(title);
+    expect(safe.length).toBe(500); // TITLE_MAX_CHARS
+  });
+
+  it('clamps a 1MB malicious body to MARKDOWN_MAX_CHARS', async () => {
+    const htmlToMarkdown = await loadHtmlToMarkdown();
+    const huge = 'y'.repeat(1_000_000);
+    const html = `<html><head><title>Big</title></head><body>${huge}</body></html>`;
+    const { markdown } = htmlToMarkdown(html);
+    const safe = sanitizeMarkdown(markdown);
+    expect(safe.length).toBe(50_000); // MARKDOWN_MAX_CHARS
+  });
+
+  it('a fully-scripted page becomes an empty (or near-empty) markdown body', async () => {
+    const htmlToMarkdown = await loadHtmlToMarkdown();
+    // Worst case: the entire body is one big <script>. After the
+    // pipeline the body should be empty (or contain only the
+    // benign surrounding words), and the title should be benign.
+    const html = `<!doctype html>
+<html>
+  <head><title><script>document.cookie</script>Hello</title></head>
+  <body><script>alert(1); steal(document.cookie);</script></body>
+</html>`;
+    const { title, markdown } = htmlToMarkdown(html);
+    const safeTitle = sanitizeTitle(title);
+    const safeMarkdown = sanitizeMarkdown(markdown);
+    expect(safeTitle.toLowerCase()).not.toContain('script');
+    expect(safeTitle).not.toContain('document.cookie');
+    expect(safeMarkdown.toLowerCase()).not.toContain('script');
+    expect(safeMarkdown).not.toContain('alert(1)');
+    expect(safeMarkdown).not.toContain('steal');
   });
 });
