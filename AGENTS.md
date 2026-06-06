@@ -41,17 +41,19 @@ Every integration library operates in two modes:
 
 Box is the deliberate exception: when Box credentials are present but a Box operation fails, the error propagates as a `BoxSystemError` rather than falling back to mock. This ensures evidence durability is guaranteed when Box is configured.
 
-### Demo Mode
+### Demo Mode (mock fallbacks)
 
-The application runs fully without any third-party credentials:
+The application runs with deterministic mock data for each non-auth integration when its credentials are absent:
 - Missing Apify credentials → deterministic mock crawl results
 - Missing Box credentials → mock folder/file identifiers and URLs
 - Missing AI credentials → deterministic mock analysis
 - Missing Insforge credentials → `InsforgeUnavailableError` with setup instructions
 
+These fallbacks exist for *data* integrations only. **Authentication is NOT in this list** — the auth path does NOT have a credential-less fallback. See [Authentication](#authentication) below.
+
 ## Environment Variables
 
-See `.env.example` for all configuration options. Missing credentials enable Demo_Mode.
+See `.env.example` for all configuration options. Missing *data-integration* credentials enable the corresponding mock fallback; auth does not fall back to a default.
 
 ## Setup
 
@@ -60,9 +62,18 @@ npm install
 npm run dev
 ```
 
-## Demo Mode
+## Demo Data
 
-Without any credentials, the application runs in Demo Mode. Use "Load Demo" on the home page to seed a complete demonstration room with before/after data and change analyses.
+Without any data-integration credentials, the application runs with mock data so the UI is browsable. Use "Load Demo" on the home page to seed a complete demonstration room with before/after data and change analyses.
+
+## Authentication
+
+Authentication is handled by NextAuth.js with the InsForge credentials provider (`lib/auth.ts`). There is no credential-less fallback for auth. Production posture:
+
+- **`NEXTAUTH_SECRET` is required.** Module load throws if it is unset in `NODE_ENV=production` (silent random would invalidate every JWT on restart). The only way to skip this is the dev-only opt-in `INSFORGE_DEV_INSECURE_SECRET=*** AND `NODE_ENV=development` — see `lib/auth.ts:resolveNextAuthSecret()` and `lib/auth.test.ts`.
+- **No hardcoded demo creds.** Historically `lib/auth.ts` contained three branches that silently accepted `admin@example.com / admin123` and `admin@example.com / demo123` whenever InsForge was misconfigured, returned non-2xx, or returned non-JSON. That was CRITICAL-2 (docs/qa-bug-hunt.md): the `demo123` path authenticated as the canonical super-user (`00000000-0000-0000-0000-000000000001`) who owned every legacy project. All three branches have been removed.
+- **Dev opt-in, if you really need it locally.** If you need to authenticate without a real InsForge backend, set BOTH `NODE_ENV=development` AND `INSFORGE_DEV_DEMO_AUTH=*** in `.env.local`. Only `admin@example.com / demo123` is accepted (the `admin123` variant is dead). Every successful demo auth logs a `console.warn` so the path is impossible to miss in dev server output. **Do not deploy with these set** — a stray `1` in production is a P0 auth bypass.
+- **Login page does not advertise the demo creds.** `app/login/page.tsx` no longer renders a "Demo filing" hint card. The card is gone entirely (it was misleading: the server only accepts the creds when the opt-in is set, and it never accepted `admin123`).
 
 ## Project Structure
 
