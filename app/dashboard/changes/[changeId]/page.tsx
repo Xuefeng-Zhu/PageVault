@@ -18,7 +18,7 @@ import {
 import { SeverityBadge } from '@/components/dashboard/SeverityBadge';
 import { AIInsightCard } from '@/components/dashboard/AIInsightCard';
 import { DiffViewer } from '@/components/dashboard/DiffViewer';
-import { DiffView } from '@/components/changes/DiffView';
+import { ShareButton } from '@/components/dashboard/ShareButton';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Tabs, SectionHeader, Spinner, EmptyState } from '@/components/ui/Primitives';
@@ -125,7 +125,7 @@ export default function ChangeDetailPage() {
               {error || 'Change not found'}
             </h2>
             <p className="font-body text-body-md text-ink-2 mb-6">
-              The filing you&apos;re looking for isn&apos;t in the archive.
+              The filing you're looking for isn't in the archive.
             </p>
             <Link href="/dashboard">
               <Button variant="secondary">← Back to overview</Button>
@@ -183,6 +183,7 @@ export default function ChangeDetailPage() {
           >
             Export evidence
           </Button>
+          <ShareButton changeId={changeId} />
           <Button
             onClick={handleMarkAsReviewed}
             disabled={reviewed}
@@ -227,17 +228,6 @@ export default function ChangeDetailPage() {
               </span>
             </div>
           </AIInsightCard>
-
-          {/* Text-level diff between the two snapshots — US-007. Render the
-              first evidence pair if it exists; otherwise skip rather than
-              emit an empty card. */}
-          {change.evidence[0] && (
-            <DiffView
-              before={change.evidence[0].before}
-              after={change.evidence[0].after}
-              summary={change.summary}
-            />
-          )}
 
           {/* Two columns: What changed + Why it matters */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
