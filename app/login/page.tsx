@@ -230,22 +230,19 @@ export default function LoginPage() {
             <ArrowUpRight className="w-4 h-4 text-ink-2 group-hover:text-ink group-hover:-translate-y-0.5 group-hover:translate-x-0.5 transition-transform" />
           </Link>
 
-          {/* Demo credentials hint */}
-          <div className="mt-7 p-4 border border-dashed border-rule">
-            <div className="font-mono text-mono-sm uppercase tracking-archive text-ink-3 mb-2">
-              Demo filing
-            </div>
-            <div className="grid grid-cols-2 gap-3 font-mono text-mono-sm">
-              <div>
-                <div className="text-ink-4 uppercase tracking-archive text-[0.625rem]">Email</div>
-                <div className="text-ink-2">admin@example.com</div>
-              </div>
-              <div>
-                <div className="text-ink-4 uppercase tracking-archive text-[0.625rem]">Password</div>
-                <div className="text-ink-2">demo123</div>
-              </div>
-            </div>
-          </div>
+          {/*
+            CRITICAL-2 (docs/qa-bug-hunt.md): the "Demo filing" credentials
+            hint card used to advertise `admin@example.com / demo123` to
+            every visitor regardless of env. The server-side backdoor that
+            accepted those creds has been closed (lib/auth.ts now requires
+            BOTH `NODE_ENV=development` AND `INSFORGE_DEV_DEMO_AUTH=*** =
+            to opt in, and even then only `demo123` works, never `admin123`).
+            The hint has been removed entirely — telling a user credentials
+            that the server will refuse in their environment is misleading
+            at best. If you are running locally and need the dev opt-in,
+            set `INSFORGE_DEV_DEMO_AUTH=*** and `NODE_ENV=development` in
+            your .env.local and call signIn programmatically.
+          */}
 
           <p className="mt-8 text-center">
             <Link
