@@ -33,9 +33,11 @@
 > Note: at the time of this reconstruction, the engineering cards
 > `t_2be39e81` (CRITICAL-1), `t_a5ba5337` (CRITICAL-4), `t_af9c3a9b` (HIGH-1),
 > `t_e72afb42` (HIGH-2 — fixed), `t_03b76d18` (HIGH-3 — fixed), `t_b04366c3`
-> (HIGH-4), `t_4348af03` (HIGH-5), and `t_ec652d37` (CRITICAL-2) are still
+> (HIGH-4), `t_95c8d16b` (HIGH-5 — fixed), and `t_ec652d37` (CRITICAL-2) are still
 > "review-required" or in flight. The fixes for CRITICAL-3 (`8cba2e8`),
-> HIGH-2, HIGH-3 (`newId` rename), MEDIUM-1 (`de464e9`), MEDIUM-2, MEDIUM-3,
+> HIGH-2, HIGH-3 (`newId` rename), HIGH-5 (per-page `snapshot_jobs` ownership
+> on branch `fix/high-5-orphan-snapshot-jobs-and-page-cap` commit `0ed2f55`),
+> MEDIUM-1 (`de464e9`), MEDIUM-2, MEDIUM-3,
 > and MEDIUM-4 (`1fb8dc3`) exist in commits on other branches / in review and
 > are not present on the current working tree. The status field below reflects
 > the current working tree at the time of writing; downstream reviewers should
@@ -289,7 +291,7 @@ Per the QA worker's own summary: "46 tests pass across 2 files. Every finding ha
 ### HIGH-5: Orphan `snapshot_jobs` FK + undocumented 50-page cap
 
 - **File:** lib/scan.ts:386-447 (runScan), with related call sites at lib/insforge.ts:303-315 (lastScanAt)
-- **Status:** open (engineering card t_4348af03 has given up after 90-iteration budget exhaustion twice; the current working tree still has the 50-page cap and the `tracked_page_id: watchedUrls[0].id` parent-rebinding shape)
+- **Status:** fixed (branch `fix/high-5-orphan-snapshot-jobs-and-page-cap`, commit `0ed2f55`; tracked by kanban card `t_95c8d16b`. `runScan` now mints a per-page `snapshot_jobs` row inside the loop — each job is parented to the page being scanned, marked succeeded/failed locally, and `&limit=50` has been dropped from the `tracked_pages` query. Regression covered by 4 tests in `lib/scan.test.ts`: one job per page, no parent-rebinding to `watchedUrls[0]`, 51-URL room scans all 51, per-page `succeeded` transitions are independent.)
 - **Code (current):**
   ```ts
   // 1. Load watched URLs
