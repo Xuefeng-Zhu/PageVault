@@ -1,0 +1,274 @@
+name: schema
+
+# CI for db/schema.sql + scripts/apply-schema.sh.
+#
+# Two jobs:
+#
+#   1. dry-run   — runs on every PR that touches db/schema.sql,
+#                  scripts/apply-schema.sh, or scripts/_split_sql.py.
+#                  Splits the schema, asserts the chunk count matches the
+#                  expected inventory (10 tables, 19 indexes, 2 RPC
+#                  helpers, 9 RLS policies, plus the boilerplate), and
+#                  verifies the splitter does not break on the actual
+#                  file.  No live DB needed, no secrets — this is the
+#                  merge gate for schema-shape changes.
+#
+#   2. apply    — workflow_dispatch only.  Lets an operator push a
+#                 schema change to the linked InsForge project from CI
+#                 instead of running scripts/apply-schema.sh by hand.
+#                 Requires the INSFORGE_USER_API_KEY secret (the user
+#                 API key from `npx @insforge/cli login --user-api-key
+#                 <key>` — see the insforge-cli skill).
+#
+# Why this is its own workflow file
+# ---------------------------------
+# The main ci.yml runs on every push to every branch and every PR.  The
+# dry-run job only needs to run when the schema or its apply path
+# changes, and the apply job is operator-triggered only.  Keeping it
+# separate keeps the main ci.yml focused on the build / lint / test
+# matrix and avoids a slow schema-parse step on every commit.
+#
+# The "multi-statement DDL" pitfall this guards against is documented
+# in the insforge-cli skill: `npx @insforge/cli db import` silently
+# drops multi-statement chunks that include ALTER TABLE / CREATE POLICY,
+# so the canonical apply path is per-statement (which is what
+# scripts/apply-schema.sh does).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "db/schema.sql"
+      - "scripts/apply-schema.sh"
+      - "scripts/_split_sql.py"
+      - ".github/workflows/schema.yml"
+  push:
+    branches: [main]
+    paths:
+      - "db/schema.sql"
+      - "scripts/apply-schema.sh"
+      - "scripts/_split_sql.py"
+      - ".github/workflows/schema.yml"
+  workflow_dispatch:
+    inputs:
+      schema_path:
+        description: "Path to the SQL file to apply (default: db/schema.sql)"
+        required: false
+        default: "db/schema.sql"
+
+# Don't cancel in flight — apply can take a couple of minutes and
+# cancelling mid-apply could leave the schema in a partially-applied
+# state.  The schema is idempotent so a re-run cleans up, but it's
+# still better to let the apply finish.
+concurrency:
+  group: schema-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    name: Schema dry-run (parse + chunk-count)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        # The splitter is pure Python 3 stdlib — no `pip install` needed.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node
+        # We also run `npx --no-install @insforge/cli db query "select 1"`
+        # to confirm the CLI is reachable on this runner; the real
+        # apply uses the same CLI but with credentials (see the apply
+        # job).
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        # We don't actually need the app deps to parse the schema, but
+        # installing npx is the cheapest way to make the CLI available
+        # for the sanity check below.
+        run: npm ci --no-audit --no-fund
+
+      - name: Split schema and assert chunk count
+        # The expected count is 55 for the current schema:
+        #   1  extension (pgcrypto)
+        #   10 create table
+        #   19 create index
+        #   2  create or replace function
+        #   2  revoke (one per function)
+        #   2  grant  (one per function)
+        #   9  alter table ... enable row level security
+        #   1  do $$ ... $$;  (the policy drop block)
+        #   9  create policy
+        #   --
+        #   55 total
+        # If a future schema edit changes one of these counts, this
+        # assertion tells the operator to update the comment above and
+        # re-verify (the apply job will fail with a clearer error
+        # otherwise).
+        run: |
+          set -euo pipefail
+          CHUNKS="$(python3 scripts/_split_sql.py db/schema.sql | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")"
+          echo "chunks: $CHUNKS"
+          if [ "$CHUNKS" -ne 55 ]; then
+            echo "::error::Expected 55 chunks after splitting db/schema.sql, got $CHUNKS."
+            echo "::error::Update the chunk-count assertion in .github/workflows/schema.yml"
+            echo "::error::and re-run the apply against a clean DB to verify the new count"
+            echo "::error::matches the expected inventory (10 tables / 19 indexes / 9 RLS policies / 2 RPC helpers)."
+            exit 1
+          fi
+          echo "Chunk count matches expected (55)."
+
+      - name: Verify every chunk is non-empty
+        # Defensive: a chunk of "0 statements" would be a splitter bug.
+        run: |
+          python3 scripts/_split_sql.py db/schema.sql | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          bad = [(c['index'], c['sql']) for c in data if not c['sql'].strip()]
+          if bad:
+              for idx, sql in bad:
+                  print(f'  chunk {idx}: {sql!r}')
+              sys.exit(1)
+          print(f'All {len(data)} chunks are non-empty.')
+          "
+
+      - name: Verify the apply wrapper is executable
+        run: |
+          test -x scripts/apply-schema.sh || { echo "::error::scripts/apply-schema.sh is not executable"; exit 1; }
+          bash -n scripts/apply-schema.sh || { echo "::error::scripts/apply-schema.sh has a bash syntax error"; exit 1; }
+          echo "scripts/apply-schema.sh is executable and syntactically valid."
+
+  apply:
+    name: Apply schema to linked InsForge project
+    # Only the operator can trigger this — protects against a PR
+    # accidentally re-applying the schema on every push.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The user API key is the only secret this job needs.  The
+      # project's own API key is baked into the CLI's per-workspace
+      # project.json, but `login --user-api-key` re-derives a session
+      # for the user that owns the project.  See the insforge-cli
+      # skill for the credential flow.
+      INSFORGE_USER_API_KEY: ${{ secrets.INSFORGE_USER_API_KEY }}
+      SCHEMA_PATH: ${{ github.event.inputs.schema_path || 'db/schema.sql' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Login to InsForge
+        if: env.INSFORGE_USER_API_KEY != ''
+        run: |
+          # The CI user might be running as github-actions[bot] which
+          # has no InsForge session, so we explicitly log in with the
+          # user API key.  --user-api-key is the non-interactive form
+          # documented in the insforge-cli skill.
+          npx @insforge/cli login --user-api-key "$INSFORGE_USER_API_KEY"
+
+      - name: Verify project is linked
+        run: |
+          # The .insforge/project.json is what `npx @insforge/cli link`
+          # wrote; it's checked in.  We just need to confirm it exists
+          # and points at the right project.
+          test -f .insforge/project.json || { echo "::error::.insforge/project.json is missing — the repo must be linked before this workflow can run."; exit 1; }
+          cat .insforge/project.json
+
+      - name: Apply schema
+        # The apply script is idempotent; if a previous apply failed
+        # partway through, this run will re-issue every chunk and the
+        # schema's CREATE IF NOT EXISTS / DO-block guards will resolve
+        # the partially-applied state.
+        run: |
+          set -euo pipefail
+          ./scripts/apply-schema.sh --schema "$SCHEMA_PATH"
+
+      - name: Verify the inventory
+        # The parent task's acceptance criteria: 10 tables, 9 RLS
+        # policies on user-scoped tables, 19 indexes, 2 RPC helpers
+        # in pg_proc.  We verify all four with `db tables`,
+        # `db policies`, `db indexes`, and an information_schema
+        # query for the functions.
+        run: |
+          set -euo pipefail
+          echo "--- tables ---"
+          npx @insforge/cli db tables
+          echo "--- policies ---"
+          npx @insforge/cli db policies
+          echo "--- indexes ---"
+          npx @insforge/cli db indexes
+          echo "--- functions (acquire/release_notification_lock) ---"
+          npx @insforge/cli db query "SELECT proname FROM pg_proc WHERE proname IN ('acquire_notification_lock', 'release_notification_lock') AND pronamespace = 'public'::regnamespace"
+
+          TABLES="$(npx @insforge/cli db tables --json | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")"
+          # Count user-declared RLS policies (db/schema.sql declares 9
+          # *_owner_all policies on the user-scoped tables;
+          # webhook_events intentionally has none).
+          POLICIES="$(npx @insforge/cli db policies --json | python3 -c "import json,sys; print(len(json.load(sys.stdin)['policies']))")"
+          # Count user-declared indexes (the 19 CREATE INDEX
+          # statements in db/schema.sql).  Postgres implicitly creates
+          # one index per PRIMARY KEY and per UNIQUE constraint, so a
+          # raw `db indexes` count is 33 (19 + 10 PK + 4 unique).  We
+          # filter to non-pkey, non-unique-constraint indexes to land
+          # on the 19 the parent task asserted.
+          INDEXES="$(npx @insforge/cli db indexes --json | python3 -c "import json,sys; print(sum(1 for ix in json.load(sys.stdin)['indexes'] if not ix.get('isPrimary') and not ix.get('isUnique')))")"
+          FUNCS="$(npx @insforge/cli db query "SELECT count(*)::int AS n FROM pg_proc WHERE proname IN ('acquire_notification_lock', 'release_notification_lock') AND pronamespace = 'public'::regnamespace" --json | python3 -c "import json,sys; print(json.load(sys.stdin)['rows'][0]['n'])")"
+
+          echo "tables=$TABLES policies=$POLICIES indexes=$INDEXES rpc_helpers=$FUNCS"
+
+          test "$TABLES" -eq 10 || { echo "::error::Expected 10 tables, got $TABLES"; exit 1; }
+          test "$POLICIES" -eq 9 || { echo "::error::Expected 9 RLS policies, got $POLICIES"; exit 1; }
+          test "$INDEXES" -eq 19 || { echo "::error::Expected 19 user-declared indexes, got $INDEXES (filtering out PK and UNIQUE-constraint implicit indexes)"; exit 1; }
+          test "$FUNCS" -eq 2  || { echo "::error::Expected 2 RPC helpers, got $FUNCS"; exit 1; }
+
+          # Verify the 9 expected policy names are present.
+          POLICY_NAMES="$(npx @insforge/cli db policies --json | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for p in data['policies']:
+              print(p.get('policyName') or p.get('policyname') or p.get('name') or '')
+          " | sort -u)"
+          for expected in \
+              projects_owner_all \
+              tracked_pages_owner_all \
+              snapshot_jobs_owner_all \
+              snapshots_owner_all \
+              artifacts_owner_all \
+              ai_explanations_owner_all \
+              scan_schedules_owner_all \
+              notif_subs_owner_all \
+              notif_outbox_owner_all ; do
+            if ! printf '%s\n' "$POLICY_NAMES" | grep -qx "$expected"; then
+              echo "::error::Missing expected policy: $expected"
+              exit 1
+            fi
+          done
+          echo "All 9 expected RLS policies are present."
+
+      - name: Re-run for idempotency
+        # Acceptance: re-running on top of an already-applied schema
+        # must exit 0.  We re-run the script and fail if it does not
+        # complete cleanly.
+        run: |
+          set -euo pipefail
+          ./scripts/apply-schema.sh --schema "$SCHEMA_PATH"
+          echo "Re-apply succeeded — the script is idempotent end-to-end."

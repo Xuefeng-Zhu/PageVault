@@ -6,9 +6,15 @@
 --           db/migrations/2026-06-02-*.sql (per-feature add-ons) + the
 --           post-deploy additions made by the live scan pipeline
 --           (snapshots.markdown_text — see lib/scan.ts:653).
--- Apply:    npx @insforge/cli db import db/schema.sql
---           (or run statement-by-statement via `db query` if `import` is
---            not available; this file is fully idempotent).
+-- Apply path: scripts/apply-schema.sh
+--           This file's canonical apply path is the per-statement wrapper
+--           script — see the insforge-cli skill for the multi-statement DDL
+--           pitfall.  `npx @insforge/cli db import db/schema.sql` silently
+--           drops multi-statement chunks that include ALTER TABLE ...
+--           ADD COLUMN and the policy re-create block, so DO NOT use
+--           `db import` directly against this file.  Use the wrapper
+--           (./scripts/apply-schema.sh) which splits into single-statement
+--           `db query` calls.  Idempotent: safe to re-run.
 -- Idempotent: every CREATE uses IF NOT EXISTS, every ALTER uses IF NOT EXISTS
 --             / DO blocks, and every CREATE OR REPLACE for functions. Safe
 --             to re-run on top of an existing partial application.
