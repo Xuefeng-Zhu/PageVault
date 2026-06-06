@@ -1,18 +1,30 @@
 // Live scan orchestration for PageVault.
 //
-// Pipeline:
-//   1. Load the room's watched URLs from InsForge Postgres
-//   2. For each URL, fetch the page (direct HTTP fetch, or Apify if creds set)
-//   3. SHA-256 hash the fetched markdown; if unchanged from previous snapshot,
+// Pipeline (per watched URL — HIGH-5: one snapshot_jobs row per URL, not per
+// room):
+//   1. Load the room's active watched URLs from InsForge Postgres (no cap —
+//      a room with 51+ URLs scans all of them; HIGH-5)
+//   2. For each URL, create one snapshot_jobs row parented to that URL's
+//      tracked_page_id (HIGH-5: was previously reused across URLs and
+//      parented to watchedUrls[0].id, which broke the FK when the first
+//      page was removed)
+//   3. Fetch the page (direct HTTP fetch, or Apify if creds set)
+//   4. SHA-256 hash the fetched markdown; if unchanged from previous snapshot,
 //      skip LLM call (cost-saver per design §3.3)
-//   4. Call the LLM via OpenAI-compatible API (InsForge AI gateway → OpenRouter
+//   5. Call the LLM via OpenAI-compatible API (InsForge AI gateway → OpenRouter
 //      when OPENAI_BASE_URL is set)
-//   5. Insert snapshot_job (running → succeeded), snapshot, ai_explanations
-//   6. Upload raw markdown to InsForge Storage for evidence chain
+//   6. Insert snapshot, ai_explanations; mark the per-page job succeeded
+//   7. Upload raw markdown to InsForge Storage for evidence chain
 //
 // Idempotency: snapshot_jobs uses `trigger_type` + `apify_run_id` semantics; we
-// generate a unique `jobId` per run. The previous-snapshot lookup is by
-// (tracked_page_id, observed_at desc) so re-running won't double-insert.
+// generate a unique `jobId` per (run, page) so re-running won't double-insert.
+// The previous-snapshot lookup is by (tracked_page_id, observed_at desc).
+//
+// Synthetic scanRunId: the API caller (POST /api/rooms/[id]/scan) gets a
+// single ScanSummary.scanRunId back. We mint a synthetic run-level UUID and
+// return it, but the per-page DB rows each get their own snapshot_jobs.id
+// (snapshots.job_id references the per-page job, not the synthetic id). The
+// synthetic id is a UI handle only — it does not appear in any DB column.
 import { createHash } from 'node:crypto';
 import dns from 'node:dns/promises';
 import { enqueueNotification } from './notifications';
@@ -539,73 +551,137 @@ export async function runScan(
   room: MemoryRoom,
   options: { triggerType?: 'manual' | 'schedule' | 'box_webhook' | 'retry' } = {},
 ): Promise<ScanSummary> {
+  // HIGH-5: per-page job ownership.
+  //
+  // The previous implementation created exactly one snapshot_jobs row and
+  // parented it to `watchedUrls[0].id`. Two problems followed:
+  //   (1) FK violation when the first page was removed — the new run's
+  //       job insert referenced a tracked_page_id that no longer existed,
+  //       and the entire scan was lost.
+  //   (2) Snapshots of every other page in the room shared a single job
+  //       row, so per-page audit history (the existing dashboard
+  //       lastScanAt-per-page query at lib/insforge.ts:303-315) only ever
+  //       reflected the first page's timestamps.
+  //
+  // The fix is to delete the global "one job per scan" insert and let
+  // `scanOne` own its own job row, parented to the URL it is scanning.
+  // `runScan` still returns a single `scanRunId` because the API
+  // contract exposes ScanSummary.scanRunId to the UI; the value is a
+  // synthetic UUID we mint here and pass to each scanOne call so the UI
+  // can correlate the per-page jobs from a single user action. The
+  // synthetic id is NOT stored in any DB column — the per-page job ids
+  // are the real FK targets.
+  //
+  // HIGH-5: drop the `&limit=50` cap on the tracked_pages query. It was
+  // an undocumented soft cap that silently truncated rooms with 51+
+  // URLs. The PostgREST `tracked_pages` table is small per room
+  // (validated 1-100 per add-URLs call at lib/validation.ts:120) so a
+  // flat fetch with no limit is fine.
   const triggerType = options.triggerType ?? 'manual';
-  const jobId = newId();
-  const startedAt = new Date().toISOString();
+  const scanRunId = newId();
 
-  // 1. Load watched URLs
+  // 1. Load watched URLs (no cap — HIGH-5)
   const watchedUrls = (await dbGet(
-    `tracked_pages?project_id=eq.${room.id}&active=eq.1&select=id,source_url&limit=50`,
+    `tracked_pages?project_id=eq.${room.id}&active=eq.1&select=id,source_url`,
   )) as Array<{ id: string; source_url: string }>;
   if (watchedUrls.length === 0) {
     return {
-      scanRunId: jobId,
+      scanRunId,
       status: 'completed',
       snapshotsCaptured: 0,
       changesCreated: 0,
     };
   }
 
-  // 2. Insert the scan_job as running
-  await dbInsert('snapshot_jobs', {
-    id: jobId,
-    tracked_page_id: watchedUrls[0].id, // one job per scan; pages are linked via snapshots
-    trigger_type: triggerType,
-    status: 'running',
-    requested_at: startedAt,
-  });
-
   let snapshotsCaptured = 0;
   let changesCreated = 0;
 
-  try {
-    for (const wp of watchedUrls) {
-      try {
-        const result = await scanOne(room, wp, jobId);
-        if (result.snapshot) snapshotsCaptured += 1;
-        if (result.change) changesCreated += 1;
-      } catch (err) {
-        console.error(`[scan] failed for ${wp.source_url}:`, err);
-        // Continue with the next URL — one bad page shouldn't fail the whole scan
-      }
+  // 2. Per-page scan. Each call to scanOne now creates its own
+  // snapshot_jobs row, parented to wp.id (the page being scanned).
+  // A failure in one page is logged and counted but does NOT abort the
+  // rest of the scan — the existing "one bad page shouldn't fail the
+  // whole scan" behaviour is preserved.
+  for (const wp of watchedUrls) {
+    try {
+      const result = await scanOne(room, wp, { triggerType, scanRunId });
+      if (result.snapshot) snapshotsCaptured += 1;
+      if (result.change) changesCreated += 1;
+    } catch (err) {
+      console.error(`[scan] failed for ${wp.source_url}:`, err);
+      // Continue with the next URL — one bad page shouldn't fail the whole scan
     }
-
-    // 3. Mark job succeeded
-    await dbUpdate('snapshot_jobs', jobId, {
-      status: 'succeeded',
-      finished_at: new Date().toISOString(),
-    });
-
-    return {
-      scanRunId: jobId,
-      status: 'completed',
-      snapshotsCaptured,
-      changesCreated,
-    };
-  } catch (err) {
-    await dbUpdate('snapshot_jobs', jobId, {
-      status: 'failed',
-      finished_at: new Date().toISOString(),
-      error_message: err instanceof Error ? err.message : String(err),
-    });
-    throw err;
   }
+
+  return {
+    scanRunId,
+    status: 'completed',
+    snapshotsCaptured,
+    changesCreated,
+  };
 }
 
 async function scanOne(
   room: MemoryRoom,
   wp: { id: string; source_url: string },
+  ctx: { triggerType: 'manual' | 'schedule' | 'box_webhook' | 'retry'; scanRunId: string },
+): Promise<{ snapshot: PageSnapshot | null; change: NewChangeAnalysis | null }> {
+  const { triggerType, scanRunId } = ctx;
+  // HIGH-5: per-page snapshot_jobs ownership.
+  //
+  // Each call mints a per-page jobId, inserts the row parented to
+  // `wp.id` (the page being scanned — not the room's first page), and
+  // marks the row succeeded/failed at the end of this function. The
+  // snapshot's `job_id` references this per-page job, so per-page
+  // audit history in `snapshot_jobs` is now correctly 1:1 with the
+  // page rather than N:1 on the room's first page.
+  //
+  // `scanRunId` is a synthetic run-level UUID minted by runScan(); it
+  // is NOT stored in any DB column. We persist it on the per-page job
+  // row via the `apify_run_id` column as a stable correlation tag
+  // (`run:<uuid>`), which gives the dashboard / debug query a way to
+  // group all per-page jobs from a single user action without
+  // requiring a schema change. The column name is a legacy alias; the
+  // value is opaque to the schema and not validated, so a
+  // `run:<uuid>` tag is safe.
+  const jobId = newId();
+  const startedAt = new Date().toISOString();
+  await dbInsert('snapshot_jobs', {
+    id: jobId,
+    tracked_page_id: wp.id,
+    trigger_type: triggerType,
+    status: 'running',
+    apify_run_id: `run:${scanRunId}`,
+    requested_at: startedAt,
+  });
+
+  try {
+    const result = await scanOneInner(room, wp, jobId, scanRunId);
+    // Mark per-page job succeeded.
+    await dbUpdate('snapshot_jobs', jobId, {
+      status: 'succeeded',
+      finished_at: new Date().toISOString(),
+    });
+    return result;
+  } catch (err) {
+    // Mark per-page job failed but re-throw so runScan logs and continues.
+    try {
+      await dbUpdate('snapshot_jobs', jobId, {
+        status: 'failed',
+        finished_at: new Date().toISOString(),
+        error_message: err instanceof Error ? err.message : String(err),
+      });
+    } catch (markErr) {
+      console.error(`[scan] failed to mark job ${jobId} as failed:`, markErr);
+    }
+    throw err;
+  }
+}
+
+async function scanOneInner(
+  room: MemoryRoom,
+  wp: { id: string; source_url: string },
   jobId: string,
+  scanRunId: string,
 ): Promise<{ snapshot: PageSnapshot | null; change: NewChangeAnalysis | null }> {
   // 1. Crawl the URL
   const crawled = await crawlOne(wp.source_url);
@@ -681,7 +757,7 @@ async function scanOne(
         id: snapId,
         roomId: room.id,
         watchedUrlId: wp.id,
-        scanRunId: jobId,
+        scanRunId,
         url: crawled.url,
         // HIGH-1: return the sanitized title/text so anything that
         // surfaces this PageSnapshot downstream (the API response,
@@ -726,7 +802,7 @@ Analyze the change. Return JSON only.`;
     // Record the snapshot but no change analysis
     return {
       snapshot: {
-        id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId: jobId,
+        id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId,
         url: crawled.url, title: cleanTitle, textContent: cleanText,
         contentHash: mdHash, storageKey: uploaded?.key ?? null,
         storageUrl: uploaded?.url ?? null, boxFileId: uploaded?.key ?? null,
@@ -794,7 +870,7 @@ Analyze the change. Return JSON only.`;
 
   return {
     snapshot: {
-      id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId: jobId,
+      id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId,
       url: crawled.url, title: cleanTitle, textContent: cleanText,
       contentHash: mdHash, storageKey: uploaded?.key ?? null,
       storageUrl: uploaded?.url ?? null, boxFileId: uploaded?.key ?? null,
