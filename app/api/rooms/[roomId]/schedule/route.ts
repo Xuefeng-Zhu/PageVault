@@ -37,6 +37,15 @@ function isValidRoomId(roomId: string): boolean {
   return UUID_REGEX.test(roomId);
 }
 
+function isLocalhostUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname;
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
 const SRK = () => process.env.INSFORGE_SERVICE_ROLE_KEY!;
 const DB = () => `${getInsforgeBaseUrl()}/api/database/records`;
 
@@ -65,6 +74,26 @@ type Schedule = {
   body?: unknown;
   isActive?: boolean;
 };
+
+async function scheduleApiError(res: Response, action: string): Promise<Error> {
+  const body = await res.text().catch(() => '');
+  return new Error(
+    `InsForge schedule ${action} failed: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ''}`,
+  );
+}
+
+function readScheduleId(value: unknown): string | null {
+  if (value && typeof value === 'object') {
+    const direct = (value as { id?: unknown }).id;
+    if (typeof direct === 'string') return direct;
+    const data = (value as { data?: unknown }).data;
+    if (data && typeof data === 'object') {
+      const nested = (data as { id?: unknown }).id;
+      if (typeof nested === 'string') return nested;
+    }
+  }
+  return null;
+}
 
 async function findExistingScheduleId(name: string): Promise<string | null> {
   // GET /api/schedules — returns the full list, which we filter by
@@ -100,7 +129,7 @@ async function createOrUpdateInsforgeSchedule(
   appUrl: string,
   secret: string,
   roomId: string,
-): Promise<string | null> {
+): Promise<string> {
   const url = `${appUrl}/api/cron/scan-room/${roomId}`;
   const headers = { 'x-cron-secret': secret };
   let res: Response;
@@ -132,16 +161,19 @@ async function createOrUpdateInsforgeSchedule(
       }),
     });
   }
-  if (!res.ok) return null;
-  let data: Schedule | null = null;
+  if (!res.ok) throw await scheduleApiError(res, existingId ? 'update' : 'create');
+  let data: unknown = null;
   try {
     data = await res.json();
   } catch {
-    return null;
+    if (existingId) return existingId;
+    throw new Error('InsForge schedule create failed: response did not include a schedule id');
   }
-  if (data && typeof data.id === 'string') return data.id;
+  const id = readScheduleId(data);
+  if (id) return id;
   // Fallback: the response didn't echo an id — return whatever we had.
-  return existingId;
+  if (existingId) return existingId;
+  throw new Error('InsForge schedule create failed: response did not include a schedule id');
 }
 
 async function deleteInsforgeSchedule(id: string): Promise<void> {

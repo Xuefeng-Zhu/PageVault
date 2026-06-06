@@ -9,7 +9,6 @@
 // to a private / loopback / link-local / cloud-metadata / multicast /
 // reserved address.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { isBlockedAddress } from './scan';
 
 // The URL-level tests (validateCrawlUrl) need to control what dns.lookup
 // returns so they don't hit the real network. We use vi.hoisted() to share
@@ -17,7 +16,7 @@ import { isBlockedAddress } from './scan';
 // since vi.mock() is hoisted above all imports.
 const dnsBehavior = vi.hoisted(() => ({
   // Each entry: hostname -> addresses to return (or null to throw ENOTFOUND)
-  responses: new Map<string, string[]>(),
+  responses: new Map<string, string[] | string[][]>(),
   // What was looked up
   looked: [] as string[],
 }));
@@ -32,10 +31,86 @@ vi.mock('node:dns/promises', () => ({
         err.code = 'ENOTFOUND';
         throw err;
       }
-      return r.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+      const addresses = Array.isArray(r[0])
+        ? ((r as string[][]).shift() ?? [])
+        : (r as string[]);
+      return addresses.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
     },
   },
 }));
+
+const transportBehavior = vi.hoisted(() => ({
+  mode: 'success' as 'success' | 'hang',
+  body: '<!doctype html><html><head><title>Hello</title></head><body><p>World</p></body></html>',
+  statusCode: 200,
+  statusMessage: 'OK',
+  headers: {} as Record<string, string>,
+  requests: [] as Array<{
+    url: URL;
+    options: Record<string, unknown>;
+    req: {
+      on(event: string, callback: (...args: unknown[]) => void): unknown;
+      destroy(error?: Error): void;
+      end(): void;
+    };
+  }>,
+}));
+
+function makeEmitter() {
+  const listeners: Record<string, Array<(...args: unknown[]) => void>> = {};
+  return {
+    on(event: string, callback: (...args: unknown[]) => void) {
+      listeners[event] = listeners[event] ?? [];
+      listeners[event].push(callback);
+      return this;
+    },
+    emit(event: string, ...args: unknown[]) {
+      for (const callback of listeners[event] ?? []) callback(...args);
+    },
+  };
+}
+
+function makeRequest(url: URL, options: Record<string, unknown>, callback: (res: unknown) => void) {
+  const req = {
+    ...makeEmitter(),
+    destroy(error?: Error) {
+      req.emit('error', error ?? new Error('request destroyed'));
+    },
+    end() {
+      if (transportBehavior.mode === 'hang') return;
+      const res = {
+        ...makeEmitter(),
+        statusCode: transportBehavior.statusCode,
+        statusMessage: transportBehavior.statusMessage,
+        headers: transportBehavior.headers,
+      };
+      callback(res);
+      queueMicrotask(() => {
+        res.emit('data', Buffer.from(transportBehavior.body));
+        res.emit('end');
+      });
+    },
+  };
+  transportBehavior.requests.push({ url, options, req });
+  return req;
+}
+
+vi.mock('node:https', () => ({
+  default: {
+    request: (url: URL, options: Record<string, unknown>, callback: (res: unknown) => void) =>
+      makeRequest(url, options, callback),
+  },
+}));
+
+vi.mock('node:http', () => ({
+  default: {
+    request: (url: URL, options: Record<string, unknown>, callback: (res: unknown) => void) =>
+      makeRequest(url, options, callback),
+  },
+}));
+
+process.env.INSFORGE_API_URL = process.env.INSFORGE_API_URL ?? 'https://example.invalid';
+const { isBlockedAddress } = await import('./scan');
 
 // Now import the function-under-test. The mock above will be applied
 // when this import resolves. We import inside describe blocks because
@@ -227,19 +302,23 @@ describe('crawlOne (direct fetch — AbortController timeout, HIGH-4 part 2)', (
   // the production module, so we re-import via the same import the
   // production code uses and the test file already exercises.
   //
-  // We mock globalThis.fetch because crawlOne uses the global
-  // fetch() (Next.js runtime). vi.useRealTimers + a real setTimeout
-  // gives us a deterministic wall-clock bound.
-  let originalFetch: typeof globalThis.fetch;
+  // We mock Node's http/https request transport because crawlOne pins
+  // DNS through a custom lookup callback instead of rewriting the URL
+  // host. vi.useRealTimers + a real setTimeout gives us a
+  // deterministic wall-clock bound.
   let originalTimeoutEnv: string | undefined;
 
   beforeEach(() => {
-    originalFetch = globalThis.fetch;
     originalTimeoutEnv = process.env.PAGEVAULT_FETCH_TIMEOUT_MS;
+    transportBehavior.mode = 'success';
+    transportBehavior.body = '<!doctype html><html><head><title>Hello</title></head><body><p>World</p></body></html>';
+    transportBehavior.statusCode = 200;
+    transportBehavior.statusMessage = 'OK';
+    transportBehavior.headers = {};
+    transportBehavior.requests = [];
   });
 
   afterEach(() => {
-    globalThis.fetch = originalFetch;
     if (originalTimeoutEnv === undefined) {
       delete process.env.PAGEVAULT_FETCH_TIMEOUT_MS;
     } else {
@@ -252,33 +331,7 @@ describe('crawlOne (direct fetch — AbortController timeout, HIGH-4 part 2)', (
     // fails loudly if the abort plumbing is removed.
     process.env.PAGEVAULT_FETCH_TIMEOUT_MS = '50';
     dnsBehavior.responses.set('slow.example.com', ['93.184.216.34']);
-
-    // Fetch that never resolves — simulates a slowloris target /
-    // captive portal. The AbortController signal passed in by
-    // crawlOne should fire within 50ms and reject the promise.
-    const fetchSpy = vi.fn((_input: unknown, _init?: RequestInit) =>
-      new Promise<Response>((_resolve, reject) => {
-        // Use the signal so we mirror the real fetch() contract —
-        // when the caller aborts, this promise rejects with the
-        // same AbortError the production fetch would throw.
-        const init = _init as RequestInit | undefined;
-        const signal = init?.signal;
-        if (signal) {
-          if (signal.aborted) {
-            const e = new Error('aborted');
-            e.name = 'AbortError';
-            reject(e);
-            return;
-          }
-          signal.addEventListener('abort', () => {
-            const e = new Error('aborted');
-            e.name = 'AbortError';
-            reject(e);
-          });
-        }
-      }),
-    );
-    globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+    transportBehavior.mode = 'hang';
 
     const { crawlOne } = await import('./scan');
     const start = Date.now();
@@ -293,12 +346,11 @@ describe('crawlOne (direct fetch — AbortController timeout, HIGH-4 part 2)', (
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).name).toBe('FetchTimeoutError');
     expect((err as Error).message).toMatch(/aborted after 50ms/);
-    // The signal is the only mechanism that can produce this
-    // rejection, so the fetch must have been called with a signal
-    // (defense: catches regressions where someone removes signal:).
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    const initArg = fetchSpy.mock.calls[0][1] as RequestInit | undefined;
-    expect(initArg?.signal).toBeDefined();
+    // The request must use the DNS-pinning lookup hook. Without it,
+    // the transport would resolve by hostname again and reopen the
+    // DNS-rebinding window.
+    expect(transportBehavior.requests).toHaveLength(1);
+    expect(typeof transportBehavior.requests[0].options.lookup).toBe('function');
     // Wall-clock bound: must be close to the 50ms budget (allow
     // generous slack for test env jitter, but not 10s).
     expect(elapsed).toBeLessThan(2000);
@@ -309,23 +361,16 @@ describe('crawlOne (direct fetch — AbortController timeout, HIGH-4 part 2)', (
     dnsBehavior.responses.set('fast.example.com', ['93.184.216.34']);
 
     // Normal HTML response — no hang, no abort.
-    const html =
+    transportBehavior.body =
       '<!doctype html><html><head><title>Hello</title></head>' +
       '<body><p>World</p></body></html>';
-    const response = new Response(html, {
-      status: 200,
-      headers: { 'content-type': 'text/html' },
-    });
-    const fetchSpy = vi.fn((_input: unknown, _init?: RequestInit) =>
-      Promise.resolve(response),
-    );
-    globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
 
     const { crawlOne } = await import('./scan');
     const result = await crawlOne('https://fast.example.com/');
     expect(result.title).toBe('Hello');
     expect(result.markdown).toContain('World');
     expect(result.apifyRunId).toBeNull();
+    expect(transportBehavior.requests[0].url.hostname).toBe('fast.example.com');
   });
 
   it('falls back to the 10s default when PAGEVAULT_FETCH_TIMEOUT_MS is invalid (negative / non-numeric)', async () => {
@@ -338,35 +383,60 @@ describe('crawlOne (direct fetch — AbortController timeout, HIGH-4 part 2)', (
     // ourselves to avoid waiting 10s.
     process.env.PAGEVAULT_FETCH_TIMEOUT_MS = 'not-a-number';
     dnsBehavior.responses.set('medium.example.com', ['93.184.216.34']);
-
-    const fetchSpy = vi.fn((_input: unknown, _init?: RequestInit) => {
-      const init = _init as RequestInit | undefined;
-      const signal = init?.signal;
-      return new Promise<Response>((_resolve, reject) => {
-        if (signal) {
-          signal.addEventListener('abort', () => {
-            const e = new Error('aborted');
-            e.name = 'AbortError';
-            reject(e);
-          });
-        }
-      });
-    });
-    globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+    transportBehavior.mode = 'hang';
 
     const { crawlOne } = await import('./scan');
     // Force the abort immediately (don't wait for the 10s default)
     // so the test doesn't run for 10 seconds.
     const pending = crawlOne('https://medium.example.com/');
     await new Promise((r) => setTimeout(r, 5));
-    const initArg = fetchSpy.mock.calls[0]?.[1] as RequestInit | undefined;
-    const signal = initArg?.signal as AbortSignal | undefined;
-    expect(signal).toBeDefined();
-    // Calling .abort() on a vi-cloned AbortSignal can fail under
-    // jsdom-vitest, so dispatch the abort event directly. The
-    // production code listens for the event via addEventListener
-    // (matching the fetch() contract), so this is equivalent.
-    signal?.dispatchEvent(new Event('abort'));
+    const abortError = new Error('aborted');
+    abortError.name = 'AbortError';
+    transportBehavior.requests[0].req.destroy(abortError);
     await expect(pending).rejects.toThrow(/aborted after 10000ms/);
+  });
+});
+
+describe('resolveAndValidateCrawlUrl (DNS pinning)', () => {
+  beforeEach(() => {
+    transportBehavior.mode = 'success';
+    transportBehavior.body = '<!doctype html><html><head><title>Hello</title></head><body><p>World</p></body></html>';
+    transportBehavior.statusCode = 200;
+    transportBehavior.statusMessage = 'OK';
+    transportBehavior.headers = {};
+    transportBehavior.requests = [];
+  });
+
+  it('rejects if the second lookup used for pinning rebinds to a blocked address', async () => {
+    dnsBehavior.responses.set('rebind.example.com', [
+      ['93.184.216.34'],
+      ['10.0.0.5'],
+    ]);
+
+    const { resolveAndValidateCrawlUrl } = await import('./scan');
+    await expect(resolveAndValidateCrawlUrl('https://rebind.example.com/'))
+      .rejects.toThrow(/10\.0\.0\.5|private|blocked/i);
+  });
+
+  it('keeps the original HTTPS hostname while pinning lookup to the validated IP', async () => {
+    process.env.PAGEVAULT_FETCH_TIMEOUT_MS = '5000';
+    dnsBehavior.responses.set('tls.example.com', ['93.184.216.34']);
+    transportBehavior.body = '<html><head><title>TLS</title></head><body>ok</body></html>';
+
+    const { crawlOne } = await import('./scan');
+    await crawlOne('https://tls.example.com/path');
+
+    const request = transportBehavior.requests[0];
+    expect(request.url.hostname).toBe('tls.example.com');
+    const lookup = request.options.lookup as (
+      hostname: string,
+      options: unknown,
+      callback: (err: Error | null, address: string, family: number) => void,
+    ) => void;
+    let lookedAddress = '';
+    lookup('tls.example.com', {}, (_err, address) => {
+      lookedAddress = address;
+    });
+    expect(lookedAddress).toBe('93.184.216.34');
   });
 });

@@ -15,6 +15,9 @@
 // (tracked_page_id, observed_at desc) so re-running won't double-insert.
 import { createHash } from 'node:crypto';
 import dns from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
+import type { LookupFunction } from 'node:net';
 import { enqueueNotification } from './notifications';
 import type {
   MemoryRoom,
@@ -242,11 +245,10 @@ export async function validateCrawlUrl(input: string): Promise<string> {
 /**
  * Like validateCrawlUrl, but also returns the IP address(es) the
  * hostname resolves to at validation time. Callers MUST use the
- * returned IP for the outbound request (e.g. via the URL trick below
- * or an https.Agent with a fixed localAddress) to prevent DNS
- * rebinding — if the request is sent by hostname, the second
- * resolution can land on a different (attacker-controlled) IP than
- * the one the guard validated.
+ * returned IP for the outbound request (via a transport lookup override)
+ * to prevent DNS rebinding — if the request is sent by hostname with the
+ * default resolver, the second resolution can land on a different
+ * (attacker-controlled) IP than the one the guard validated.
  *
  * For literal-IP hostnames, returns the literal IP as a single-entry
  * array (the caller can pin to it).
@@ -254,19 +256,39 @@ export async function validateCrawlUrl(input: string): Promise<string> {
  * Returns a structured object { url, ips } so the caller has both
  * the canonical URL and the pinned addresses to use in the fetch.
  */
-export async function resolveAndValidateCrawlUrl(input: string): Promise<{ url: string; ips: string[] }> {
+type ResolvedCrawlAddress = { address: string; family: 4 | 6 };
+
+export async function resolveAndValidateCrawlUrl(input: string): Promise<{ url: string; ips: ResolvedCrawlAddress[] }> {
   const validated = await validateCrawlUrl(input);
   const parsed = new URL(validated);
   const bareHost = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
     ? parsed.hostname.slice(1, -1)
     : parsed.hostname;
   if (isLiteralIPv4(bareHost) || isLiteralIPv6(bareHost)) {
-    return { url: validated, ips: [bareHost] };
+    return { url: validated, ips: [{ address: bareHost, family: isLiteralIPv6(bareHost) ? 6 : 4 }] };
   }
   // Already validated by validateCrawlUrl above; lookup again to get
   // the IPs (validateCrawlUrl only checked them, didn't return them).
+  // Re-check this second result too: a DNS answer can change between
+  // the validation lookup and the pinning lookup.
   const addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
-  return { url: validated, ips: addrs.map((a) => a.address) };
+  if (addrs.length === 0) {
+    throw new Error(`Refusing to crawl "${input}": DNS lookup returned no addresses for "${bareHost}"`);
+  }
+  for (const { address } of addrs) {
+    if (isBlockedAddress(address)) {
+      throw new Error(
+        `Refusing to crawl "${input}": hostname "${bareHost}" resolves to blocked private/internal address "${address}"`,
+      );
+    }
+  }
+  return {
+    url: validated,
+    ips: addrs.map((a) => ({
+      address: a.address,
+      family: a.family === 6 ? 6 : 4,
+    })),
+  };
 }
 
 /**
@@ -329,6 +351,103 @@ function getFetchTimeoutMs(): number {
   return parsed;
 }
 
+type DirectCrawlResponse = {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  headers: { get(name: string): string | null };
+  text(): Promise<string>;
+};
+
+function getResponseHeader(headers: http.IncomingHttpHeaders, name: string): string | null {
+  const value = headers[name.toLowerCase()];
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+
+function makeAbortError(): Error {
+  const err = new Error('AbortError');
+  err.name = 'AbortError';
+  return err;
+}
+
+function fetchPinnedCrawlUrl(
+  url: string,
+  pin: ResolvedCrawlAddress,
+  signal: AbortSignal,
+): Promise<DirectCrawlResponse> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const client = parsed.protocol === 'https:' ? https : http;
+    const chunks: Buffer[] = [];
+    let settled = false;
+
+    const lookup: LookupFunction = (_hostname, _options, callback) => {
+      const cb = callback as (err: NodeJS.ErrnoException | null, address: string, family: number) => void;
+      if (isBlockedAddress(pin.address)) {
+        cb(new Error(`Refusing to crawl: pinned address "${pin.address}" is blocked`), '', 0);
+        return;
+      }
+      cb(null, pin.address, pin.family);
+    };
+
+    const req = client.request(parsed, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      lookup,
+    }, (res) => {
+      res.on('data', (chunk: Buffer | string) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', abort);
+        const body = Buffer.concat(chunks).toString('utf8');
+        resolve({
+          ok: Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 300),
+          status: res.statusCode ?? 0,
+          statusText: res.statusMessage ?? '',
+          headers: {
+            get(name: string) {
+              return getResponseHeader(res.headers, name);
+            },
+          },
+          text: async () => body,
+        });
+      });
+      res.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', abort);
+        reject(err);
+      });
+    });
+
+    const abort = () => {
+      if (settled) return;
+      req.destroy(makeAbortError());
+    };
+
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      reject(err);
+    });
+
+    if (signal.aborted) {
+      abort();
+    } else {
+      signal.addEventListener('abort', abort, { once: true });
+    }
+    req.end();
+  });
+}
+
 // Direct HTTP fetch as a baseline crawler. Tries the Apify run-sync API
 // directly if creds are present, otherwise falls back to a plain fetch()
 // with HTML→Markdown extraction.
@@ -385,15 +504,13 @@ export async function crawlOne(url: string): Promise<{
   // (loopback) without re-running the private-address checks.
   //
   // DNS-rebinding defense: the SSRF guard above resolves the
-  // hostname and checks every returned IP, but the next fetch() does
-  // its own DNS lookup. Between the guard and the fetch, a malicious
-  // authoritative DNS server (or a TOCTOU in node's resolver) can
-  // flip the answer to a private IP. To prevent that, we pin the
-  // request to the IP we already validated by rewriting the URL to
-  // `http://ip/` and passing the original hostname in the `Host`
-  // header. TLS SNI / virtual-host handling then sees the right
-  // hostname. This is the standard "host-header pinning" pattern
-  // for SSRF defenses.
+  // hostname and checks every returned IP, but a plain fetch() would
+  // perform its own DNS lookup later. Between the guard and the
+  // request, a malicious authoritative DNS server can flip the answer
+  // to a private IP. To prevent that, we keep the original URL host
+  // (so HTTPS TLS/SNI and virtual-host routing still see the real
+  // hostname) and override Node's lookup callback to return the
+  // already-validated IP.
   const MAX_REDIRECTS = 5;
   const timeoutMs = getFetchTimeoutMs();
   // Single AbortController covers the entire redirect chain — a target
@@ -405,61 +522,37 @@ export async function crawlOne(url: string): Promise<{
   const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
   timeoutHandle.unref?.();
   let currentUrl = url;
-  let currentHostHeader: string | null = null;
-  let r: Response | null = null;
+  let r: DirectCrawlResponse | null = null;
   try {
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     // SSRF guard + DNS-rebinding pin. resolveAndValidateCrawlUrl
     // returns the validated URL and the IP(s) the hostname resolves
-    // to; we use the first IP for the request URL and the original
-    // hostname for the Host header.
+    // to; we use the first IP in the transport lookup override and
+    // keep the original hostname in the URL itself for TLS/SNI.
     const resolved = await resolveAndValidateCrawlUrl(currentUrl);
     currentUrl = resolved.url;
-    if (resolved.ips.length > 0) {
-      const parsed = new URL(currentUrl);
-      const ipForHost = resolved.ips[0];
-      currentHostHeader = parsed.host;
-      // Rewrite the URL to use the IP. For IPv6, wrap in brackets.
-      const ipForUrl = ipForHost.includes(':') ? `[${ipForHost}]` : ipForHost;
-      parsed.host = `${ipForUrl}:${parsed.port}`;
-      currentUrl = parsed.toString();
+    const pin = resolved.ips[0];
+    if (!pin) {
+      throw new Error(`Refusing to crawl "${currentUrl}": DNS lookup returned no addresses`);
     }
-    const res = await fetch(currentUrl, {
-      headers: {
-        'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        // Pin the original hostname (so the server's SNI / virtual
-        // host routing sees the right name even though we connected
-        // to the IP).
-        ...(currentHostHeader ? { Host: currentHostHeader } : {}),
-      },
-      // HIGH-4: AbortController timeout. A target that accepts the
-      // connection but never sends a response (slowloris, captive
-      // portal, etc.) used to pin a scan worker forever. The same
-      // signal applies to every hop in the redirect chain.
-      signal: abortController.signal,
-      redirect: 'manual',
-    });
+    const res = await fetchPinnedCrawlUrl(currentUrl, pin, abortController.signal);
     // Non-redirect: we have the final response.
     if (res.status < 300 || res.status >= 400) {
       r = res;
       break;
     }
-    // 3xx: read Location, loop. After a redirect, the next URL
-    // is a hostname (parsed from the Location header) and we
-    // re-pin on the next iteration. Reset the Host header so the
-    // next resolveAndValidateCrawlUrl call repopulates it.
+    // 3xx: read Location, loop. After a redirect, the next URL is
+    // still hostname-based, and we re-resolve/re-pin on the next
+    // iteration.
     const location = res.headers.get('location');
     if (!location) {
       // 3xx with no Location is malformed; treat as terminal.
       r = res;
       break;
     }
-    // Resolve relative to the previous URL (which was the pinned
-    // IP-based URL). The next iteration re-resolves and re-pins
-    // for the new hostname.
+    // Resolve relative to the previous hostname URL. The next
+    // iteration re-resolves and re-pins for the new hostname.
     currentUrl = new URL(location, currentUrl).toString();
-    currentHostHeader = null;
   }
   } catch (err) {
     // Convert the AbortError from the timeout into a deterministic,
@@ -657,7 +750,7 @@ if (!BASE_URL) {
   throw new Error('INSFORGE_API_URL is not set. Refusing to run scans against an unknown InsForge tenant.');
 }
 const SRK = process.env.INSFORGE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
-const ANON = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
+const ANON = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || process.env.INSFORGE_ANON_KEY || '';
 
 function uuid(prefix: string): string {
   // InsForge rejects UUIDs whose first char isn't 0-9 or a-f.

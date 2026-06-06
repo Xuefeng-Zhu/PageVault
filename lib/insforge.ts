@@ -231,6 +231,40 @@ function readOwnerId(snapshotsField: unknown): string | null | undefined {
   return undefined; // malformed shape
 }
 
+function readProjectFromSnapshot(snapshotsField: unknown): Record<string, unknown> | null | undefined {
+  const snap = Array.isArray(snapshotsField) ? snapshotsField[0] : snapshotsField;
+  if (!snap || typeof snap !== 'object') return null;
+  const snapObj = snap as { tracked_pages?: unknown };
+
+  const trackedPages = snapObj.tracked_pages;
+  const tp = Array.isArray(trackedPages) ? trackedPages[0] : trackedPages;
+  if (!tp || typeof tp !== 'object') return null;
+  const tpObj = tp as { projects?: unknown };
+
+  const projects = tpObj.projects;
+  const project = Array.isArray(projects) ? projects[0] : projects;
+  if (!project || typeof project !== 'object') return null;
+  return project as Record<string, unknown>;
+}
+
+function readProjectId(snapshotsField: unknown): string | null | undefined {
+  const project = readProjectFromSnapshot(snapshotsField);
+  if (project === null || project === undefined) return project;
+  const projectId = project.id;
+  if (typeof projectId === 'string') return projectId;
+  if (projectId === null) return null;
+  return undefined;
+}
+
+function readTrackedPageId(snapshotsField: unknown): string | null | undefined {
+  const snap = Array.isArray(snapshotsField) ? snapshotsField[0] : snapshotsField;
+  if (!snap || typeof snap !== 'object') return null;
+  const trackedPageId = (snap as { tracked_page_id?: unknown }).tracked_page_id;
+  if (typeof trackedPageId === 'string') return trackedPageId;
+  if (trackedPageId === null) return null;
+  return undefined;
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -270,7 +304,7 @@ export async function createRoom(input: NewRoom): Promise<MemoryRoom> {
   };
 }
 
-export async function listRoomsWithStats(): Promise<RoomWithStats[]> {
+export async function listRoomsWithStats(ownerId?: string): Promise<RoomWithStats[]> {
   // Real mode: query projects + compute stats from related tables
   const projects = await sdkQuery<{
     id: string;
@@ -280,6 +314,7 @@ export async function listRoomsWithStats(): Promise<RoomWithStats[]> {
     created_at: string;
   }>('public.projects', {
     select: 'id,owner_id,name,box_root_folder_id,created_at',
+    filters: ownerId ? `owner_id=eq.${ownerId}` : '',
     order: 'created_at.desc',
     limit: 100,
   });
@@ -542,7 +577,7 @@ async function getChangeInternal(
   // but the TS check is the source of truth for the security boundary.
   const select =
     'id,snapshot_id,previous_snapshot_id,output_json,confidence,created_at,' +
-    'snapshots!snapshot_id(tracked_page_id,change_type,tracked_pages!tracked_page_id(project_id,projects!project_id(owner_id)))';
+    'snapshots!snapshot_id(tracked_page_id,change_type,tracked_pages!tracked_page_id(project_id,projects!project_id(id,owner_id)))';
   const filters = `id=eq.${changeId}`;
   const rows = await sdkQuery<{
     id: string; snapshot_id: string; previous_snapshot_id: string | null;
@@ -591,10 +626,13 @@ async function getChangeInternal(
   // of undefined. Read both shapes; prefer before/after.
   const rawEvidence = Array.isArray(output.evidence) ? output.evidence as unknown[] : [];
   const evidence = rawEvidence.map((e) => normalizeEvidenceItem(e));
+  const roomId = readProjectId(row.snapshots);
+  const watchedUrlId = readTrackedPageId(row.snapshots);
+
   return {
     id: String(row.id),
-    roomId: '',
-    watchedUrlId: row.tracked_page_id ?? '',
+    roomId: roomId ?? '',
+    watchedUrlId: watchedUrlId ?? row.tracked_page_id ?? '',
     previousSnapshotId: row.previous_snapshot_id ? String(row.previous_snapshot_id) : null,
     currentSnapshotId: row.snapshot_id ? String(row.snapshot_id) : null,
     severity: (output.severity ?? 'low') as ChangeAnalysis['severity'],

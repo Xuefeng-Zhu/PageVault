@@ -19,7 +19,7 @@
 
 import { notFound } from 'next/navigation';
 import Link from 'next/link';
-import { FileText, GitCompare, AlertTriangle } from 'lucide-react';
+import { FileText, GitCompare } from 'lucide-react';
 import { DiffViewer } from '@/components/dashboard/DiffViewer';
 import { SeverityBadge } from '@/components/dashboard/SeverityBadge';
 import { Card } from '@/components/ui/Card';
@@ -45,12 +45,13 @@ export const metadata = {
 export default async function SharedChangePage({
   params,
 }: {
-  params: { token: string };
+  params: Promise<{ token: string }>;
 }) {
+  const { token } = await params;
   // 1. Resolve the share token. A miss returns null (404). A revoked
   //    or expired token also returns null because the RLS policy
   //    hides revoked/expired rows from anon SELECT.
-  const shared = await getSharedChangeByToken(params.token);
+  const shared = await getSharedChangeByToken(token);
   if (!shared) {
     notFound();
   }
@@ -213,33 +214,6 @@ function SharedChangeBody({
           </p>
         </footer>
       </div>
-    </div>
-  );
-}
-
-// Custom not-found for the share route — keeps the public page
-// on-brand when the token doesn't resolve.
-export function NotFound() {
-  return (
-    <div className="min-h-screen bg-paper text-ink flex items-center justify-center px-6">
-      <Card padding="xl" className="max-w-xl w-full">
-        <div className="text-center">
-          <div className="w-12 h-12 border border-ember mx-auto mb-5 flex items-center justify-center">
-            <AlertTriangle className="w-5 h-5 text-ember" strokeWidth={1.5} />
-          </div>
-          <h2 className="font-display text-display-md text-ink mb-2">
-            Link not found
-          </h2>
-          <p className="font-body text-body-md text-ink-2 mb-6">
-            This share link is invalid, has been revoked, or has expired.
-          </p>
-          <Link href="/">
-            <span className="font-mono text-mono-sm text-ink-2 hover:text-ink transition-colors uppercase tracking-archive">
-              ← PageVault home
-            </span>
-          </Link>
-        </div>
-      </Card>
     </div>
   );
 }

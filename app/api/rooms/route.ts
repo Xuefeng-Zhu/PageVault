@@ -40,10 +40,10 @@ export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorRespons
   if (session instanceof NextResponse) return session;
 
   try {
-    const rooms = await listRoomsWithStats();
     const userId = session.user.id;
-    // listRoomsWithStats queries the service-role client, so the result set
-    // is NOT pre-filtered by RLS. Scope to the caller's owned rooms here.
+    const rooms = await listRoomsWithStats(userId);
+    // listRoomsWithStats applies the owner filter before its 100-room limit.
+    // Keep this as a defense in depth in case the data layer regresses.
     const ownRooms = rooms.filter(r => r.userId === userId);
     return NextResponse.json(ownRooms);
   } catch (error) {

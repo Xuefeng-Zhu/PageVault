@@ -20,7 +20,7 @@
 --             to re-run on top of an existing partial application.
 -- =============================================================================
 -- Schema inventory
---   Ten tables in the public schema, in the dependency order they must be
+--   Eleven tables in the public schema, in the dependency order they must be
 --   created in:
 --
 --     Core (user-owned) ────────────────────────────────────────────────
@@ -40,6 +40,7 @@
 --
 --     System-wide (no owner) ───────────────────────────────────────────
 --      10.  webhook_events                 (inbound webhook idempotency log)
+--      11.  shared_changes                 (public read-only share links)
 --
 --   RPC helpers:
 --       - acquire_notification_lock(integer)  wraps pg_try_advisory_lock
@@ -344,6 +345,25 @@ create table if not exists public.webhook_events (
 
 
 -- =============================================================================
+-- 11. shared_changes
+-- -----------------------------------------------------------------------------
+-- Public read-only share links for individual changes (ai_explanations rows).
+-- API routes create and revoke rows with the service role; anon callers can
+-- only read non-revoked, non-expired tokens.
+-- =============================================================================
+
+create table if not exists public.shared_changes (
+  id                       uuid        primary key default gen_random_uuid(),
+  change_id                uuid        not null references public.ai_explanations(id) on delete cascade,
+  token                    text        not null unique,
+  created_at               timestamptz not null default now(),
+  created_by               uuid        not null references auth.users(id),
+  expires_at               timestamptz,
+  revoked_at               timestamptz
+);
+
+
+-- =============================================================================
 -- Indexes
 -- =============================================================================
 
@@ -405,6 +425,12 @@ create index if not exists idx_outbox_subscription
 create index if not exists idx_webhooks_source_received
   on public.webhook_events (source, received_at desc);
 
+create index if not exists idx_shared_changes_token
+  on public.shared_changes (token);
+
+create index if not exists idx_shared_changes_change_id
+  on public.shared_changes (change_id);
+
 
 -- =============================================================================
 -- RPC helpers — wrappers for pg_advisory_lock
@@ -436,11 +462,11 @@ $$;
 
 revoke all on function public.acquire_notification_lock(integer) from public;
 grant execute on function public.acquire_notification_lock(integer)
-  to anon, authenticated, project_admin;
+  to anon, authenticated, project_admin, service_role;
 
 revoke all on function public.release_notification_lock(integer) from public;
 grant execute on function public.release_notification_lock(integer)
-  to anon, authenticated, project_admin;
+  to anon, authenticated, project_admin, service_role;
 
 
 -- =============================================================================
@@ -473,6 +499,7 @@ alter table public.ai_explanations             enable row level security;
 alter table public.scan_schedules              enable row level security;
 alter table public.notification_subscriptions  enable row level security;
 alter table public.notification_outbox         enable row level security;
+alter table public.shared_changes              enable row level security;
 
 -- Drop and re-create policies so this block is idempotent. CREATE POLICY
 -- has no IF NOT EXISTS, so DO blocks are the only safe pattern.
@@ -516,6 +543,10 @@ begin
   -- notification_outbox
   if exists (select 1 from pg_policies where schemaname='public' and tablename='notification_outbox' and policyname='notif_outbox_owner_all') then
     drop policy notif_outbox_owner_all on public.notification_outbox;
+  end if;
+  -- shared_changes
+  if exists (select 1 from pg_policies where schemaname='public' and tablename='shared_changes' and policyname='shared_changes_select_anon') then
+    drop policy shared_changes_select_anon on public.shared_changes;
   end if;
 end
 $$;
@@ -693,4 +724,14 @@ create policy notif_outbox_owner_all on public.notification_outbox
       where ns.id = notification_outbox.subscription_id
         and p.owner_id = auth.uid()
     )
+  );
+
+-- shared_changes is intentionally public-read for valid tokens only.
+-- Inserts/updates/deletes stay service-role-only because no anon or
+-- authenticated write policy is defined.
+create policy shared_changes_select_anon on public.shared_changes
+  for select to anon
+  using (
+    revoked_at is null
+    and (expires_at is null or expires_at > now())
   );

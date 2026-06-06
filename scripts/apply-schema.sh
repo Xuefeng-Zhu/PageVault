@@ -56,22 +56,31 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCHEMA_PATH="$REPO_ROOT/db/schema.sql"
 DRY_RUN=0
 
-for arg in "$@"; do
-  case "$arg" in
-    --dry-run) DRY_RUN=1 ;;
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
     --schema)
       shift
+      if [ "$#" -eq 0 ]; then
+        echo "--schema requires a path argument" >&2
+        exit 1
+      fi
       SCHEMA_PATH="$1"
+      shift
       ;;
     --schema=*)
-      SCHEMA_PATH="${arg#--schema=}"
+      SCHEMA_PATH="${1#--schema=}"
+      shift
       ;;
     -h|--help)
       sed -n '2,50p' "$0"
       exit 0
       ;;
     *)
-      echo "Unknown argument: $arg" >&2
+      echo "Unknown argument: $1" >&2
       echo "Run with --help for usage." >&2
       exit 1
       ;;

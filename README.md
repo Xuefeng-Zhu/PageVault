@@ -101,6 +101,16 @@ INSFORGE_ANON_KEY=your-anon-key
 APIFY_API_TOKEN=your-apify-token
 APIFY_ACTOR_ID=your-actor-id
 
+# Apify webhook shared secret — required for the production
+# `/functions/apify-webhook` edge function. Apify must send the same
+# value in the `X-Shared-Secret` header. Without this set, the
+# function returns 503 `service_unconfigured` for every request.
+# Generate with `openssl rand -base64 48`.
+APIFY_WEBHOOK_SECRET=
+
+# Cron auth — required for the scheduled-scan endpoints
+CRON_SHARED_SECRET=            # must match what the InsForge schedule sends
+
 # Box (evidence storage) — optional, enables durable storage
 BOX_DEVELOPER_TOKEN=your-box-token
 # OR

@@ -7,8 +7,8 @@ name: schema
 #   1. dry-run   — runs on every PR that touches db/schema.sql,
 #                  scripts/apply-schema.sh, or scripts/_split_sql.py.
 #                  Splits the schema, asserts the chunk count matches the
-#                  expected inventory (10 tables, 19 indexes, 2 RPC
-#                  helpers, 9 RLS policies, plus the boilerplate), and
+#                  expected inventory (11 tables, 21 indexes, 2 RPC
+#                  helpers, 10 RLS policies, plus the boilerplate), and
 #                  verifies the splitter does not break on the actual
 #                  file.  No live DB needed, no secrets — this is the
 #                  merge gate for schema-shape changes.
@@ -99,18 +99,18 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Split schema and assert chunk count
-        # The expected count is 55 for the current schema:
+        # The expected count is 60 for the current schema:
         #   1  extension (pgcrypto)
-        #   10 create table
-        #   19 create index
+        #   11 create table
+        #   21 create index
         #   2  create or replace function
         #   2  revoke (one per function)
         #   2  grant  (one per function)
-        #   9  alter table ... enable row level security
+        #   10 alter table ... enable row level security
         #   1  do $$ ... $$;  (the policy drop block)
-        #   9  create policy
+        #   10 create policy
         #   --
-        #   55 total
+        #   60 total
         # If a future schema edit changes one of these counts, this
         # assertion tells the operator to update the comment above and
         # re-verify (the apply job will fail with a clearer error
@@ -119,14 +119,14 @@ jobs:
           set -euo pipefail
           CHUNKS="$(python3 scripts/_split_sql.py db/schema.sql | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")"
           echo "chunks: $CHUNKS"
-          if [ "$CHUNKS" -ne 55 ]; then
-            echo "::error::Expected 55 chunks after splitting db/schema.sql, got $CHUNKS."
+          if [ "$CHUNKS" -ne 60 ]; then
+            echo "::error::Expected 60 chunks after splitting db/schema.sql, got $CHUNKS."
             echo "::error::Update the chunk-count assertion in .github/workflows/schema.yml"
             echo "::error::and re-run the apply against a clean DB to verify the new count"
-            echo "::error::matches the expected inventory (10 tables / 19 indexes / 9 RLS policies / 2 RPC helpers)."
+            echo "::error::matches the expected inventory (11 tables / 21 indexes / 10 RLS policies / 2 RPC helpers)."
             exit 1
           fi
-          echo "Chunk count matches expected (55)."
+          echo "Chunk count matches expected (60)."
 
       - name: Verify every chunk is non-empty
         # Defensive: a chunk of "0 statements" would be a splitter bug.

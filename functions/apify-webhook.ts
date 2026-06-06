@@ -6,8 +6,9 @@
 //
 // CRITICAL-1 fix (docs/qa-bug-hunt.md):
 //   The shared secret is no longer a hardcoded string literal. It is
-//   read from process.env.APIFY_WEBHOOK_SECRET at request time. If
-//   the env var is missing, the function fails closed with a 503
+//   read from APIFY_WEBHOOK_SECRET at request time. In InsForge Edge
+//   Functions this comes from Deno.env; local tests may use process.env.
+//   If the env var is missing, the function fails closed with a 503
 //   "service_unconfigured" response — the same posture lib/cron-auth.ts
 //   uses for CRON_SHARED_SECRET — so a misconfigured deployment is
 //   obvious to operators (vs. silently accepting the wrong secret).
@@ -28,6 +29,19 @@ export type ApifyWebhookSecretCheck =
   | { ok: false; reason: 'unconfigured' }
   | { ok: false; reason: 'mismatch' };
 
+function getEdgeEnv(name: string): string | undefined {
+  const deno = (globalThis as unknown as {
+    Deno?: { env?: { get?: (key: string) => string | undefined } };
+  }).Deno;
+  const denoValue = deno?.env?.get?.(name);
+  if (denoValue !== undefined) return denoValue;
+
+  const nodeProcess = (globalThis as unknown as {
+    process?: { env?: Record<string, string | undefined> };
+  }).process;
+  return nodeProcess?.env?.[name];
+}
+
 /**
  * Verify the X-Shared-Secret header against APIFY_WEBHOOK_SECRET.
  *
@@ -40,7 +54,7 @@ export type ApifyWebhookSecretCheck =
  * the secret length.
  */
 export function verifyApifyWebhookSecret(req: Request): ApifyWebhookSecretCheck {
-  const expected = process.env.APIFY_WEBHOOK_SECRET;
+  const expected = getEdgeEnv('APIFY_WEBHOOK_SECRET');
   if (!expected || expected.length === 0) {
     return { ok: false, reason: 'unconfigured' };
   }

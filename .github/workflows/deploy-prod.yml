@@ -55,7 +55,8 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
+  statuses: write
 
 jobs:
   deploy:
@@ -103,6 +104,15 @@ jobs:
         run: npm run build
         env:
           NEXT_TELEMETRY_DISABLED: "1"
+          NEXTAUTH_SECRET: "ci-placeholder-nextauth-secret-32-chars"
+          INSFORGE_API_URL: "https://ci-placeholder.insforge.app"
+          INSFORGE_SERVICE_ROLE_KEY: "ci-placeholder-service-role-key-32-chars"
+          INSFORGE_ANON_KEY: "ci-placeholder-anon-key-32-chars"
+          NEXT_PUBLIC_INSFORGE_URL: "https://ci-placeholder.insforge.app"
+          NEXT_PUBLIC_INSFORGE_ANON_KEY: "ci-placeholder-anon-key-32-chars"
+          CRON_SHARED_SECRET: "ci-placeholder-cron-secret-32-chars"
+          INSFORGE_DEV_DEMO_AUTH: "1"
+          CI: "1"
 
       - name: Install Vercel CLI
         run: npm install --no-save vercel@latest
