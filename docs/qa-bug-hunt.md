@@ -214,7 +214,7 @@ Per the QA worker's own summary: "46 tests pass across 2 files. Every finding ha
 ### HIGH-1: Snapshot text stored unsanitized (XSS blast radius / future-compatibility risk)
 
 - **Files:** lib/scan.ts:113-123, 480-495
-- **Status:** open (engineering card t_af9c3a9b is in flight; the `lib/sanitize.ts` work exists in the working tree as an untracked file and `HIGH-4`'s sibling fix has shipped — see HIGH-4 status — but the call sites in `lib/scan.ts` do not yet pipe `title` and `markdown_text` through the sanitizer at the time of this reconstruction)
+- **Status:** fixed (branch `fix/high-1-markdown-rendered-snapshot-text-is-stored-and-ship`, commit `9f41283`; `lib/sanitize.ts` exports `sanitizeMarkdownText`, `sanitizeChangeAnalysis`, `sanitizeUrlForHref`, and `sanitizeEvidenceItem`; `lib/scan.ts:htmlToMarkdown` sanitises `title` and `markdown` before returning; `lib/scan.ts:runScan` wraps the LLM-produced `outputJson` in `sanitizeChangeAnalysis` before persisting; `lib/notifications.ts:buildPayload` re-sanitises the same fields when building the webhook payload (defence in depth); 46/46 `lib/sanitize.test.ts` tests pass)
 - **Code (current):**
   ```ts
   const r = await fetch(url, { ... });
