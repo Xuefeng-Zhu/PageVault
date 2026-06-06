@@ -1,446 +1,399 @@
 # Runbook
 
-> **Audience:** on-call engineer responding to a PageVault incident,
-> or a maintainer performing a deploy or rollback.
-> **Pair with:** [DEPLOYMENT.md](DEPLOYMENT.md) (architecture + env vars),
-> [OPERATIONS.md](OPERATIONS.md) (incident classes), [SECURITY.md](../SECURITY.md).
+> **Last updated:** 2026-06-05 · view this against the current `main` for accuracy.
+> **Pair with:** [DEPLOYMENT.md](DEPLOYMENT.md) for the topology and the
+> deploy steps; [OPERATIONS.md](OPERATIONS.md) for ongoing monitoring; and
+> [SECURITY.md](../SECURITY.md) for the threat model and secret handling.
 
-This runbook is the operational source of truth. When something is
-broken, do the steps here before improvising. When improvising is
-required, **update this file afterwards** so the next on-call inherits
-your learning.
+This is the "what do I do when X breaks" doc. It's intentionally short on
+philosophy and long on commands you can copy-paste. If something here is
+wrong or missing, fix it in the same PR that broke it.
 
----
+## 1. PageVault deployment topology
 
-## Contents
+PageVault is four planes held together by env vars and a shared secret. The
+Next.js app runs on Vercel, all persistent state lives in InsForge, the
+crawl is delegated to Apify's cloud, and any uploaded snapshot/HTML is
+written to an InsForge Storage bucket. There is no long-running worker
+process inside the app itself — scheduled work and the notification drain
+fire from InsForge Schedules (cron) into the deployed app's HTTP routes.
 
-1. [Deploy procedure](#1-deploy-procedure)
-2. [Rollback procedure](#2-rollback-procedure)
-3. [Stop everything (incident brake)](#3-stop-everything-incident-brake)
-4. [Inspect a deployment](#4-inspect-a-deployment)
-5. [Database rollback](#5-database-rollback)
-6. [Cron worker failure](#6-cron-worker-failure)
-7. [Secrets rotation](#7-secrets-rotation)
+```
+                          ┌──────────────────────────────┐
+                          │           Browser            │
+                          │      (Next.js client)        │
+                          └──────────────┬───────────────┘
+                                         │ HTTPS
+                                         ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │                       Vercel (prod)                          │
+   │  ┌───────────────────────────────────────────────────────┐  │
+   │  │     Next.js 14 App Router  (app/)                     │  │
+   │  │  ├── app/rooms/*        — UI                           │  │
+   │  │  ├── app/api/*          — API routes                   │  │
+   │  │  ├── app/api/cron/*     — cron entry points            │  │
+   │  │  └── lib/{insforge,apify,box,ai,scan,notifications}   │  │
+   │  └───────────────────────────────────────────────────────┘  │
+   └────────┬───────────────┬───────────────┬─────────────┬──────┘
+            │               │               │             │
+            │ SQL/PostgREST │  HTTPS        │ HTTPS       │ HTTPS
+            ▼               ▼               ▼             ▼
+   ┌────────────────┐  ┌────────────┐  ┌─────────────┐  ┌──────────────────────┐
+   │   InsForge     │  │   Apify    │  │  InsForge   │  │ InsForge Storage     │
+   │   Postgres     │  │   cloud    │  │  Schedules  │  │ bucket:              │
+   │   (managed)    │  │ (crawler)  │  │  (cron 1m)  │  │  pagevault-evidence  │
+   │                │  │            │  │             │  │                      │
+   │ 7 base tables  │  │ Actor:     │  │ scan-all    │  │ append-only;         │
+   │ + RLS, advisory│  │ website-   │  │ scan-room/* │  │ raw HTML / markdown  │
+   │   locks        │  │ content-   │  │ notification│  │ snapshots +          │
+   │                │  │ crawler    │  │ -worker     │  │ diff evidence        │
+   └────────────────┘  └────────────┘  └─────────────┘  └──────────────────────┘
+                                                         ▲
+                                                         │  uploads on
+                                                         │  every scan
+                                                         │
+   (Vercel writes here via the scan pipeline) ───────────┘
+```
 
----
+Two things to notice in the picture:
 
-## 1. Deploy procedure
+- The Postgres box is the only one with persistent application state. The
+  Next.js app is stateless (sessions are JWT). You can replace Vercel with
+  any Node host that can reach the three HTTPS endpoints, and the system
+  still works.
+- The "InsForge Schedules" box is the heartbeat. If it stops firing, the
+  app still serves the dashboard and you can still trigger manual scans —
+  you just stop getting scheduled work and outbound webhook deliveries.
 
-### 1.1 Staging (push to `main`)
+## 2. Deploy procedure
 
-Triggers automatically via `.github/workflows/deploy-staging.yml`.
-No human action required beyond merging the PR.
-
-**Watch for:** the `deploy / Deploy to Vercel preview (staging)` job
-in the GitHub Actions UI. The step summary will show the preview URL.
-Smoke checks (200/200/307/401) run against the deployed URL and
-fail the job if any regress.
-
-**To redeploy without a code change:** re-run the workflow from the
-Actions UI. Do not re-tag — staging has no tag gating.
-
-### 1.2 Production (tag a release)
-
-Prod deploys are gated by a manual approval on the `production`
-GitHub Environment. The flow:
+The K-17 deployment-pipeline card will own the automated version. This is
+the manual fallback. Use it for the first deploy to a new environment, or
+when the CI pipeline is broken and you need to push a hotfix.
 
 ```bash
-# 1. Make sure main is green.
-git checkout main
-git pull --ff-only origin main
+# 1. Make sure you're on the commit you want to ship
+cd /home/azureuser/workspace/PageVault
+git log --oneline -1                # confirm the SHA
+git diff main --stat                # see what changed
 
-# 2. Bump the version. Use `npm version` for code releases so
-#    package.json + package-lock.json + the tag all stay in sync.
-#    Doc-only releases: edit package.json by hand.
-npm version 0.1.1 --no-git-tag-version
+# 2. Typecheck, lint, and unit tests pass locally
+npm run typecheck
+npm run lint
+npm test -- --run
 
-# 3. Commit the version bump.
-git add package.json package-lock.json
-git commit -m "chore(release): 0.1.1"
+# 3. Apply any new DB migrations against the production InsForge project
+#    (the project this repo talks to is wga6k9at, but use your own in real life)
+ls db/migrations/                   # see what hasn't been applied
+# Apply via the InsForge SQL editor in the dashboard, OR:
+npx @insforge/cli db exec --file db/migrations/<new-file>.sql
 
-# 4. Tag. Use an annotated tag (not lightweight) so the GitHub
-#    release page has authorship + a message.
-git tag -a v0.1.1 -m "Release 0.1.1"
+# 4. Push to Vercel
+vercel link                         # one-time per machine
+vercel --prod
 
-# 5. Push the tag. The workflow triggers on tag push.
-git push origin main --follow-tags
+# 5. Verify env vars on the production deployment
+vercel env ls production | grep -E '^(INSFORGE|NEXTAUTH|CRON|APIFY|OPENAI)'
+# Anything missing? Set it before smoke-testing.
+
+# 6. Smoke-test (see DEPLOYMENT.md §Smoke-testing the deploy)
+curl -i https://<your-host>/
+curl -i -X POST https://<your-host>/api/cron/notification-worker \
+  -H "x-cron-secret: $CRON_SHARED_SECRET"
 ```
 
-**Watch for:** the `deploy / Deploy to Vercel production` job. It
-will pause at the "Waiting" state and page the `production`
-environment's required reviewers. Approve in the GitHub UI.
+**Two things that bite people on first deploy:**
 
-**Pre-deploy checklist:**
-- [ ] `ci / build` was green on the commit the tag points to.
-- [ ] The version in `package.json` matches the tag (`v0.1.1` → `0.1.1`).
-- [ ] The tag is annotated (`git show v0.1.1` shows a tagger line).
-- [ ] No open incident that would make a prod deploy unwise.
-- [ ] A second maintainer is online to approve (you can't approve
-      your own deploy if branch protection is set to "require
-      non-author approval").
+- `NEXTAUTH_URL` and `NEXTAUTH_SECRET` must both be set in production. If
+  `NEXTAUTH_URL` is wrong, NextAuth silently fails every login redirect
+  and you get a stream of `/api/auth/error` hits with no obvious cause.
+  See the [NEXTAUTH_URL / NEXTAUTH_SECRET](#5-on-call-rotation) section
+  in the env-debug skill for the exact failure mode.
+- `INSFORGE_DEV_INSECURE_SECRET=1` is a footgun. Never set it in prod.
+  It auto-generates a per-process JWT secret, which means every Vercel
+  cold start invalidates all user sessions. It's an opt-in to a debug
+  behaviour, not a default.
 
----
+## 3. Rollback procedure
 
-## 2. Rollback procedure
+Rollback is per-layer. You almost never need to roll back every layer at
+once — usually the app layer is the broken one and the DB is fine. Match
+the rollback to the layer that actually broke.
 
-> **Pick the smallest blast radius that fixes the incident.** A code
-> rollback is almost always cheaper and faster than a database one.
-
-### 2.1 Vercel deployment rollback (preferred for app-only regressions)
-
-This is the fast path. It rolls the app back to the previous Vercel
-deployment without touching git or the database. Use it for: a bad
-release, a routing bug, an SSR regression, a 5xx spike tied to a
-specific commit.
-
-**Option A — Vercel dashboard (recommended):**
-
-1. Open the Vercel project → **Deployments**.
-2. Find the last-known-good deployment (look for the most recent
-   green one before the incident started).
-3. Open the ⋮ menu → **Promote to Production**.
-4. Vercel re-points the production alias to that deployment. Takes
-   ~30 seconds. No build, no PR.
-5. Watch the **Post-deploy commit status** check on the rolled-back
-   commit go green in GitHub.
-6. Open an incident ticket with: the SHA you rolled back to, the
-   commit you rolled back from, and the reason.
-
-**Option B — CLI:**
+### 3.1 App (Vercel)
 
 ```bash
-# Install once: npm i -g vercel
-vercel login
+# Option A — CLI rollback to the previous production deployment
+vercel rollback
 
-# List the last 5 deployments with their URLs
-vercel ls --prod | head -10
-
-# Roll back to a specific deployment URL
-vercel rollback <deployment-url>
+# Option B — pick a specific older deployment in the Vercel dashboard
+#   Deployments → click the SHA you want → "Promote to Production"
 ```
 
-**When to do this instead of `git revert`:** the incident is
-app-only (no schema or storage change), you want the rollback in
-under a minute, and you don't need a permanent commit that says
-"this was reverted". A Vercel rollback is reversible — re-promote
-the newer deployment once the underlying bug is fixed.
+Vercel keeps every production deployment. The "Promote to Production"
+button is the safest when you've made several deploys since the good one
+and want to skip past the bad ones.
 
-**When NOT to do this:** if the bad release included a database
-migration or an evidence-storage schema change (see §5). Rolling
-back the app to an older commit while leaving the new schema in
-place can crash the older code on first request. In that case,
-roll forward (fix forward) or do a coordinated `git revert` +
-redeploy of the same SHA, not a Vercel rollback.
+### 3.2 Database
 
-### 2.2 `git revert` + redeploy (when you need a paper trail)
-
-Use this when the rollback needs to be visible in the git history
-(e.g. for compliance, when the bad commit had a destructive side
-effect you want to neutralize, or when the team is reviewing the
-incident post-mortem).
+Migrations are forward-only. There is no `migrate down`. Rolling back
+the schema means writing a new migration that undoes the broken one.
 
 ```bash
-# 1. Identify the bad commit. GitHub shows it in the deploy
-#    status check; you can also find it in the Vercel dashboard.
-BAD_SHA=abc1234
-
-# 2. Revert it on a new branch. Use --no-edit to take the default
-#    commit message; add context if you need it.
-git checkout main
-git pull --ff-only origin main
-git revert --no-edit $BAD_SHA
-
-# 3. Push. The normal staging deploy workflow fires.
-git push origin main
+# 1. See what's pending / recent
+ls -lt db/migrations/ | head -10
+#   -lt sorts by mtime; the most recent is the one most likely to be broken
 ```
 
-If the revert is urgent and you don't want to wait for the
-staging-to-prod path, tag the revert as a patch release
-(`v0.1.2`) so the prod workflow can ship it through the
-approval gate quickly. Document in the incident ticket that the
-prod deploy is a revert, not a forward change.
-
-### 2.3 Decision tree
-
-```
-Incident
-├── Bad release, app-only, no schema change
-│   └── Vercel rollback (Option A or B)        ← fastest
-├── Bad release with a non-destructive schema change
-│   └── Vercel rollback to the previous deployment
-│       (the schema change is additive and the older code tolerates it)
-├── Bad release with a destructive schema change
-│   └── STOP. Read §5 first.
-│       Coordinated revert + manual verification.
-└── Security incident (credential leak, RCE, etc.)
-    └── §3 (stop everything) FIRST, then §2.
-```
-
----
-
-## 3. Stop everything (incident brake)
-
-When a deploy has already shipped and the rollback is the only
-remaining move, but you need to **freeze** the system — no more
-scans, no more notifications, no more prod deploys — do this:
-
-1. **Lock down the production GitHub Environment**:
-   Repo → Settings → Environments → `production` → add the
-   on-call team as required reviewers with a **deployment
-   branch policy of "Only protected branches"**. While the lock
-   is in effect, `deploy-prod.yml` cannot run because no
-   branch is allowed.
-2. **Pause the scheduled-scans cron**:
-   In the InsForge dashboard, open the `scheduled-scans` schedule
-   and click **Pause**. This stops new scan jobs from being
-   created. Already-running jobs will finish; that's fine.
-3. **Pause the notification-worker cron**:
-   Same as above for the `notification-worker` schedule.
-4. **Optionally: revert the latest prod deploy** via §2.1.
-
-To unfreeze, reverse each step in order. Don't forget to unpause
-the cron schedules — the most common incident-after-the-incident
-is "why did scans silently stop for 3 hours?" because someone
-forgot to flip the schedule back on.
-
----
-
-## 4. Inspect a deployment
+If `db/migration.sql` (the base schema) is the broken file, you're
+recovering from backup — go to §6. Otherwise:
 
 ```bash
-# What is currently serving prod?
-vercel ls --prod
+# 2. Identify the broken migration
+#    e.g. db/migrations/2026-06-05-weekly-digest-queue.sql is broken
 
-# Tail the runtime logs of a specific deployment
-vercel logs <deployment-url> --follow
+# 3. Write a new file that undoes it
+#    db/migrations/2026-06-05-weekly-digest-queue_rollback.sql
+#    Start by copying the broken file and reverse the DDL:
+#      CREATE TABLE x → DROP TABLE x;
+#      ALTER TABLE y ADD COLUMN z → ALTER TABLE y DROP COLUMN z;
+#      CREATE INDEX i ON t(c) → DROP INDEX i;
+#      INSERT new rows → DELETE those rows (WHERE some marker)
+#    Be explicit about data loss in a comment at the top of the file.
 
-# Pull the build log of a specific deployment
-vercel inspect <deployment-url>
+# 4. Apply the rollback migration against production
+npx @insforge/cli db exec --file db/migrations/2026-06-05-weekly-digest-queue_rollback.sql
 
-# List the Vercel env vars actually set on the project
-vercel env ls production
+# 5. Verify
+npx @insforge/cli db query "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name"
+# The table/index/column you removed should be gone.
+
+# 6. Apply the rollback app-side as well
+vercel rollback   # or redeploy the last-known-good commit
 ```
 
-For a deeper view (InsForge function logs, storage operations,
-Postgres slow queries) use the InsForge dashboard:
-https://insforge.dev → open the `PageVault` project →
-**Logs** / **Database** / **Storage**.
+**Don't try to be clever.** Forward-only is forward-only. Writing a
+rollback file and committing it (`git add db/migrations/*_rollback.sql`)
+keeps the audit trail intact and means the next person to read the
+migration directory sees both halves of the story.
 
----
+### 3.3 Edge functions
 
-## 5. Database rollback
+InsForge functions are versioned. If a deployed function is broken
+(`/functions/apify-webhook` returning 500s, for instance), redeploy a
+known-good version:
 
-> **Last resort.** Schema changes in production require a
-> coordinated plan, not a `git revert`.
+```bash
+# List the current code
+npx @insforge/cli functions code apify-webhook
 
-PageVault persists everything in InsForge Postgres (via the
-`@insforge/sdk`) and in an InsForge storage bucket
-(`pagevault-evidence`). The schema lives in `db/*.sql` and the
-bucket is created on first deploy.
+# If you have a previous good version in the repo, redeploy it
+npx @insforge/cli functions deploy apify-webhook \
+  --file functions/apify-webhook.ts \
+  --version=<previous-commit-sha>
+```
 
-**If the bad release only changed the application code (no new
-columns, no new tables, no new storage keys):** do a Vercel
-rollback per §2.1. The database is unchanged and the older code
-still speaks the same schema.
+In practice the function code lives in `functions/*.ts` in this repo. If
+the deployed function is broken, the source in `main` is almost always
+either the same (so redeploy doesn't help — the bug is in InsForge) or
+already updated (so a fresh deploy from `main` is what you want). If
+neither, you've found a case the docs don't cover — fix the function in
+a new commit and redeploy.
 
-**If the bad release added a non-destructive migration
-(new column with a default, new table, new index):** the
-older code may or may not tolerate the new shape. Try the
-Vercel rollback first. If the older code crashes on first
-request with a schema-related error, fall through to:
+### 3.4 Storage
 
-1. **Forward-fix** the new column to be optional. Quickest
-   path; preserves the data model.
-2. Or, **drop the new column** with a hotfix migration:
-   ```sql
-   ALTER TABLE rooms DROP COLUMN new_thing;
-   ```
-   Apply via the InsForge SQL editor or `npx @insforge-cli sql`
-   and immediately push a hotfix commit that removes the code
-   that referenced the column.
+InsForge Storage is append-only. There is no `DELETE` we should ever
+call. If a corrupted file was uploaded (wrong content, truncated,
+sensitive data that shouldn't have been there):
 
-**If the bad release added a destructive migration
-(`DROP COLUMN`, `DROP TABLE`, type change, NOT NULL on a
-column with existing NULLs):** you cannot roll the app back
-without losing data. The choices are:
+- **Don't** try to delete the old object.
+- **Do** upload a corrected version with a new key, and update the
+  `artifacts` row to point at the new key.
+- The old object stays as evidence of what was wrong. That's the point
+  of the bucket.
 
-1. **Restore from a point-in-time backup.** InsForge Postgres
-   supports PITR; reach out to InsForge support with the
-   timestamp you need. Test the restore on a staging clone
-   first; never restore over the live database.
-2. **Forward-fix the destructive change.** If the destructive
-   change was an accident (e.g. someone shipped a `DROP COLUMN`
-   that wasn't supposed to be there), ship a hotfix that
-   re-adds the column with the same shape. Coordinate with
-   the on-call DBA.
+If sensitive data leaked into the bucket, that's a security incident —
+see §8, and follow the data-handling section in
+[SECURITY.md](../SECURITY.md).
 
-**Evidence storage (the `pagevault-evidence` bucket)** is
-immutable — files are never deleted by the app. A bad release
-that uploaded garbage to the bucket cannot be rolled back by
-deleting the files; the URLs in the database still point to
-them. The path is:
-1. Roll forward with a fix that ignores the bad evidence.
-2. Tag the bad evidence files with a metadata key
-   (e.g. `status=quarantined`) via the InsForge dashboard.
-3. Purge the quarantine set after a 30-day grace period.
+## 4. Common errors and fixes
 
----
+These are the ones we've actually hit. If you hit a new one, add it here
+in the same PR that fixes it.
 
-## 6. Cron worker failure
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `InsforgeUnavailableError` on app boot | `INSFORGE_API_URL` or `INSFORGE_ANON_KEY` missing or placeholder | Verify `.env.local` (or Vercel env), restart `npm run dev` or redeploy. The error message names the missing var. |
+| Cron returns 401 | `CRON_SHARED_SECRET` rotated on one side (Vercel env or the InsForge schedule header) but not the other | Update both: `vercel env add CRON_SHARED_SECRET production`, then `npx @insforge/cli schedules update <id> --headers '{"x-cron-secret":"<new>"}'`. |
+| Scans return 0 changes for an hour | `APIFY_API_TOKEN` expired, or free-tier memory limit (8GB) hit on `apify/website-content-crawler` (402 status) | Verify token at [console.apify.com](https://console.apify.com). If 402 from Apify, switch the room to direct `fetch()` (set `APIFY_API_TOKEN=` empty in the env override) or upgrade the Apify plan. |
+| LLM call returns `401 Incorrect API key provided: OPENAI_A****LDER` | `OPENAI_API_KEY` in `.env.local` is a placeholder (`OPENAI...LDER`); the app fell back to OpenAI rather than OpenRouter | Either set a real `OPENAI_API_KEY` (30+ chars, no `...`) or set `OPENROUTER_API_KEY` (via `npx @insforge/cli ai setup`). |
+| `Webhook 401` in notification worker | A subscription's HMAC secret was rotated on the receiver side | Re-create the subscription from the room detail page; the new secret gets persisted to `notification_subscriptions.secret`. |
+| Scan returns `failed` with `LLM API error` | OpenAI/OpenRouter 4xx — usually rate limit, expired key, or model name typo | Check the `error_message` column on `snapshot_jobs`. If it's a 429, the room is producing too many LLM calls (see [OPERATIONS.md §LLM costs spike](OPERATIONS.md)). |
+| Scan returns `failed` with `INSFORGE_API_URL is not set` | Env var drifted; usually after a Vercel redeploy without env preservation | `vercel env ls production` to confirm; redeploy with `--build-env` or re-add the var. |
+| Lint fails in CI on a fresh PR with `react/no-unescaped-entities` | 8 pre-existing unescaped-entity errors unrelated to your change | `npm run lint -- --fix` may auto-fix; if it doesn't, run the `fix-lint` card to land the cleanup. Do not `// eslint-disable` in a fresh PR to silence it. |
+| `Permission denied` writing `/var/log/hermes-gateway/*.log` | systemd hardened the service unit; the runtime user can't write the default log path | Either move logs to a writable path (`StandardOutput=journal` is the default and the right answer), or `sudo setenforce 0` if SELinux is the cause. Check `~/.hermes/.env` permissions (`chmod 600`). |
+| `Latest scan: Never` on a room that has a real scan job | `/api/rooms/[id]` route had `latestScan: null` hardcoded | Pull the most recent `snapshot_jobs` row with `status=eq.succeeded` for any `tracked_pages.id` in the room. See the `lib/insforge.ts:listRoomsWithStats` recipe in the insforge-debug skill. |
+| `diff` extracts `Cannot read 'split' of undefined` | `snapshots` table has no `markdown_text` column, so `prev.text_content` is `undefined` | Run `ALTER TABLE public.snapshots ADD COLUMN IF NOT EXISTS markdown_text text`, then write `markdown_text` on every insert (50KB cap). |
 
-The scheduled-scan and notification-worker endpoints live in
-`app/api/cron/`. They are called by the InsForge schedules
-every N minutes. Each endpoint is authenticated with
-`CRON_SHARED_SECRET` via the `x-cron-secret` header.
+## 5. On-call rotation
 
-**Symptoms:**
+**Single-person MVP, founder is on-call.** This is a pre-launch product.
+There is no rotation, no escalation tier, no backup. The founder (or
+whoever the human is who set up the deploy) is the only person on the
+hook.
 
-- `vercel logs` shows repeated 401s from the InsForge scheduler
-  IP — the secret has rotated or been unset.
-- The `scheduled_scans` table stops growing new rows — the
-  worker can't write.
-- The `notification_outbox` table grows but `sent_at` stays
-  NULL — the worker isn't draining it.
+When paged, follow the escalation path in order. Don't skip steps.
 
-**Steps:**
+1. **Page** — the page arrives (a Slack notification from a Kanban
+   worker, a Sentry alert, a "the app is down" message from a user,
+   whatever). Acknowledge it, even if just to yourself.
+2. **Check gateway status** — `curl -i https://<your-host>/` should
+   return 200. If it 5xx's, you're looking at a Vercel outage or a
+   process crash, not an application bug. Check
+   [vercel.com/status](https://www.vercel-status.com).
+3. **Check the kanban list** — is a worker currently running something
+   that might be touching prod? `hermes kanban list` will show in-flight
+   tasks.
+4. **Check the workers' latest events** — `hermes kanban tail <task_id>`
+   on anything that looks suspicious. Workers log every external call
+   and every state transition.
 
-1. **Confirm the secret is set** in the Vercel project:
-   `vercel env ls production | grep CRON_SHARED_SECRET`. If
-   missing, follow §7 to mint a new one.
-2. **Confirm the InsForge schedule points at the right URL
-   with the right header**. Open the schedule in the InsForge
-   dashboard and verify:
-   - URL: `https://<your-prod-domain>/api/cron/notification-worker`
-   - Method: `POST`
-   - Header: `x-cron-secret: <the same secret>`
-3. **Tail the Vercel logs** for the cron endpoint and look for
-   the actual error. Common ones:
-   - `CRON_SHARED_SECRET unset` → the Vercel env var is missing.
-     See §7.
-   - `insforge 503 service_unconfigured` → the InsForge
-     service-role key is missing or rotated. Same fix.
-   - `insforge 401 invalid jwt` → the anon key is stale. See §7.
-4. **Manual drain** (if notifications are backed up): call the
-   worker endpoint by hand with the secret:
-   ```bash
-   curl -X POST -H "x-cron-secret: $CRON_SHARED_SECRET" \
-     https://<your-prod-domain>/api/cron/notification-worker
-   ```
-   Repeat until `notification_outbox WHERE sent_at IS NULL`
-   is empty. The endpoint is idempotent — duplicate calls
-   are safe.
+If the page turns out to be a worker bug, the right move is to let the
+worker fail, comment on the task with what you saw, and `kanban_block`
+with a reason. The founder reads the board and decides what to do.
 
----
+## 6. Backup and recovery
+
+InsForge is a managed Postgres + managed object store, so the database
+and the `pagevault-evidence` bucket are both backed up on InsForge's
+schedule (their standard tier durability applies; get the snapshot
+SLA from their support contract).
+
+The things that are **not** automatically backed up:
+
+- The app source (it's in git, on GitHub — that's the backup).
+- The Vercel project (env vars, deployment history) — Vercel keeps
+  these; you can `vercel env pull` to export.
+- The InsForge Schedules (cron jobs) — these are *not* in code. If
+  they're lost, you have to recreate them by hand using the commands
+  in [DEPLOYMENT.md §Configuring InsForge Schedules](DEPLOYMENT.md).
+
+### Full disaster recovery (new project, from scratch)
+
+If the InsForge project is gone and you need to stand up a new one:
+
+```bash
+# 1. Create a new InsForge project, log the new keys somewhere safe
+npx @insforge/cli login --user-api-key <new-user-key>
+npx @insforge/cli link --project-id <new-project-id>
+
+# 2. Apply the base schema
+npx @insforge/cli db exec --file db/migration.sql
+
+# 3. Apply every migration in order, oldest first
+ls db/migrations/ | sort | while read f; do
+  echo "Applying $f..."
+  npx @insforge/cli db exec --file "db/migrations/$f"
+done
+
+# 4. Recreate the storage bucket
+npx @insforge/cli storage create-bucket pagevault-evidence --private
+
+# 5. Recreate the InsForge Schedules
+npx @insforge/cli schedules create scan-all \
+  --cron "*/1 * * * *" \
+  --target "https://<your-host>/api/cron/scan-all" \
+  --method POST \
+  --headers '{"x-cron-secret":"<CRON_SHARED_SECRET>"}'
+
+npx @insforge/cli schedules create notification-worker \
+  --cron "*/1 * * * *" \
+  --target "https://<your-host>/api/cron/notification-worker" \
+  --method POST \
+  --headers '{"x-cron-secret":"<CRON_SHARED_SECRET>"}'
+
+# 6. Deploy the app
+vercel --prod
+
+# 7. Run the smoke-test checklist in DEPLOYMENT.md
+```
+
+**RTO / RPO targets (MVP, document these with the founder before going live):**
+
+- **RTO (Recovery Time Objective):** 4 hours. The DR runbook above is the
+  target; budget 2 hours of execution + 2 hours of debugging the
+  inevitable environment drift.
+- **RPO (Recovery Point Objective):** whatever InsForge's Postgres
+  snapshot interval is (typically 24 hours for managed Postgres on the
+  standard tier). For the storage bucket, RPO is effectively 0 — every
+  scan writes the file before the DB row is committed.
+
+If you tighten either target, you pay for it: point-in-time recovery on
+Postgres costs more, and a multi-region storage bucket costs more. Make
+the call before launch, not after an incident.
 
 ## 7. Secrets rotation
 
-PageVault has four classes of secrets. Each is rotated differently.
+The five production secrets, in priority order:
 
-### 7.1 Vercel project env vars
+| Secret | Where it lives | Cadence | How to rotate |
+|---|---|---|---|
+| `NEXTAUTH_SECRET` | Vercel env (prod) | On-demand. Rotate immediately if you suspect a leak. | `openssl rand -base64 32` → `vercel env rm NEXTAUTH_SECRET production && vercel env add NEXTAUTH_SECRET production` → redeploy. **All user sessions invalidate.** |
+| `INSFORGE_SERVICE_ROLE_KEY` | Vercel env + `.insforge/project.json` | 90 days. | Rotate in the InsForge dashboard, update both locations, redeploy. The cron worker will 401 on the next attempt if the SRK is wrong — see the cron 401 row in §4. |
+| `INSFORGE_ANON_KEY` | Vercel env + `.insforge/project.json` + `NEXT_PUBLIC_INSFORGE_ANON_KEY` | 90 days. | Same as SRK, but the public/anon key is safe to ship in client JS so a leak is less catastrophic. Update all three places (server anon, client NEXT_PUBLIC, `.insforge/project.json`). |
+| `APIFY_API_TOKEN` | Vercel env | 90 days, or on-demand if Apify support flags something. | Generate at [console.apify.com](https://console.apify.com/settings/integrations), `vercel env add APIFY_API_TOKEN production`, redeploy. |
+| `APIFY_WEBHOOK_SECRET` | Vercel env + the Apify webhook integration's "Shared secret" field | 90 days. | `openssl rand -base64 48`, set both sides (Vercel env and the Apify integration), restart the edge function (redeploy). |
+| `CRON_SHARED_SECRET` | Vercel env + every InsForge schedule's `headers` JSON | 90 days. | `openssl rand -hex 32`, update Vercel, then for each schedule run `npx @insforge/cli schedules update <id> --headers '{"x-cron-secret":"<new>"}'`. See the cli-parse-output pitfall in the insforge-cli skill — `schedules list --json` output has nested braces. |
+| `OPENAI_API_KEY` / `OPENROUTER_API_KEY` | Vercel env | On-demand. | Rotate in the provider's dashboard, update Vercel, redeploy. |
 
-These live in the Vercel dashboard, not in GitHub. The deploy
-workflows do not need them — only the running app does.
+**Rotation rules:**
 
-```bash
-# List what's currently set
-vercel env ls production
+- Service keys (`INSFORGE_*`, `APIFY_*`, `CRON_*`, the LLM keys) get a
+  hard 90-day cadence. Set a calendar reminder; don't wait until you
+  suspect a leak.
+- User-provided secrets (whatever a user plugs in via the room detail
+  page) are the user's problem. We do not store them, and we do not
+  rotate them. If a user rotates, they re-create the subscription from
+  the UI.
+- After every rotation, run the smoke-test in §DEPLOYMENT.md to make
+  sure the new value actually took.
 
-# Set a new value (creates the entry if it doesn't exist)
-echo "<new-value>" | vercel env add CRON_SHARED_SECRET production
+## 8. Incident response
 
-# Remove the old value (only if you minted a fresh one and
-# both old and new are valid in the running app)
-vercel env rm CRON_SHARED_SECRET production --yes
-```
+Four steps. In order. Don't skip ahead.
 
-After any change, **trigger a no-op prod deploy** so the new
-env vars are baked into the runtime. The deploy-staging
-workflow on a no-op merge is the easiest way; it builds
-against staging, but if the secret is production-only,
-push an empty commit to main to fire staging and then
-trigger a prod rebuild via the Vercel dashboard.
+1. **Check the kanban for the worker that's running.** `hermes kanban list`
+   shows every in-flight task. If the broken thing is "the scan worker
+   has been wedged for 20 minutes", look for a task with a long runtime
+   and an unusual status.
 
-For **InsForge project keys** (`INSFORGE_API_URL`,
-`INSFORGE_SERVICE_ROLE_KEY`, `INSFORGE_ANON_KEY`): rotate
-in the InsForge dashboard first, then update the Vercel env
-vars, then redeploy. The InsForge dashboard gives you a
-"roll new key alongside old" window — use it. Cut over to
-the new key in Vercel only after the new key has been live
-in InsForge for at least one full cron tick.
+2. **Read the gateway log.** `journalctl --user -u hermes-gateway -n 200`
+   shows the last 200 lines of the gateway. If you don't see systemd
+   managing the gateway (some installs use a different supervisor),
+   substitute the right log path — `tail -200 ~/.hermes/logs/gateway.log`
+   is the common fallback.
 
-### 7.2 Vercel account token (`VERCEL_TOKEN`)
+3. **`hermes kanban tail <task_id>` on the suspect task.** This streams
+   the worker's last N events. Look for repeated error patterns, the
+   last successful state transition, and the timestamp of the most
+   recent log line. If the worker has been silent for >5 minutes on a
+   long-running task, it's probably stuck, not "thinking".
 
-Used by the deploy workflows. Rotate via the Vercel
-dashboard: Settings → Tokens → Revoke + create new. Update
-the GitHub repo secret `VERCEL_TOKEN` (Settings → Secrets
-→ Actions) with the new value. Both deploy workflows pick
-up the new value on their next run.
+4. **If it's a worker crash, `hermes kanban reclaim <id>`** and let the
+   dispatcher retry. The reclaim transitions the task back to `ready`
+   without incrementing the failure counter; the next dispatcher tick
+   will re-spawn it. Only reclaim when you believe the crash was
+   transient (network blip, OOM that won't repeat, InsForge rate limit).
+   If the crash is deterministic — bad code, wrong env — fix the root
+   cause first, then reclaim.
 
-`VERCEL_ORG_ID` and `VERCEL_PROJECT_ID` are not secret, but
-they are config. They do not need to rotate; if the Vercel
-project is moved to a new team, the values change and the
-GitHub secrets need to be updated.
-
-### 7.3 GitHub token (`GITHUB_TOKEN`)
-
-Auto-issued per workflow run. No rotation needed. For
-workflows that need a long-lived PAT (none currently do),
-use a fine-grained token scoped to the `PageVault` repo
-with `contents: write` and `deployments: write` only.
-
-### 7.4 Cron shared secret (`CRON_SHARED_SECRET`)
-
-Used by the InsForge scheduler to call the cron endpoints.
-Rotate by:
-
-1. Mint a new value: `openssl rand -hex 32`.
-2. Set the new value in Vercel production env vars (§7.1).
-3. Update the InsForge schedule's `x-cron-secret` header
-   to the new value.
-4. **Keep the old value valid in the app for at least one
-   cron tick** (5 minutes) so any in-flight requests from
-   the old schedule don't 401.
-5. Remove the old value from Vercel env vars.
-
-If you suspect the old value is compromised, skip step 4
-and remove the old value immediately after step 3. The
-brief 401 window is acceptable when the alternative is
-keeping a leaked secret alive.
+If after these four steps you still don't know what's wrong, comment on
+the task with what you've seen, `kanban_block` with a one-line reason,
+and ping the founder. The next worker that picks up the task will read
+the comment thread first.
 
 ---
 
-## Appendix A: quick-reference commands
-
-```bash
-# What's deployed right now?
-vercel ls --prod
-
-# Roll back to a specific deployment
-vercel rollback <deployment-url>
-
-# Tail prod logs
-vercel logs <deployment-url> --follow
-
-# Re-run the last failed CI job
-gh run rerun <run-id> --failed
-
-# Cancel an in-flight prod deploy that hasn't been approved yet
-gh workflow run cancel deploy-prod
-
-# Mint a new cron secret
-openssl rand -hex 32
-
-# Test the cron worker with a manual call
-curl -X POST -H "x-cron-secret: $CRON_SHARED_SECRET" \
-  https://<your-prod-domain>/api/cron/notification-worker
-```
-
-## Appendix B: who to page
-
-- **Deploy is wedged / Vercel 5xx** → on-call devops (this rotation)
-- **InsForge backend errors (auth, RLS, Postgres)** → InsForge
-  support (status.insforge.dev for incident status)
-- **Vercel platform outage** → status.vercel.com first, then
-  escalate to on-call devops if the workaround is non-obvious
-- **Security incident** (credential leak, suspected RCE) → on-call
-  security (see `SECURITY.md` for the disclosure policy)
+**Last reviewed:** the runbook was written against `main` at the time of
+the K-17 / K-19 launch checklist work. If you change a deploy step, a
+rollback procedure, or a recovery path, update this file in the same PR.
