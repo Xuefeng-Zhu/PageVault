@@ -8,8 +8,9 @@
 // before any outbound fetch) which rejects URLs whose hostname resolves
 // to a private / loopback / link-local / cloud-metadata / multicast /
 // reserved address.
-import { describe, it, expect, vi } from 'vitest';
-import { isBlockedAddress } from './scan';
+import { beforeAll, describe, it, expect, vi } from 'vitest';
+
+process.env.INSFORGE_API_URL = process.env.INSFORGE_API_URL || 'https://insforge.test';
 
 // The URL-level tests (validateCrawlUrl) need to control what dns.lookup
 // returns so they don't hit the real network. We use vi.hoisted() to share
@@ -42,12 +43,23 @@ vi.mock('node:dns/promises', () => ({
 // lib/scan.ts has top-level side effects (it throws if INSFORGE_API_URL
 // is missing) — we don't need those for the pure-function tests but the
 // import is still required to set up the module.
+let scanModulePromise: Promise<typeof import('./scan')> | null = null;
+function loadScanModule(): Promise<typeof import('./scan')> {
+  scanModulePromise = scanModulePromise ?? import('./scan');
+  return scanModulePromise;
+}
+
 async function loadValidateCrawlUrl(): Promise<(url: string) => Promise<string>> {
-  const mod = await import('./scan');
-  return mod.validateCrawlUrl;
+  return (await loadScanModule()).validateCrawlUrl;
 }
 
 describe('isBlockedAddress', () => {
+  let isBlockedAddress: (addr: string) => boolean;
+
+  beforeAll(async () => {
+    isBlockedAddress = (await loadScanModule()).isBlockedAddress;
+  });
+
   it('blocks IPv4 loopback (127.0.0.0/8)', () => {
     expect(isBlockedAddress('127.0.0.1')).toBe(true);
     expect(isBlockedAddress('127.255.255.254')).toBe(true);
