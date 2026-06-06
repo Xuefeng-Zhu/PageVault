@@ -1,7 +1,7 @@
 # Dependencies
 node_modules/
 
-# Next.js build
+# Next.js build output
 .next/
 out/
 
@@ -17,12 +17,14 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # TypeScript
 *.tsbuildinfo
 next-env.d.ts
 
-# Editor
+# Editor / IDE
 .vscode/
 .idea/
 *.swp
@@ -31,12 +33,24 @@ next-env.d.ts
 # Build artifacts
 dist/
 build/
+.turbo/
 
-# Stitch (local reference only)
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Cache
+.cache/
+.eslintcache
+
+# Vercel
+.vercel
+
+# Local reference (not source)
 .stitch/
 
-# InsForge & AI agent skills
-.insforge
+# InsForge & AI agent skills (local-only)
+.insforge/
 .agent
 .agents
 .augment

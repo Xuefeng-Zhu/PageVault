@@ -14,6 +14,9 @@
 // generate a unique `jobId` per run. The previous-snapshot lookup is by
 // (tracked_page_id, observed_at desc) so re-running won't double-insert.
 import { createHash } from 'node:crypto';
+import dns from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
 import { enqueueNotification } from './notifications';
 import type {
   MemoryRoom,
@@ -64,6 +67,293 @@ function htmlToMarkdown(html: string): { title: string; markdown: string; text: 
   return { title, markdown: body, text };
 }
 
+// SSRF guard: validateCrawlUrl rejects URLs that point at internal,
+// private, loopback, link-local, or cloud-metadata addresses before any
+// fetch() is issued. crawlOne() always goes through this first.
+//
+// We block by inspecting the parsed hostname, and (for hostnames that
+// aren't literal IPs) we DNS-resolve and block if *any* returned address
+// is in a denied range. The DNS step defeats classic DNS-rebinding where
+// a public hostname resolves to an internal IP at fetch time.
+//
+// Exported helpers (isBlockedAddress, validateCrawlUrl) are covered by
+// lib/scan.test.ts. They are the public security boundary.
+
+/** True if the address is in any range we refuse to crawl. */
+export function isBlockedAddress(addr: string): boolean {
+  if (!addr) return false;
+  // Normalize IPv4-mapped IPv6 to their v4 form so the v4 blocklist
+  // catches them. Accepts all three common forms:
+  //   ::ffff:127.0.0.1   (dotted-quad; the form new URL() emits for
+  //                       many resolvers)
+  //   ::ffff:7f00:1      (compressed hex; what new URL() emits for
+  //                       the dotted-quad form when the trailing bytes
+  //                       contain leading zeros)
+  //   ::ffff:0:0:7f00:1  (fully expanded)
+  // node's `dns.lookup` returns these in mixed form depending on the
+  // resolver, so we expand the address to its full 8-group form first
+  // (via expandIPv6ForMapping), then detect the ::ffff: prefix and
+  // pull the 32-bit v4 address out of the trailing groups. The dotted-
+  // quad form is handled in a separate case from the hex form.
+  if (addr.includes(':')) {
+    const expanded = expandIPv6ForMapping(addr);
+    // Case 1: trailing dotted-quad in the last group, e.g.
+    //   "0000:0000:0000:0000:0000:0000:ffff:127.0.0.1" (6 leading zeros)
+    //   "0000:0000:0000:0000:0000:ffff:127.0.0.1"     (5 leading zeros,
+    //                                                   the canonical
+    //                                                   "::ffff:127.0.0.1" form)
+    // The `(?:0+:)+` pattern is non-capturing (so the dotted-quad in
+    // group 1 is the only captured group) and matches one or more
+    // `0xxx:` groups (the leading zero run), then requires the literal
+    // `ffff:`. (A plain `^0+:` won't work because regex quantifiers
+    // don't backtrack across colons — each `0+` greedily consumes the
+    // trailing colon of its group, so the next match attempt starts
+    // at the next group's `0`, never at the `f` of `ffff:`.)
+    const dottedMatch = /^(?:0+:)+ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(expanded);
+    if (dottedMatch) {
+      return isBlockedAddress(dottedMatch[1]);
+    }
+    // Case 2: trailing hex form (two 16-bit groups, e.g.
+    //   "0000:0000:0000:0000:0000:ffff:7f00:1"     (compressed)
+    //   "0000:0000:0000:0000:0000:ffff:0:7f00:1"   (expanded with one
+    //                                                     leading zero)
+    // The v4 address is split as `7f00` / `1` = (a, b) where the
+    // dotted form is a.b.c.d and a = 7f, b = 00, c = 00, d = 01.
+    // Both `7f00` and `1` (or `0` / `7f00` in the expanded form) are
+    // captured as non-capturing groups so group 1 / group 2 are
+    // unambiguous.
+    const hexMatch = /^(?:0+:)+ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(expanded);
+    if (hexMatch) {
+      const a = parseInt(hexMatch[1], 16);
+      const b = parseInt(hexMatch[2], 16);
+      const dot = `${(a >> 8) & 0xff}.${a & 0xff}.${(b >> 8) & 0xff}.${b & 0xff}`;
+      return isBlockedAddress(dot);
+    }
+  }
+
+  // IPv6
+  if (addr.includes(':')) {
+    const lc = addr.toLowerCase();
+    if (lc === '::' || lc === '::1') return true;          // unspecified + loopback
+    if (lc.startsWith('fc') || lc.startsWith('fd')) return true; // unique-local fc00::/7
+    if (lc.startsWith('fe8') || lc.startsWith('fe9') ||
+        lc.startsWith('fea') || lc.startsWith('feb')) return true; // link-local fe80::/10
+    if (lc.startsWith('ff')) return true;                  // multicast ff00::/8
+    return false;
+  }
+
+  // IPv4
+  const parts = addr.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) {
+    return false; // not a parseable IPv4 — let the URL-level validator reject
+  }
+  const [a, b] = parts;
+  if (a === 0) return true;                              // 0.0.0.0/8
+  if (a === 10) return true;                             // 10.0.0.0/8
+  if (a === 127) return true;                            // 127.0.0.0/8 loopback
+  if (a === 169 && b === 254) return true;               // 169.254.0.0/16 link-local (incl. 169.254.169.254)
+  if (a === 172 && b >= 16 && b <= 31) return true;      // 172.16.0.0/12 RFC1918
+  if (a === 192 && b === 168) return true;               // 192.168.0.0/16
+  if (a === 100 && b >= 64 && b <= 127) return true;     // 100.64.0.0/10 CGNAT
+  if (a >= 224 && a <= 239) return true;                 // 224.0.0.0/4 multicast
+  if (a >= 240) return true;                             // 240.0.0.0/4 reserved + 255.255.255.255
+  return false;
+}
+
+/**
+ * Validate a URL before we crawl it. Throws on any blocked / malformed URL.
+ * The error message intentionally includes the offending host so that
+ * operators can debug "why was this URL rejected?" from a single stack
+ * line.
+ */
+type ValidatedCrawlTarget = {
+  url: string;
+  ips: Array<{ address: string; family: 4 | 6 }>;
+};
+
+export async function validateCrawlUrl(input: string): Promise<string> {
+  return (await resolveAndValidateCrawlUrl(input)).url;
+}
+
+export async function resolveAndValidateCrawlUrl(input: string): Promise<ValidatedCrawlTarget> {
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    throw new Error(`Refusing to crawl: invalid URL "${input}"`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      `Refusing to crawl "${input}": protocol "${parsed.protocol}" is not http(s)`,
+    );
+  }
+  const hostname = parsed.hostname; // URL.hostname is the lowercased, bracket-stripped host
+  if (!hostname) {
+    throw new Error(`Refusing to crawl "${input}": missing hostname`);
+  }
+
+  // URL.hostname returns literal IPv6 hostnames with surrounding brackets
+  // (e.g. "[::1]") but lowercased. Strip them so the literal-IP probe
+  // and the blocklist see the bare address.
+  const bareHost = hostname.startsWith('[') && hostname.endsWith(']')
+    ? hostname.slice(1, -1)
+    : hostname;
+
+  // Treat `localhost` and other well-known hostnames that should never be
+  // reached from the server's network as blocked without a DNS lookup.
+  const lcHost = bareHost.toLowerCase();
+  if (
+    lcHost === 'localhost' ||
+    lcHost.endsWith('.localhost') ||
+    lcHost.endsWith('.local') ||
+    lcHost.endsWith('.internal') ||
+    lcHost.endsWith('.intranet')
+  ) {
+    throw new Error(
+      `Refusing to crawl "${input}": hostname "${bareHost}" points at loopback / internal namespace`,
+    );
+  }
+
+  // If the hostname is a literal IP, the blocklist is sufficient — no DNS
+  // is needed and a malicious client can't rebind a literal IP.
+  if (isLiteralIPv4(bareHost) || isLiteralIPv6(bareHost)) {
+    if (isBlockedAddress(bareHost)) {
+      throw new Error(
+        `Refusing to crawl "${input}": hostname "${bareHost}" is a blocked private/internal address`,
+      );
+    }
+    return {
+      url: input,
+      ips: [{ address: bareHost, family: isLiteralIPv6(bareHost) ? 6 : 4 }],
+    };
+  }
+
+  // Hostname is a DNS name — resolve it and check every returned address.
+  // dns.lookup with { all: true } returns all A + AAAA records.
+  let addrs: Array<{ address: string; family?: number }>;
+  try {
+    addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
+  } catch (err) {
+    throw new Error(
+      `Refusing to crawl "${input}": DNS lookup failed for "${bareHost}" — ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  if (addrs.length === 0) {
+    throw new Error(`Refusing to crawl "${input}": DNS lookup returned no addresses for "${bareHost}"`);
+  }
+  for (const { address } of addrs) {
+    if (isBlockedAddress(address)) {
+      throw new Error(
+        `Refusing to crawl "${input}": hostname "${bareHost}" resolves to blocked private/internal address "${address}"`,
+      );
+    }
+  }
+  return {
+    url: input,
+    ips: addrs.map((a) => ({
+      address: a.address,
+      family: a.family === 6 || a.address.includes(':') ? 6 : 4,
+    })),
+  };
+}
+
+/**
+ * Expand an IPv6 address to its full 8-group colon-hex form. Returns
+ * the input unchanged if it doesn't look like an IPv6 address. Handles
+ * the `::` shorthand by computing the missing zero groups. Used by
+ * isBlockedAddress() to normalize ::ffff: mappings before checking
+ * the v4 blocklist. (new URL() sometimes normalizes the dotted-quad
+ * form ::ffff:127.0.0.1 to the compressed hex form ::ffff:7f00:1,
+ * and the uncompressed form ::ffff:0:0:7f00:1 is also seen in the
+ * wild; we accept all three.)
+ */
+function expandIPv6ForMapping(addr: string): string {
+  if (!addr.includes(':')) return addr;
+  const lc = addr.toLowerCase();
+  // The `::` shorthand: split on the first `::` and pad to 8 groups.
+  const dci = lc.indexOf('::');
+  if (dci !== -1) {
+    const head = lc.slice(0, dci);
+    const tail = lc.slice(dci + 2);
+    const headParts = head === '' ? [] : head.split(':');
+    const tailParts = tail === '' ? [] : tail.split(':');
+    const missing = 8 - headParts.length - tailParts.length;
+    if (missing < 0) return addr; // malformed; let downstream reject
+    const full = [...headParts, ...Array(missing).fill('0'), ...tailParts];
+    return full.map((g) => g.padStart(4, '0')).join(':');
+  }
+  // No `::` shorthand: just zero-pad each group.
+  return lc.split(':').map((g) => g.padStart(4, '0')).join(':');
+}
+
+function isLiteralIPv4(host: string): boolean {
+  const parts = host.split('.');
+  if (parts.length !== 4) return false;
+  return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+}
+
+function isLiteralIPv6(host: string): boolean {
+  // A literal IPv6 (after URL.hostname strip-bracket normalization) must
+  // contain at least one colon and consist of hex / colon / dot-quad chars.
+  if (!host.includes(':')) return false;
+  return /^[0-9a-fA-F:.]{2,}$/.test(host);
+}
+
+type CrawlResponse = {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  headers: { get(name: string): string | null };
+  text(): Promise<string>;
+};
+
+function fetchPinnedCrawlUrl(
+  url: string,
+  pin: { address: string; family: 4 | 6 },
+): Promise<CrawlResponse> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const client = parsed.protocol === 'https:' ? https : http;
+    const chunks: Buffer[] = [];
+    const req = client.request(parsed, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      lookup: (_hostname, _options, callback) => {
+        if (isBlockedAddress(pin.address)) {
+          callback(new Error(`Refusing to crawl: pinned address "${pin.address}" is blocked`), '', 0);
+          return;
+        }
+        callback(null, pin.address, pin.family);
+      },
+    }, (res) => {
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        resolve({
+          ok: Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 300),
+          status: res.statusCode ?? 0,
+          statusText: res.statusMessage ?? '',
+          headers: {
+            get(name: string) {
+              const value = res.headers[name.toLowerCase()];
+              if (Array.isArray(value)) return value[0] ?? null;
+              return value ?? null;
+            },
+          },
+          text: async () => body,
+        });
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 // Direct HTTP fetch as a baseline crawler. Tries the Apify run-sync API
 // directly if creds are present, otherwise falls back to a plain fetch()
 // with HTML→Markdown extraction.
@@ -71,13 +361,21 @@ async function crawlOne(url: string): Promise<{
   url: string; title: string; markdown: string; text: string; capturedAt: string;
   apifyRunId: string | null;
 }> {
+  // HIGH-4: SSRF guard. The URL is user-supplied (lives in
+  // tracked_pages.source_url) and any fetch() in this function is from
+  // the Next.js server's network. Reject private / loopback / link-local /
+  // cloud-metadata targets before issuing a single byte of outbound
+  // traffic, and follow DNS resolution to defeat DNS-rebinding.
+  await validateCrawlUrl(url);
+
   const apifyToken = process.env.APIFY_API_TOKEN;
   const apifyActorId = process.env.APIFY_ACTOR_ID;
 
   if (apifyToken && apifyActorId) {
     // Real Apify path
+    const actorIdForApi = encodeURIComponent(apifyActorId.replace(/\//g, '~'));
     const r = await fetch(
-      `https://api.apify.com/v2/acts/${apifyActorId}/run-sync-get-dataset-items?token=${apifyToken}`,
+      `https://api.apify.com/v2/acts/${actorIdForApi}/run-sync-get-dataset-items?token=${apifyToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -102,14 +400,43 @@ async function crawlOne(url: string): Promise<{
     console.warn(`[scan] Apify call failed for ${url}, falling back to direct fetch`);
   }
 
-  // Direct fetch path
-  const r = await fetch(url, {
-    headers: {
-      'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    },
-    redirect: 'follow',
-  });
+  // Direct fetch path. We use redirect: 'manual' so we can
+  // re-validate every Location header against the SSRF blocklist;
+  // the default 'follow' would silently redirect a public URL
+  // to http://169.254.169.254/ (cloud metadata) or http://127.0.0.1/
+  // (loopback) without re-running the private-address checks.
+  //
+  // DNS-rebinding defense: resolveAndValidateCrawlUrl returns the
+  // validated IPs, and fetchPinnedCrawlUrl passes the selected IP
+  // through Node's lookup hook for the actual socket connection.
+  // The request URL stays as the original hostname, so HTTPS SNI,
+  // certificate validation, Host headers, and relative redirects all
+  // continue to use the public hostname instead of an IP literal.
+  const MAX_REDIRECTS = 5;
+  let currentUrl = url;
+  let r: CrawlResponse | null = null;
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    const resolved = await resolveAndValidateCrawlUrl(currentUrl);
+    currentUrl = resolved.url;
+    const res = await fetchPinnedCrawlUrl(currentUrl, resolved.ips[0]);
+    // Non-redirect: we have the final response.
+    if (res.status < 300 || res.status >= 400) {
+      r = res;
+      break;
+    }
+    // 3xx: read Location, resolve against the hostname URL we just
+    // requested, and revalidate/re-pin on the next iteration.
+    const location = res.headers.get('location');
+    if (!location) {
+      // 3xx with no Location is malformed; treat as terminal.
+      r = res;
+      break;
+    }
+    currentUrl = new URL(location, currentUrl).toString();
+  }
+  if (!r) {
+    throw new Error(`Failed to fetch ${url}: too many redirects (limit ${MAX_REDIRECTS})`);
+  }
   if (!r.ok) throw new Error(`Failed to fetch ${url}: ${r.status} ${r.statusText}`);
   const html = await r.text();
   const { title, markdown, text } = htmlToMarkdown(html);
@@ -284,8 +611,8 @@ const BASE_URL = process.env.INSFORGE_API_URL;
 if (!BASE_URL) {
   throw new Error('INSFORGE_API_URL is not set. Refusing to run scans against an unknown InsForge tenant.');
 }
-const SRK = process.env.INSFORGE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
-const ANON = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
+const SRK = process.env.INSFORGE_SERVICE_ROLE_KEY || process.env.INSFORGE_ANON_KEY || process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
+const ANON = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || process.env.INSFORGE_ANON_KEY || '';
 
 function uuid(prefix: string): string {
   // InsForge rejects UUIDs whose first char isn't 0-9 or a-f.

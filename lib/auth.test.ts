@@ -22,27 +22,42 @@ type EnvSnapshot = {
   NODE_ENV: string | undefined;
 };
 
+function mutableEnv(): Record<keyof EnvSnapshot, string | undefined> & Record<string, string | undefined> {
+  return process.env as unknown as Record<keyof EnvSnapshot, string | undefined> & Record<string, string | undefined>;
+}
+
 function snapshotEnv(): EnvSnapshot {
+  const env = mutableEnv();
   return {
-    NEXTAUTH_SECRET: process.env.NEXTAUTH_SECRET,
-    INSFORGE_DEV_INSECURE_SECRET: process.env.INSFORGE_DEV_INSECURE_SECRET,
-    NODE_ENV: process.env.NODE_ENV,
+    NEXTAUTH_SECRET: env.NEXTAUTH_SECRET,
+    INSFORGE_DEV_INSECURE_SECRET: env.INSFORGE_DEV_INSECURE_SECRET,
+    NODE_ENV: env.NODE_ENV,
   };
 }
 
 function restoreEnv(snap: EnvSnapshot): void {
+  const env = mutableEnv();
   for (const k of Object.keys(snap) as (keyof EnvSnapshot)[]) {
     if (snap[k] === undefined) {
-      delete process.env[k];
+      delete env[k];
     } else {
-      process.env[k] = snap[k];
+      env[k] = snap[k];
     }
   }
 }
 
 function clearAuthEnv(): void {
-  delete process.env.NEXTAUTH_SECRET;
-  delete process.env.INSFORGE_DEV_INSECURE_SECRET;
+  const env = mutableEnv();
+  delete env.NEXTAUTH_SECRET;
+  delete env.INSFORGE_DEV_INSECURE_SECRET;
+}
+
+function setNodeEnv(value: string): void {
+  mutableEnv().NODE_ENV = value;
+}
+
+function clearNodeEnv(): void {
+  delete mutableEnv().NODE_ENV;
 }
 
 describe('resolveNextAuthSecret()', () => {
@@ -53,7 +68,7 @@ describe('resolveNextAuthSecret()', () => {
     // Wipe per-test so leakage from a previous test (or the surrounding
     // vitest worker env) cannot silently change behavior.
     clearAuthEnv();
-    delete process.env.NODE_ENV;
+    clearNodeEnv();
   });
 
   afterEach(() => {
@@ -63,7 +78,7 @@ describe('resolveNextAuthSecret()', () => {
   it('returns NEXTAUTH_SECRET verbatim when set', async () => {
     process.env.NEXTAUTH_SECRET = 'real-prod-secret-abc123';
     process.env.INSFORGE_DEV_INSECURE_SECRET = '1';
-    process.env.NODE_ENV = 'production';
+    setNodeEnv('production');
 
     const { resolveNextAuthSecret } = await import('./auth');
     expect(resolveNextAuthSecret()).toBe('real-prod-secret-abc123');
@@ -76,7 +91,7 @@ describe('resolveNextAuthSecret()', () => {
   });
 
   it('generates a per-process random hex secret when dev opt-in is set in development', async () => {
-    process.env.NODE_ENV = 'development';
+    setNodeEnv('development');
     process.env.INSFORGE_DEV_INSECURE_SECRET = '1';
     // Suppress the warning noise — it's the expected behavior here.
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -94,7 +109,7 @@ describe('resolveNextAuthSecret()', () => {
   });
 
   it('throws when INSFORGE_DEV_INSECURE_SECRET=1 is set in production', async () => {
-    process.env.NODE_ENV = 'production';
+    setNodeEnv('production');
     process.env.INSFORGE_DEV_INSECURE_SECRET = '1';
 
     const { resolveNextAuthSecret } = await import('./auth');
@@ -104,7 +119,7 @@ describe('resolveNextAuthSecret()', () => {
   });
 
   it('throws when INSFORGE_DEV_INSECURE_SECRET=1 is set in test (non-development)', async () => {
-    process.env.NODE_ENV = 'test';
+    setNodeEnv('test');
     process.env.INSFORGE_DEV_INSECURE_SECRET = '1';
 
     const { resolveNextAuthSecret } = await import('./auth');
@@ -124,7 +139,7 @@ describe('resolveNextAuthSecret()', () => {
   });
 
   it('throws when NEXTAUTH_SECRET is unset in NODE_ENV=production (no opt-in)', async () => {
-    process.env.NODE_ENV = 'production';
+    setNodeEnv('production');
     // No NEXTAUTH_SECRET, no opt-in.
 
     const { resolveNextAuthSecret } = await import('./auth');
@@ -134,7 +149,7 @@ describe('resolveNextAuthSecret()', () => {
   });
 
   it('throws when NEXTAUTH_SECRET is unset in NODE_ENV=test (no opt-in)', async () => {
-    process.env.NODE_ENV = 'test';
+    setNodeEnv('test');
 
     const { resolveNextAuthSecret } = await import('./auth');
     expect(() => resolveNextAuthSecret()).toThrowError(
@@ -143,7 +158,7 @@ describe('resolveNextAuthSecret()', () => {
   });
 
   it('throws when NEXTAUTH_SECRET is unset in NODE_ENV=development WITHOUT the opt-in', async () => {
-    process.env.NODE_ENV = 'development';
+    setNodeEnv('development');
     // No opt-in — the dev path requires explicit INSFORGE_DEV_INSECURE_SECRET=1.
 
     const { resolveNextAuthSecret } = await import('./auth');
@@ -153,7 +168,7 @@ describe('resolveNextAuthSecret()', () => {
   });
 
   it('treats INSFORGE_DEV_INSECURE_SECRET values other than "1" as no opt-in', async () => {
-    process.env.NODE_ENV = 'development';
+    setNodeEnv('development');
     process.env.INSFORGE_DEV_INSECURE_SECRET = 'true'; // not '1'
 
     const { resolveNextAuthSecret } = await import('./auth');
@@ -172,7 +187,7 @@ describe('lib/auth.ts module-load behavior (CRITICAL-3 regression)', () => {
   beforeEach(() => {
     envSnap = snapshotEnv();
     clearAuthEnv();
-    delete process.env.NODE_ENV;
+    clearNodeEnv();
     // Always reset module cache so each test re-evaluates the module under
     // its own env. Without this, the first test's resolution would be cached
     // and subsequent tests would see a stale module-level constant.
@@ -185,7 +200,7 @@ describe('lib/auth.ts module-load behavior (CRITICAL-3 regression)', () => {
   });
 
   it('throws at module load when NEXTAUTH_SECRET is unset in NODE_ENV=production', async () => {
-    process.env.NODE_ENV = 'production';
+    setNodeEnv('production');
     // NEXTAUTH_SECRET deliberately not set.
 
     await expect(import('./auth')).rejects.toThrowError(
@@ -194,7 +209,7 @@ describe('lib/auth.ts module-load behavior (CRITICAL-3 regression)', () => {
   });
 
   it('throws at module load when INSFORGE_DEV_INSECURE_SECRET=1 is set in NODE_ENV=production', async () => {
-    process.env.NODE_ENV = 'production';
+    setNodeEnv('production');
     process.env.INSFORGE_DEV_INSECURE_SECRET = '1';
 
     await expect(import('./auth')).rejects.toThrowError(
@@ -203,7 +218,7 @@ describe('lib/auth.ts module-load behavior (CRITICAL-3 regression)', () => {
   });
 
   it('loads successfully in NODE_ENV=development with the dev opt-in', async () => {
-    process.env.NODE_ENV = 'development';
+    setNodeEnv('development');
     process.env.INSFORGE_DEV_INSECURE_SECRET = '1';
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -216,7 +231,7 @@ describe('lib/auth.ts module-load behavior (CRITICAL-3 regression)', () => {
   });
 
   it('loads successfully in NODE_ENV=development with NEXTAUTH_SECRET set', async () => {
-    process.env.NODE_ENV = 'development';
+    setNodeEnv('development');
     process.env.NEXTAUTH_SECRET = 'dev-secret-xyz';
 
     const mod = await import('./auth');

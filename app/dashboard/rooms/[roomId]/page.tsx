@@ -124,7 +124,7 @@ export default function RoomDetailPage() {
             </div>
             <h2 className="font-display text-display-md text-ink mb-2">{error || 'Room not found'}</h2>
             <p className="font-body text-body-md text-ink-2 mb-6">
-              The filing you're looking for isn't in the archive. It may have been sealed or never opened.
+              The filing you&apos;re looking for isn&apos;t in the archive. It may have been sealed or never opened.
             </p>
             <Link href="/dashboard">
               <Button variant="secondary">← Back to overview</Button>
