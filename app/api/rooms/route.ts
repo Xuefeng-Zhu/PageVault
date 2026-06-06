@@ -14,6 +14,15 @@ import { requireSession } from '@/lib/apiAuth';
 
 const execAsync = promisify(exec);
 
+function isLocalhostUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname;
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
 export async function GET(): Promise<NextResponse<RoomWithStats[] | ErrorResponse>> {
   const session = await requireSession();
   if (session instanceof NextResponse) return session;
@@ -116,6 +125,11 @@ export async function POST(request: NextRequest): Promise<NextResponse<MemoryRoo
         'NEXT_PUBLIC_APP_URL is not set; skipping auto-registration of InsForge schedule for room',
         room.id,
         '— the per-room schedule route can retry once the env is configured.',
+      );
+    } else if (process.env.NODE_ENV !== 'development' && isLocalhostUrl(appUrl)) {
+      console.warn(
+        'NEXT_PUBLIC_APP_URL points at localhost; skipping InsForge schedule registration for room',
+        room.id,
       );
     } else {
       try {

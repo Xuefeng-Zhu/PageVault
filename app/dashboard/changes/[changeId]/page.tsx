@@ -84,7 +84,7 @@ export default function ChangeDetailPage() {
               {error || 'Change not found'}
             </h2>
             <p className="font-body text-body-md text-ink-2 mb-6">
-              The filing you're looking for isn't in the archive.
+              The filing you&apos;re looking for isn&apos;t in the archive.
             </p>
             <Link href="/dashboard">
               <Button variant="secondary">← Back to overview</Button>

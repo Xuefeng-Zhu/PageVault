@@ -71,7 +71,7 @@ function makeFixture(activePageCount: number, jobsPerPage = 1) {
         id: `job-${p}-${j}`,
         tracked_page_id: `page-${p}`,
         status: 'succeeded',
-        finished_at: new Date(2026, 5, 1, 0, jobsPerPage - j).toISOString(),
+        finished_at: new Date(Date.UTC(2026, 5, 1, 0, jobsPerPage - j)).toISOString(),
       });
     }
   }
@@ -152,29 +152,16 @@ describe('listRoomsWithStats — MEDIUM-4 regression (O(1) PostgREST round-trips
     expect(room.watchedUrls).toHaveLength(3);
   });
 
-  it('keeps the snapshot_jobs queries scoped per active page with limit=1', async () => {
-    // Round 6 (commit b0fa9ee) changed listRoomsWithStats from one
-    // global batched query to N per-page queries. The test from
-    // round 5 (commit c026b2f) asserted the batched shape and is
-    // now obsolete. We replace it with an assertion matching the
-    // per-page shape: each tracked_page_id=eq.<uuid> snapshot_jobs
-    // call has limit=1, status=eq.succeeded, and order=finished_at.desc.
+  it('uses one bounded succeeded-job query for the latest-job bucket', async () => {
     mocks.from.mockImplementation(routeFixture(makeFixture(2)));
     await listRoomsWithStats();
     const jobsCalls = (mocks.from.mock.calls as unknown[][])
       .map((c) => String(c[0]))
       .filter((q) => q.startsWith('snapshot_jobs?'));
-    // One query per active page (2 in this fixture).
-    expect(jobsCalls).toHaveLength(2);
-    for (const q of jobsCalls) {
-      expect(q).toContain('status=eq.succeeded');
-      expect(q).toContain('order=finished_at.desc');
-      expect(q).toContain('limit=1');
-      // Per-page filter is `tracked_page_id=eq.<anything-not-a-comma>`.
-      // Match anything that isn't a comma or query separator so this
-      // works for both UUID fixtures and the simpler `page-${i}` ids
-      // the test fixture uses.
-      expect(q).toMatch(/tracked_page_id=eq\.[^&,\s]+/);
-    }
+    expect(jobsCalls).toHaveLength(1);
+    expect(jobsCalls[0]).toContain('status=eq.succeeded');
+    expect(jobsCalls[0]).toContain('order=finished_at.desc');
+    expect(jobsCalls[0]).toContain('limit=5000');
+    expect(jobsCalls[0]).not.toContain('tracked_page_id=eq.');
   });
 });

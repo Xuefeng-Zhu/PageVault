@@ -280,7 +280,7 @@ export default function LandingPage() {
 
               <h1 className="font-display text-display-2xl lg:text-[5.5rem] lg:leading-[0.95] text-ink tracking-[-0.035em] mb-8">
                 The web forgets.<br />
-                <span className="italic text-ink-2">PageVault doesn't.</span>
+                <span className="italic text-ink-2">PageVault doesn&apos;t.</span>
               </h1>
 
               <p className="font-body text-body-lg text-ink-2 max-w-2xl leading-relaxed mb-10">
@@ -404,7 +404,7 @@ export default function LandingPage() {
             </div>
             <div className="lg:col-span-6 lg:col-start-7 self-end">
               <p className="font-body text-body-lg text-ink-2 leading-relaxed">
-                PageVault composes three systems you probably already use. The point isn't novelty — it's that
+                PageVault composes three systems you probably already use. The point isn&apos;t novelty — it&apos;s that
                 when a page on the open web changes, the <em>why it matters</em> arrives in the same envelope as
                 the <em>what</em>.
               </p>
@@ -605,7 +605,7 @@ export default function LandingPage() {
                 <span className="italic text-paper/50">Watch one URL change.</span>
               </h2>
               <p className="font-body text-body-lg text-paper/70 mb-10 max-w-xl leading-relaxed">
-                Takes about ninety seconds. We'll run an initial crawl, surface the diff, and
+                Takes about ninety seconds. We&apos;ll run an initial crawl, surface the diff, and
                 write the AI interpretation before you finish your coffee.
               </p>
               <div className="flex flex-wrap gap-3">
