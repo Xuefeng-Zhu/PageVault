@@ -42,9 +42,11 @@ const VALID_PAYLOAD: ApifyWebhookPayload = {
 
 describe('apify-webhook (CRITICAL-1 fix)', () => {
   const ORIGINAL_ENV = process.env.APIFY_WEBHOOK_SECRET;
+  const ORIGINAL_DENO = (globalThis as unknown as { Deno?: unknown }).Deno;
 
   beforeEach(() => {
     delete process.env.APIFY_WEBHOOK_SECRET;
+    delete (globalThis as unknown as { Deno?: unknown }).Deno;
   });
 
   afterEach(() => {
@@ -52,6 +54,11 @@ describe('apify-webhook (CRITICAL-1 fix)', () => {
       delete process.env.APIFY_WEBHOOK_SECRET;
     } else {
       process.env.APIFY_WEBHOOK_SECRET = ORIGINAL_ENV;
+    }
+    if (ORIGINAL_DENO === undefined) {
+      delete (globalThis as unknown as { Deno?: unknown }).Deno;
+    } else {
+      (globalThis as unknown as { Deno?: unknown }).Deno = ORIGINAL_DENO;
     }
   });
 
@@ -123,6 +130,19 @@ describe('apify-webhook (CRITICAL-1 fix)', () => {
     it('returns { ok: true } when the header matches', () => {
       process.env.APIFY_WEBHOOK_SECRET='expected-secret';
       const req = makeRequest({}, { sharedSecretHeader: 'expected-secret' });
+      expect(verifyApifyWebhookSecret(req)).toEqual({ ok: true });
+    });
+
+    it('reads APIFY_WEBHOOK_SECRET from Deno.env in the edge runtime', () => {
+      delete process.env.APIFY_WEBHOOK_SECRET;
+      (globalThis as unknown as {
+        Deno: { env: { get: (key: string) => string | undefined } };
+      }).Deno = {
+        env: {
+          get: (key: string) => key === 'APIFY_WEBHOOK_SECRET' ? 'deno-edge-secret' : undefined,
+        },
+      };
+      const req = makeRequest({}, { sharedSecretHeader: 'deno-edge-secret' });
       expect(verifyApifyWebhookSecret(req)).toEqual({ ok: true });
     });
   });

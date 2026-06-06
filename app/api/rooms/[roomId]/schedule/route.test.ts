@@ -200,4 +200,35 @@ describe('CRITICAL-4: roomId is validated as a UUID at the front door', () => {
     expect(r.status).not.toBe(400);
     expect(getRoomMock).toHaveBeenCalledWith(VALID_UUID);
   });
+
+  it('fails before persisting enabled=true when InsForge rejects schedule creation', async () => {
+    getRoomMock.mockResolvedValue({ id: VALID_UUID, userId: 'user-1' });
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    global.fetch = vi.fn(async (url: any, init?: RequestInit) => {
+      const normalizedUrl = String(url);
+      calls.push({ url: normalizedUrl, init });
+      if (normalizedUrl.endsWith('/api/schedules') && init?.method === 'GET') {
+        return Response.json([]);
+      }
+      if (normalizedUrl.endsWith('/api/schedules') && init?.method === 'POST') {
+        return Response.json({ error: 'invalid cron upstream' }, { status: 400, statusText: 'Bad Request' });
+      }
+      return Response.json([]);
+    }) as unknown as typeof fetch;
+    (global.fetch as unknown as { __calls: typeof calls }).__calls = calls;
+
+    const r = await POST(
+      makeRequest('POST', { cronExpression: '0 3 * * *', enabled: true }),
+      makeParams(VALID_UUID),
+    );
+
+    expect(r.status).toBe(500);
+    const body = await r.json();
+    expect(body.error?.message).toMatch(/InsForge schedule create failed/i);
+    const dbWrites = calls.filter((c) =>
+      c.url.includes('/api/database/records/scan_schedules') &&
+      (c.init?.method === 'POST' || c.init?.method === 'PATCH')
+    );
+    expect(dbWrites).toEqual([]);
+  });
 });
