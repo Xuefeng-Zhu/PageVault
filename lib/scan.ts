@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto';
 import dns from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
+import type { LookupFunction } from 'node:net';
 import { enqueueNotification } from './notifications';
 import type {
   MemoryRoom,
@@ -166,16 +167,7 @@ export function isBlockedAddress(addr: string): boolean {
  * operators can debug "why was this URL rejected?" from a single stack
  * line.
  */
-type ValidatedCrawlTarget = {
-  url: string;
-  ips: Array<{ address: string; family: 4 | 6 }>;
-};
-
 export async function validateCrawlUrl(input: string): Promise<string> {
-  return (await resolveAndValidateCrawlUrl(input)).url;
-}
-
-export async function resolveAndValidateCrawlUrl(input: string): Promise<ValidatedCrawlTarget> {
   let parsed: URL;
   try {
     parsed = new URL(input);
@@ -222,15 +214,12 @@ export async function resolveAndValidateCrawlUrl(input: string): Promise<Validat
         `Refusing to crawl "${input}": hostname "${bareHost}" is a blocked private/internal address`,
       );
     }
-    return {
-      url: input,
-      ips: [{ address: bareHost, family: isLiteralIPv6(bareHost) ? 6 : 4 }],
-    };
+    return input;
   }
 
   // Hostname is a DNS name — resolve it and check every returned address.
   // dns.lookup with { all: true } returns all A + AAAA records.
-  let addrs: Array<{ address: string; family?: number }>;
+  let addrs: Array<{ address: string }>;
   try {
     addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
   } catch (err) {
@@ -250,11 +239,54 @@ export async function resolveAndValidateCrawlUrl(input: string): Promise<Validat
       );
     }
   }
+  return input;
+}
+
+/**
+ * Like validateCrawlUrl, but also returns the IP address(es) the
+ * hostname resolves to at validation time. Callers MUST use the
+ * returned IP for the outbound request (via a transport lookup override)
+ * to prevent DNS rebinding — if the request is sent by hostname with the
+ * default resolver, the second resolution can land on a different
+ * (attacker-controlled) IP than the one the guard validated.
+ *
+ * For literal-IP hostnames, returns the literal IP as a single-entry
+ * array (the caller can pin to it).
+ *
+ * Returns a structured object { url, ips } so the caller has both
+ * the canonical URL and the pinned addresses to use in the fetch.
+ */
+type ResolvedCrawlAddress = { address: string; family: 4 | 6 };
+
+export async function resolveAndValidateCrawlUrl(input: string): Promise<{ url: string; ips: ResolvedCrawlAddress[] }> {
+  const validated = await validateCrawlUrl(input);
+  const parsed = new URL(validated);
+  const bareHost = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname;
+  if (isLiteralIPv4(bareHost) || isLiteralIPv6(bareHost)) {
+    return { url: validated, ips: [{ address: bareHost, family: isLiteralIPv6(bareHost) ? 6 : 4 }] };
+  }
+  // Already validated by validateCrawlUrl above; lookup again to get
+  // the IPs (validateCrawlUrl only checked them, didn't return them).
+  // Re-check this second result too: a DNS answer can change between
+  // the validation lookup and the pinning lookup.
+  const addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
+  if (addrs.length === 0) {
+    throw new Error(`Refusing to crawl "${input}": DNS lookup returned no addresses for "${bareHost}"`);
+  }
+  for (const { address } of addrs) {
+    if (isBlockedAddress(address)) {
+      throw new Error(
+        `Refusing to crawl "${input}": hostname "${bareHost}" resolves to blocked private/internal address "${address}"`,
+      );
+    }
+  }
   return {
-    url: input,
+    url: validated,
     ips: addrs.map((a) => ({
       address: a.address,
-      family: a.family === 6 || a.address.includes(':') ? 6 : 4,
+      family: a.family === 6 ? 6 : 4,
     })),
   };
 }
@@ -301,7 +333,25 @@ function isLiteralIPv6(host: string): boolean {
   return /^[0-9a-fA-F:.]{2,}$/.test(host);
 }
 
-type CrawlResponse = {
+// Direct HTTP fetch timeout. A user-supplied tracked page could point at
+// a server that accepts the TCP connection but never sends a response
+// (a "slowloris" target, an IP that's actually a captive portal holding
+// the socket open, etc.). Without a timeout, the next.js worker would be
+// pinned indefinitely — the scan queue would fill up and never drain.
+// Default is 10s; operators can override per-environment with the
+// PAGEVAULT_FETCH_TIMEOUT_MS env var (e.g. 2000 in tests, 30000 over a
+// slow WAN). The same abort signal applies to every hop in the
+// redirect chain so the total wall-clock for one crawl is bounded.
+const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+function getFetchTimeoutMs(): number {
+  const raw = process.env.PAGEVAULT_FETCH_TIMEOUT_MS;
+  if (!raw) return DEFAULT_FETCH_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_FETCH_TIMEOUT_MS;
+  return parsed;
+}
+
+type DirectCrawlResponse = {
   ok: boolean;
   status: number;
   statusText: string;
@@ -309,30 +359,53 @@ type CrawlResponse = {
   text(): Promise<string>;
 };
 
+function getResponseHeader(headers: http.IncomingHttpHeaders, name: string): string | null {
+  const value = headers[name.toLowerCase()];
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+
+function makeAbortError(): Error {
+  const err = new Error('AbortError');
+  err.name = 'AbortError';
+  return err;
+}
+
 function fetchPinnedCrawlUrl(
   url: string,
-  pin: { address: string; family: 4 | 6 },
-): Promise<CrawlResponse> {
+  pin: ResolvedCrawlAddress,
+  signal: AbortSignal,
+): Promise<DirectCrawlResponse> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const client = parsed.protocol === 'https:' ? https : http;
     const chunks: Buffer[] = [];
+    let settled = false;
+
+    const lookup: LookupFunction = (_hostname, _options, callback) => {
+      const cb = callback as (err: NodeJS.ErrnoException | null, address: string, family: number) => void;
+      if (isBlockedAddress(pin.address)) {
+        cb(new Error(`Refusing to crawl: pinned address "${pin.address}" is blocked`), '', 0);
+        return;
+      }
+      cb(null, pin.address, pin.family);
+    };
+
     const req = client.request(parsed, {
       method: 'GET',
       headers: {
         'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
-      lookup: (_hostname, _options, callback) => {
-        if (isBlockedAddress(pin.address)) {
-          callback(new Error(`Refusing to crawl: pinned address "${pin.address}" is blocked`), '', 0);
-          return;
-        }
-        callback(null, pin.address, pin.family);
-      },
+      lookup,
     }, (res) => {
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('data', (chunk: Buffer | string) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
       res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', abort);
         const body = Buffer.concat(chunks).toString('utf8');
         resolve({
           ok: Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 300),
@@ -340,16 +413,37 @@ function fetchPinnedCrawlUrl(
           statusText: res.statusMessage ?? '',
           headers: {
             get(name: string) {
-              const value = res.headers[name.toLowerCase()];
-              if (Array.isArray(value)) return value[0] ?? null;
-              return value ?? null;
+              return getResponseHeader(res.headers, name);
             },
           },
           text: async () => body,
         });
       });
+      res.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', abort);
+        reject(err);
+      });
     });
-    req.on('error', reject);
+
+    const abort = () => {
+      if (settled) return;
+      req.destroy(makeAbortError());
+    };
+
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      reject(err);
+    });
+
+    if (signal.aborted) {
+      abort();
+    } else {
+      signal.addEventListener('abort', abort, { once: true });
+    }
     req.end();
   });
 }
@@ -357,7 +451,11 @@ function fetchPinnedCrawlUrl(
 // Direct HTTP fetch as a baseline crawler. Tries the Apify run-sync API
 // directly if creds are present, otherwise falls back to a plain fetch()
 // with HTML→Markdown extraction.
-async function crawlOne(url: string): Promise<{
+//
+// Exported (not just module-local) so unit tests in lib/scan.test.ts
+// can drive the timeout / abort path with a controlled fetch mock
+// without standing up the full runScan() / DB / Apify stack.
+export async function crawlOne(url: string): Promise<{
   url: string; title: string; markdown: string; text: string; capturedAt: string;
   apifyRunId: string | null;
 }> {
@@ -373,9 +471,8 @@ async function crawlOne(url: string): Promise<{
 
   if (apifyToken && apifyActorId) {
     // Real Apify path
-    const actorIdForApi = encodeURIComponent(apifyActorId.replace(/\//g, '~'));
     const r = await fetch(
-      `https://api.apify.com/v2/acts/${actorIdForApi}/run-sync-get-dataset-items?token=${apifyToken}`,
+      `https://api.apify.com/v2/acts/${apifyActorId}/run-sync-get-dataset-items?token=${apifyToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -406,33 +503,74 @@ async function crawlOne(url: string): Promise<{
   // to http://169.254.169.254/ (cloud metadata) or http://127.0.0.1/
   // (loopback) without re-running the private-address checks.
   //
-  // DNS-rebinding defense: resolveAndValidateCrawlUrl returns the
-  // validated IPs, and fetchPinnedCrawlUrl passes the selected IP
-  // through Node's lookup hook for the actual socket connection.
-  // The request URL stays as the original hostname, so HTTPS SNI,
-  // certificate validation, Host headers, and relative redirects all
-  // continue to use the public hostname instead of an IP literal.
+  // DNS-rebinding defense: the SSRF guard above resolves the
+  // hostname and checks every returned IP, but a plain fetch() would
+  // perform its own DNS lookup later. Between the guard and the
+  // request, a malicious authoritative DNS server can flip the answer
+  // to a private IP. To prevent that, we keep the original URL host
+  // (so HTTPS TLS/SNI and virtual-host routing still see the real
+  // hostname) and override Node's lookup callback to return the
+  // already-validated IP.
   const MAX_REDIRECTS = 5;
+  const timeoutMs = getFetchTimeoutMs();
+  // Single AbortController covers the entire redirect chain — a target
+  // that hangs on hop 1 OR a chain of slow redirects that together
+  // exceed the budget both get cut off at timeoutMs. The timer is
+  // unref'd so a still-pending abort can't keep the event loop alive
+  // past the caller's await.
+  const abortController = new AbortController();
+  const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
+  timeoutHandle.unref?.();
   let currentUrl = url;
-  let r: CrawlResponse | null = null;
+  let r: DirectCrawlResponse | null = null;
+  try {
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    // SSRF guard + DNS-rebinding pin. resolveAndValidateCrawlUrl
+    // returns the validated URL and the IP(s) the hostname resolves
+    // to; we use the first IP in the transport lookup override and
+    // keep the original hostname in the URL itself for TLS/SNI.
     const resolved = await resolveAndValidateCrawlUrl(currentUrl);
     currentUrl = resolved.url;
-    const res = await fetchPinnedCrawlUrl(currentUrl, resolved.ips[0]);
+    const pin = resolved.ips[0];
+    if (!pin) {
+      throw new Error(`Refusing to crawl "${currentUrl}": DNS lookup returned no addresses`);
+    }
+    const res = await fetchPinnedCrawlUrl(currentUrl, pin, abortController.signal);
     // Non-redirect: we have the final response.
     if (res.status < 300 || res.status >= 400) {
       r = res;
       break;
     }
-    // 3xx: read Location, resolve against the hostname URL we just
-    // requested, and revalidate/re-pin on the next iteration.
+    // 3xx: read Location, loop. After a redirect, the next URL is
+    // still hostname-based, and we re-resolve/re-pin on the next
+    // iteration.
     const location = res.headers.get('location');
     if (!location) {
       // 3xx with no Location is malformed; treat as terminal.
       r = res;
       break;
     }
+    // Resolve relative to the previous hostname URL. The next
+    // iteration re-resolves and re-pins for the new hostname.
     currentUrl = new URL(location, currentUrl).toString();
+  }
+  } catch (err) {
+    // Convert the AbortError from the timeout into a deterministic,
+    // greppable error message. The original DOMException is preserved
+    // on .cause for callers that want to inspect it.
+    if (err instanceof Error && (err.name === 'AbortError' || abortController.signal.aborted)) {
+      const e = new Error(`Fetch of ${url} aborted after ${timeoutMs}ms (PAGEVAULT_FETCH_TIMEOUT_MS)`);
+      e.name = 'FetchTimeoutError';
+      (e as Error & { cause?: unknown }).cause = err;
+      throw e;
+    }
+    throw err;
+  } finally {
+    // Clear the timeout in every exit path — success, error, or
+    // abort. Without this, the timer would keep the event loop
+    // alive until it fires, and on success it would still call
+    // abort() on a controller that's no longer in use.
+    clearTimeout(timeoutHandle);
   }
   if (!r) {
     throw new Error(`Failed to fetch ${url}: too many redirects (limit ${MAX_REDIRECTS})`);
@@ -611,7 +749,7 @@ const BASE_URL = process.env.INSFORGE_API_URL;
 if (!BASE_URL) {
   throw new Error('INSFORGE_API_URL is not set. Refusing to run scans against an unknown InsForge tenant.');
 }
-const SRK = process.env.INSFORGE_SERVICE_ROLE_KEY || process.env.INSFORGE_ANON_KEY || process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
+const SRK = process.env.INSFORGE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
 const ANON = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || process.env.INSFORGE_ANON_KEY || '';
 
 function uuid(prefix: string): string {

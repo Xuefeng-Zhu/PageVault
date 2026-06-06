@@ -31,12 +31,12 @@ cp .env.example .env.local
 # this in production.
 
 # 4. Run migrations
-# The project does not have a migration runner. Open the InsForge SQL
-# editor for your project and run, in order:
-#   - db/migration.sql
-#   - db/migrations/2026-06-02-scan-schedules.sql
-#   - db/migrations/2026-06-02-notification-tables.sql
-#   - db/migrations/2026-06-02-notification-advisory-lock.sql
+# Apply the single canonical schema file with the InsForge CLI:
+#   npx @insforge/cli db import db/schema.sql
+# It is fully idempotent (CREATE TABLE IF NOT EXISTS, CREATE OR REPLACE
+# FUNCTION, DO blocks for ALTERs). The legacy per-feature files in
+# db/legacy/ are NOT runnable and exist for git history only — see
+# db/legacy/README.md.
 
 # 5. Run
 npm run dev
@@ -101,8 +101,9 @@ lib/                  Server-side library code (non-React)
   apify.ts            (legacy, unused)
 
 db/                   SQL migrations
-  migration.sql       The 7 base tables
-  migrations/         Per-feature migrations
+  schema.sql          Canonical idempotent schema (10 tables, RLS, RPCs)
+  ER.md               Mermaid ER diagram of schema.sql
+  legacy/             Superseded SQL files — DO NOT RUN (see legacy/README.md)
 
 types/index.ts        Shared TypeScript types
 

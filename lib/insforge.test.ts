@@ -164,4 +164,14 @@ describe('listRoomsWithStats — MEDIUM-4 regression (O(1) PostgREST round-trips
     expect(jobsCalls[0]).toContain('limit=5000');
     expect(jobsCalls[0]).not.toContain('tracked_page_id=eq.');
   });
+
+  it('applies the owner filter to the projects query before the 100-room limit', async () => {
+    mocks.from.mockImplementation(routeFixture(makeFixture(2)));
+    await listRoomsWithStats('user-1');
+
+    const projectCall = String(mocks.from.mock.calls[0][0]);
+    expect(projectCall).toContain('projects?');
+    expect(projectCall).toContain('owner_id=eq.user-1');
+    expect(projectCall).toContain('limit=100');
+  });
 });

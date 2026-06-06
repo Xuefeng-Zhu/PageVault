@@ -11,6 +11,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'node:crypto';
 
 // Load .env.local
 function loadEnv() {
@@ -237,7 +238,7 @@ async function uploadToBox(items: any[]): Promise<{ folderId: string; fileId: st
 async function storeSnapshot(trackedPageId: string, fileId: string, item: any): Promise<string> {
   const now = new Date().toISOString();
   const contentText = item.text || item.markdown || '';
-  const contentHash = require('crypto').createHash('sha256').update(contentText).digest('hex');
+  const contentHash = createHash('sha256').update(contentText).digest('hex');
   
   // Create a snapshot job first
   const jobResult = await sdk.database.from('snapshot_jobs').insert([{

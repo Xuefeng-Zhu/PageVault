@@ -42,6 +42,10 @@ If you're new to PageVault, read in this order:
 - **[LLM_MODEL_RESEARCH.md](LLM_MODEL_RESEARCH.md)** — the model-selection
   research behind the `lib/scan.ts` analyzer. Read this if you're tuning
   prompts, swapping models, or trying to understand the cascade architecture.
+- **[runbook.md](runbook.md)** — the "what do I do when X breaks" doc.
+  Topology, deploy procedure, rollback per layer, common errors, on-call
+  posture, full DR runbook, secret rotation, incident response checklist.
+  Read this before paging anyone.
 - **[audits/2026-06-02-codebase-audit.md](audits/2026-06-02-codebase-audit.md)**
   — the security and maintainability audit. Every finding has a risk rating and
   a remediation plan. Several findings are already fixed in

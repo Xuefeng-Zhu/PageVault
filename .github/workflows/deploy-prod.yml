@@ -1,0 +1,237 @@
+name: deploy-prod
+
+# Deploy to production on a `v*` git tag, gated by a manual approval.
+#
+# Triggers on:
+#   - push of a tag matching `v*` (e.g. v0.1.0, v1.2.3-rc.1)
+#
+# Flow:
+#   1. CI must be green for the tagged commit (we don't re-run CI
+#      here; the tag was cut from main, which has branch protection
+#      requiring the `ci / build` job to pass).
+#   2. Build the app with `next build`.
+#   3. **Manual approval gate** via the `production` GitHub
+#      Environment. The job pauses in the "Waiting" state until a
+#      maintainer with access to the environment clicks "Approve".
+#   4. `vercel deploy --prod` to the production URL.
+#   5. Smoke-test the deployed URL.
+#   6. Post a commit status and a deploy marker.
+#
+# Required GitHub Environment setup (do this once in the GitHub UI):
+#   1. Repo -> Settings -> Environments -> New environment -> "production"
+#   2. Required reviewers: add the on-call maintainers. Each one will
+#      be paged when a prod deploy is awaiting approval.
+#   3. (Optional) Add deployment branch policy: only allow tags
+#      matching `v*` (a branch rule won't work for tags, so the
+#      workflow's own `on: push: tags:` filter is the source of
+#      truth).
+#
+# Required secrets (same as deploy-staging.yml):
+#   VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
+#
+# How to cut a release:
+#   1. Make sure main is green and you have approval from a code owner.
+#   2. Bump the version: `npm version 0.1.0 --no-git-tag-version`
+#      (or edit package.json by hand for a doc-only release).
+#   3. Commit: `git commit -am "chore(release): 0.1.0"`
+#   4. Tag:   `git tag -a v0.1.0 -m "Release 0.1.0"`
+#   5. Push:  `git push origin main --follow-tags`
+#   6. Watch the workflow run. Approve when the gate appears.
+#   7. Smoke-test the production URL by hand.
+#
+# Rollback procedure is in docs/runbook.md.
+
+concurrency:
+  # The production deploy is serial — no two prod deploys in flight
+  # at once. cancel-in-progress is FALSE: if you push v0.1.1 while
+  # v0.1.0 is still being approved, the new one must wait. That is
+  # intentional — silently cancelling a prod deploy is a footgun.
+  group: deploy-prod
+  cancel-in-progress: false
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  statuses: write
+
+jobs:
+  deploy:
+    name: Deploy to Vercel production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Always deploy the tagged commit, not a later commit on
+          # the same ref. Without this, a tag re-pushed after a
+          # force-push would pick up the latest main.
+          ref: ${{ github.ref }}
+
+      - name: Verify tag is well-formed
+        # Belt-and-braces. The `on: push: tags: ["v*"]` already
+        # gates this, but a typo in a tag push (e.g. v1.2 vs v.1.2)
+        # is the kind of thing you'd want to catch with a friendly
+        # error rather than a half-deployed prod.
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "Deploying tag: $TAG"
+          if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$'; then
+            echo "::error::Tag '$TAG' is not semver-shaped (expected vX.Y.Z or vX.Y.Z-rc.N)"
+            exit 1
+          fi
+          echo "Tag is well-formed."
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app
+        # Same rationale as deploy-staging: catch build-time errors
+        # locally so we never call Vercel with a broken commit.
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+          NEXTAUTH_SECRET: "ci-placeholder-nextauth-secret-32-chars"
+          INSFORGE_API_URL: "https://ci-placeholder.insforge.app"
+          INSFORGE_SERVICE_ROLE_KEY: "ci-placeholder-service-role-key-32-chars"
+          INSFORGE_ANON_KEY: "ci-placeholder-anon-key-32-chars"
+          NEXT_PUBLIC_INSFORGE_URL: "https://ci-placeholder.insforge.app"
+          NEXT_PUBLIC_INSFORGE_ANON_KEY: "ci-placeholder-anon-key-32-chars"
+          CRON_SHARED_SECRET: "ci-placeholder-cron-secret-32-chars"
+          INSFORGE_DEV_DEMO_AUTH: "1"
+          CI: "1"
+
+      - name: Install Vercel CLI
+        run: npm install --no-save vercel@latest
+
+      - name: Verify Vercel secrets are present
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          : "${VERCEL_TOKEN:?VERCEL_TOKEN is required}"
+          : "${VERCEL_ORG_ID:?VERCEL_ORG_ID is required}"
+          : "${VERCEL_PROJECT_ID:?VERCEL_PROJECT_ID is required}"
+          echo "Vercel secrets are present."
+
+      - name: Deploy to Vercel production
+        # The environment: production block above pauses the job
+        # for manual approval. Steps below this point do not run
+        # until a reviewer clicks "Approve" in the GitHub UI.
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -o pipefail
+          OUTPUT=$(npx vercel deploy --prod --yes --confirm \
+            --token "$VERCEL_TOKEN" 2>&1)
+          echo "$OUTPUT"
+          URL=$(echo "$OUTPUT" | grep -Eo 'https://[a-z0-9.-]+vercel\.app' | tail -n 1)
+          if [ -n "$URL" ]; then
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Production deploy"
+              echo ""
+              echo "- URL: $URL"
+              echo "- Tag: ${GITHUB_REF#refs/tags/}"
+              echo "- Commit: $GITHUB_SHA"
+              echo "- Approver: $GITHUB_ACTOR (workflow), reviewer(s) in GitHub Environment"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Could not parse Vercel production URL from output"
+            exit 1
+          fi
+
+      - name: Smoke-test production
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "No URL captured, skipping smoke test"
+            exit 0
+          fi
+          echo "Smoke-testing $URL"
+          # Same checks as deploy-staging but on the prod URL.
+          HOME_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/")
+          echo "  /              -> $HOME_STATUS"
+          test "$HOME_STATUS" = "200" || { echo "::error::Home page returned $HOME_STATUS"; exit 1; }
+          LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/login")
+          echo "  /login         -> $LOGIN_STATUS"
+          test "$LOGIN_STATUS" = "200" || { echo "::error::Login page returned $LOGIN_STATUS"; exit 1; }
+          DASH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/dashboard")
+          echo "  /dashboard     -> $DASH_STATUS  (expected 307)"
+          test "$DASH_STATUS" = "307" || { echo "::error::Dashboard returned $DASH_STATUS, expected 307"; exit 1; }
+          ROOMS_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/api/rooms")
+          echo "  /api/rooms     -> $ROOMS_STATUS  (expected 401)"
+          test "$ROOMS_STATUS" = "401" || { echo "::error::api/rooms returned $ROOMS_STATUS, expected 401"; exit 1; }
+          # Cron worker is the highest-leverage secret gate. A
+          # regression here means anyone can fire scans.
+          CRON_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$URL/api/cron/notification-worker")
+          echo "  /api/cron/notification-worker (no secret) -> $CRON_STATUS  (expected 401)"
+          test "$CRON_STATUS" = "401" || { echo "::error::cron worker returned $CRON_STATUS, expected 401"; exit 1; }
+          echo "All smoke checks passed."
+
+      - name: Post deploy commit status
+        if: always()
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            STATE="success"
+            DESC="Deployed to production"
+          else
+            STATE="failure"
+            DESC="Production deploy failed"
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "$(jq -nc \
+              --arg state "$STATE" \
+              --arg desc "$DESC" \
+              --arg url "${URL:-}" \
+              --arg ctx "deploy/prod" \
+              '{state: $state, description: $desc, target_url: (if $url == "" then null else $url end), context: $ctx}')"
+
+      - name: Create GitHub release
+        if: success()
+        # Best-effort: a maintainer usually drafts the release notes
+        # by hand. This creates an empty release draft tagged to the
+        # commit so the workflow leaves a paper trail.
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            try {
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tag,
+                name: tag,
+                draft: true,
+                generate_release_notes: true,
+              });
+              core.info(`Created draft release for ${tag}`);
+            } catch (err) {
+              // Release may already exist (re-running the workflow
+              // after a failed approval). That's fine.
+              core.warning(`Release creation failed (likely already exists): ${err.message}`);
+            }

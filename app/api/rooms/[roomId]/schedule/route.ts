@@ -263,13 +263,13 @@ export async function POST(
     if (!process.env.CRON_SHARED_SECRET) {
       return NextResponse.json({ error: { code: 'NO_SECRET', message: 'CRON_SHARED_SECRET not configured on server' } }, { status: 500 });
     }
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL;
     // The InsForge schedule's --url must point at a host that
-    // InsForge's cloud scheduler can actually reach. Only require
-    // it when enabling/registering a schedule; disabling can delete
-    // the existing schedule and update the DB row without a callback
-    // URL.
-    if (enabled && !appUrl) {
+    // InsForge's cloud scheduler can actually reach. Falling back
+    // to localhost silently produces a schedule that InsForge can
+    // never invoke. Require the env var to be set; if it's not,
+    // log and return 500 so the operator knows to configure it.
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL;
+    if (!appUrl) {
       console.warn(
         'NEXT_PUBLIC_APP_URL is not set; cannot auto-register InsForge schedule for room',
         roomId,
@@ -279,19 +279,13 @@ export async function POST(
         { status: 500 },
       );
     }
-    if (enabled && appUrl && process.env.NODE_ENV !== 'development' && isLocalhostUrl(appUrl)) {
-      return NextResponse.json(
-        { error: { code: 'INTERNAL_ERROR', message: 'NEXT_PUBLIC_APP_URL must be a public URL for InsForge schedules' } },
-        { status: 500 },
-      );
-    }
     const name = `pagevault-room-${roomId}`;
     const existingId = await findExistingScheduleId(name);
 
     let insforgeScheduleId: string | null = null;
     if (enabled) {
       insforgeScheduleId = await createOrUpdateInsforgeSchedule(
-        existingId, name, cronExpression, appUrl!, process.env.CRON_SHARED_SECRET, roomId,
+        existingId, name, cronExpression, appUrl, process.env.CRON_SHARED_SECRET, roomId,
       );
     } else if (existingId) {
       try {

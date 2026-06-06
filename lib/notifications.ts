@@ -4,7 +4,7 @@
 // drainOutbox() to actually send the webhooks.
 import { getInsforgeClient, getInsforgeBaseUrl } from './env';
 import {
-  listEnabledSubscriptions,
+  listEnabledSubscriptionsForProject,
   getSubscription,
   type NotificationSubscription,
 } from './insforge';
@@ -101,12 +101,20 @@ async function dbRpc(path: string, body: unknown): Promise<RpcResult> {
 }
 
 // Called from lib/scan.ts after the ai_explanations insert.
+//
+// MEDIUM-2 fix (docs/qa-bug-hunt.md): the previous version called
+// listEnabledSubscriptions() (an unfiltered `enabled=eq.true` query)
+// and then filtered by projectId in JS, transferring every enabled
+// subscription in the database on every scan. We now use
+// listEnabledSubscriptionsForProject which pushes the project_id filter
+// into the PostgREST query, so the DB returns only the rows for this
+// room. See lib/insforge.ts:listEnabledSubscriptionsForProject for the
+// regression note and the URL-encoding rationale.
 export async function enqueueNotification(opts: {
   aiExplanationId: string;
   projectId: string;
 }): Promise<{ enqueued: number }> {
-  const all = await listEnabledSubscriptions();
-  const subs = all.filter((s) => s.projectId === opts.projectId);
+  const subs = await listEnabledSubscriptionsForProject(opts.projectId);
   if (subs.length === 0) return { enqueued: 0 };
   const rows = subs.map((s) => ({
     subscription_id: s.id,

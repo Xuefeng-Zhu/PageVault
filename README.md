@@ -1,5 +1,9 @@
 # PageVault — AI Memory Layer for the Web
 
+[![CI](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/ci.yml/badge.svg)](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/ci.yml)
+[![Deploy staging](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/deploy-staging.yml/badge.svg)](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/deploy-staging.yml)
+[![Deploy production](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/deploy-prod.yml/badge.svg)](https://github.com/Xuefeng-Zhu/PageVault/actions/workflows/deploy-prod.yml)
+
 > **Apify captures the web. Box stores the memory. AI explains the change.**
 
 PageVault is a Next.js (App Router) + TypeScript full-stack application that monitors public web pages using Apify, stores every snapshot and report as evidence in Box, persists metadata in an Insforge Postgres backend, and uses an OpenAI-compatible LLM to explain what changed and why it matters.
@@ -272,7 +276,18 @@ On any failure after step 1, the run is marked `failed` with an error message.
 
 ## Database Schema
 
-See `db/migration.sql` for the full schema. Five tables:
+The canonical, idempotent PageVault schema lives in [`db/schema.sql`](db/schema.sql)
+(10 tables, RLS policies on user-scoped tables, RPC helpers, audit columns).
+See [`db/ER.md`](db/ER.md) for the Mermaid ER diagram. The legacy SQL files
+(`db/migration.sql` and the per-feature add-ons) are preserved at
+`db/legacy/` for `git blame` and are **not** runnable — see
+[`db/legacy/README.md`](db/legacy/README.md) for the supersession note.
+
+> **Note:** the table list below predates the canonical schema and uses
+> older working names. For the authoritative table inventory, RLS
+> policies, and column definitions, always read `db/schema.sql` directly.
+> Tracking issue: bring this README section up to date with the canonical
+> schema in a follow-up doc-correctness pass.
 
 - `memory_rooms` — the rooms you create
 - `watched_urls` — URLs being monitored per room

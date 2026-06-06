@@ -42,6 +42,8 @@ coverage/
 # Cache
 .cache/
 .eslintcache
+__pycache__/
+*.pyc
 
 # Vercel
 .vercel

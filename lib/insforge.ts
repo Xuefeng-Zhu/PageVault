@@ -231,6 +231,40 @@ function readOwnerId(snapshotsField: unknown): string | null | undefined {
   return undefined; // malformed shape
 }
 
+function readProjectFromSnapshot(snapshotsField: unknown): Record<string, unknown> | null | undefined {
+  const snap = Array.isArray(snapshotsField) ? snapshotsField[0] : snapshotsField;
+  if (!snap || typeof snap !== 'object') return null;
+  const snapObj = snap as { tracked_pages?: unknown };
+
+  const trackedPages = snapObj.tracked_pages;
+  const tp = Array.isArray(trackedPages) ? trackedPages[0] : trackedPages;
+  if (!tp || typeof tp !== 'object') return null;
+  const tpObj = tp as { projects?: unknown };
+
+  const projects = tpObj.projects;
+  const project = Array.isArray(projects) ? projects[0] : projects;
+  if (!project || typeof project !== 'object') return null;
+  return project as Record<string, unknown>;
+}
+
+function readProjectId(snapshotsField: unknown): string | null | undefined {
+  const project = readProjectFromSnapshot(snapshotsField);
+  if (project === null || project === undefined) return project;
+  const projectId = project.id;
+  if (typeof projectId === 'string') return projectId;
+  if (projectId === null) return null;
+  return undefined;
+}
+
+function readTrackedPageId(snapshotsField: unknown): string | null | undefined {
+  const snap = Array.isArray(snapshotsField) ? snapshotsField[0] : snapshotsField;
+  if (!snap || typeof snap !== 'object') return null;
+  const trackedPageId = (snap as { tracked_page_id?: unknown }).tracked_page_id;
+  if (typeof trackedPageId === 'string') return trackedPageId;
+  if (trackedPageId === null) return null;
+  return undefined;
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -270,7 +304,7 @@ export async function createRoom(input: NewRoom): Promise<MemoryRoom> {
   };
 }
 
-export async function listRoomsWithStats(): Promise<RoomWithStats[]> {
+export async function listRoomsWithStats(ownerId?: string): Promise<RoomWithStats[]> {
   // Real mode: query projects + compute stats from related tables
   const projects = await sdkQuery<{
     id: string;
@@ -280,6 +314,7 @@ export async function listRoomsWithStats(): Promise<RoomWithStats[]> {
     created_at: string;
   }>('public.projects', {
     select: 'id,owner_id,name,box_root_folder_id,created_at',
+    filters: ownerId ? `owner_id=eq.${ownerId}` : '',
     order: 'created_at.desc',
     limit: 100,
   });
@@ -542,7 +577,7 @@ async function getChangeInternal(
   // but the TS check is the source of truth for the security boundary.
   const select =
     'id,snapshot_id,previous_snapshot_id,output_json,confidence,created_at,' +
-    'snapshots!snapshot_id(tracked_page_id,change_type,tracked_pages!tracked_page_id(project_id,projects!project_id(owner_id)))';
+    'snapshots!snapshot_id(tracked_page_id,change_type,tracked_pages!tracked_page_id(project_id,projects!project_id(id,owner_id)))';
   const filters = `id=eq.${changeId}`;
   const rows = await sdkQuery<{
     id: string; snapshot_id: string; previous_snapshot_id: string | null;
@@ -591,10 +626,13 @@ async function getChangeInternal(
   // of undefined. Read both shapes; prefer before/after.
   const rawEvidence = Array.isArray(output.evidence) ? output.evidence as unknown[] : [];
   const evidence = rawEvidence.map((e) => normalizeEvidenceItem(e));
+  const roomId = readProjectId(row.snapshots);
+  const watchedUrlId = readTrackedPageId(row.snapshots);
+
   return {
     id: String(row.id),
-    roomId: '',
-    watchedUrlId: row.tracked_page_id ?? '',
+    roomId: roomId ?? '',
+    watchedUrlId: watchedUrlId ?? row.tracked_page_id ?? '',
     previousSnapshotId: row.previous_snapshot_id ? String(row.previous_snapshot_id) : null,
     currentSnapshotId: row.snapshot_id ? String(row.snapshot_id) : null,
     severity: (output.severity ?? 'low') as ChangeAnalysis['severity'],
@@ -901,30 +939,82 @@ export async function getSubscription(id: string): Promise<NotificationSubscript
   };
 }
 
+// Shared column list and row mapper for notification_subscriptions
+// queries. Used by listEnabledSubscriptions, listEnabledSubscriptionsForProject
+// (MEDIUM-2 fix), and listSubscriptionsForRoom so they all produce the same
+// NotificationSubscription shape and pull the same column set.
+const SUBSCRIPTION_COLUMNS =
+  'id,project_id,channel,config,severity_threshold,enabled,consecutive_failures,failure_window_start,last_triggered_at,last_failure_at,last_failure_error,created_at,updated_at';
+
+type SubscriptionRow = {
+  id: string;
+  project_id: string;
+  channel: string;
+  config: { url: string; secret?: string };
+  severity_threshold: 'low' | 'medium' | 'high';
+  enabled: boolean;
+  consecutive_failures: number;
+  failure_window_start: string | null;
+  last_triggered_at: string | null;
+  last_failure_at: string | null;
+  last_failure_error: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function mapSubscriptionRow(r: unknown): NotificationSubscription {
+  const row = r as SubscriptionRow;
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    channel: 'webhook' as const,
+    config: row.config,
+    severityThreshold: row.severity_threshold,
+    enabled: row.enabled,
+    consecutiveFailures: row.consecutive_failures,
+    failureWindowStart: row.failure_window_start,
+    lastTriggeredAt: row.last_triggered_at,
+    lastFailureAt: row.last_failure_at,
+    lastFailureError: row.last_failure_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export async function listEnabledSubscriptions(): Promise<NotificationSubscription[]> {
   const { data, error } = await getInsforgeClient()
     .database
     .from('notification_subscriptions?enabled=eq.true')
-    .select('id,project_id,channel,config,severity_threshold,enabled,consecutive_failures,failure_window_start,last_triggered_at,last_failure_at,last_failure_error,created_at,updated_at');
+    .select(SUBSCRIPTION_COLUMNS);
   if (error) {
     console.error('listEnabledSubscriptions error:', error.message);
     return [];
   }
-  return (data || []).map((r) => ({
-    id: (r as { id: string }).id,
-    projectId: (r as { project_id: string }).project_id,
-    channel: 'webhook' as const,
-    config: (r as { config: { url: string; secret?: string } }).config,
-    severityThreshold: (r as { severity_threshold: 'low' | 'medium' | 'high' }).severity_threshold,
-    enabled: (r as { enabled: boolean }).enabled,
-    consecutiveFailures: (r as { consecutive_failures: number }).consecutive_failures,
-    failureWindowStart: (r as { failure_window_start: string | null }).failure_window_start,
-    lastTriggeredAt: (r as { last_triggered_at: string | null }).last_triggered_at,
-    lastFailureAt: (r as { last_failure_at: string | null }).last_failure_at,
-    lastFailureError: (r as { last_failure_error: string | null }).last_failure_error,
-    createdAt: (r as { created_at: string }).created_at,
-    updatedAt: (r as { updated_at: string }).updated_at,
-  }));
+  return (data || []).map(mapSubscriptionRow);
+}
+
+// MEDIUM-2 fix (docs/qa-bug-hunt.md): the old listEnabledSubscriptions()
+// pulled every enabled subscription in the database back into Node, and
+// enqueueNotification() then filtered by projectId in JS. For 10k
+// subscriptions across 1k rooms, every scan in any room transferred 10k
+// rows over the network, took ~3s, and blocked the scan worker. This
+// pushes the project_id filter into the PostgREST query so the database
+// returns only the rows for the room we care about. The project_id is
+// URL-encoded so a room id containing `&` or `=` cannot inject extra
+// filter fragments.
+export async function listEnabledSubscriptionsForProject(
+  projectId: string,
+): Promise<NotificationSubscription[]> {
+  const safeProjectId = encodeURIComponent(projectId);
+  const { data, error } = await getInsforgeClient()
+    .database
+    .from(`notification_subscriptions?enabled=eq.true&project_id=eq.${safeProjectId}`)
+    .select(SUBSCRIPTION_COLUMNS);
+  if (error) {
+    console.error('listEnabledSubscriptionsForProject error:', error.message);
+    return [];
+  }
+  return (data || []).map(mapSubscriptionRow);
 }
 
 
