@@ -311,10 +311,32 @@ function isLiteralIPv6(host: string): boolean {
   return /^[0-9a-fA-F:.]{2,}$/.test(host);
 }
 
+// Direct HTTP fetch timeout. A user-supplied tracked page could point at
+// a server that accepts the TCP connection but never sends a response
+// (a "slowloris" target, an IP that's actually a captive portal holding
+// the socket open, etc.). Without a timeout, the next.js worker would be
+// pinned indefinitely — the scan queue would fill up and never drain.
+// Default is 10s; operators can override per-environment with the
+// PAGEVAULT_FETCH_TIMEOUT_MS env var (e.g. 2000 in tests, 30000 over a
+// slow WAN). The same abort signal applies to every hop in the
+// redirect chain so the total wall-clock for one crawl is bounded.
+const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+function getFetchTimeoutMs(): number {
+  const raw = process.env.PAGEVAULT_FETCH_TIMEOUT_MS;
+  if (!raw) return DEFAULT_FETCH_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_FETCH_TIMEOUT_MS;
+  return parsed;
+}
+
 // Direct HTTP fetch as a baseline crawler. Tries the Apify run-sync API
 // directly if creds are present, otherwise falls back to a plain fetch()
 // with HTML→Markdown extraction.
-async function crawlOne(url: string): Promise<{
+//
+// Exported (not just module-local) so unit tests in lib/scan.test.ts
+// can drive the timeout / abort path with a controlled fetch mock
+// without standing up the full runScan() / DB / Apify stack.
+export async function crawlOne(url: string): Promise<{
   url: string; title: string; markdown: string; text: string; capturedAt: string;
   apifyRunId: string | null;
 }> {
@@ -373,9 +395,19 @@ async function crawlOne(url: string): Promise<{
   // hostname. This is the standard "host-header pinning" pattern
   // for SSRF defenses.
   const MAX_REDIRECTS = 5;
+  const timeoutMs = getFetchTimeoutMs();
+  // Single AbortController covers the entire redirect chain — a target
+  // that hangs on hop 1 OR a chain of slow redirects that together
+  // exceed the budget both get cut off at timeoutMs. The timer is
+  // unref'd so a still-pending abort can't keep the event loop alive
+  // past the caller's await.
+  const abortController = new AbortController();
+  const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
+  timeoutHandle.unref?.();
   let currentUrl = url;
   let currentHostHeader: string | null = null;
   let r: Response | null = null;
+  try {
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     // SSRF guard + DNS-rebinding pin. resolveAndValidateCrawlUrl
     // returns the validated URL and the IP(s) the hostname resolves
@@ -401,6 +433,11 @@ async function crawlOne(url: string): Promise<{
         // to the IP).
         ...(currentHostHeader ? { Host: currentHostHeader } : {}),
       },
+      // HIGH-4: AbortController timeout. A target that accepts the
+      // connection but never sends a response (slowloris, captive
+      // portal, etc.) used to pin a scan worker forever. The same
+      // signal applies to every hop in the redirect chain.
+      signal: abortController.signal,
       redirect: 'manual',
     });
     // Non-redirect: we have the final response.
@@ -423,6 +460,24 @@ async function crawlOne(url: string): Promise<{
     // for the new hostname.
     currentUrl = new URL(location, currentUrl).toString();
     currentHostHeader = null;
+  }
+  } catch (err) {
+    // Convert the AbortError from the timeout into a deterministic,
+    // greppable error message. The original DOMException is preserved
+    // on .cause for callers that want to inspect it.
+    if (err instanceof Error && (err.name === 'AbortError' || abortController.signal.aborted)) {
+      const e = new Error(`Fetch of ${url} aborted after ${timeoutMs}ms (PAGEVAULT_FETCH_TIMEOUT_MS)`);
+      e.name = 'FetchTimeoutError';
+      (e as Error & { cause?: unknown }).cause = err;
+      throw e;
+    }
+    throw err;
+  } finally {
+    // Clear the timeout in every exit path — success, error, or
+    // abort. Without this, the timer would keep the event loop
+    // alive until it fires, and on success it would still call
+    // abort() on a controller that's no longer in use.
+    clearTimeout(timeoutHandle);
   }
   if (!r) {
     throw new Error(`Failed to fetch ${url}: too many redirects (limit ${MAX_REDIRECTS})`);

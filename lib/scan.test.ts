@@ -8,7 +8,7 @@
 // before any outbound fetch) which rejects URLs whose hostname resolves
 // to a private / loopback / link-local / cloud-metadata / multicast /
 // reserved address.
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { isBlockedAddress } from './scan';
 
 // The URL-level tests (validateCrawlUrl) need to control what dns.lookup
@@ -217,5 +217,156 @@ describe('validateCrawlUrl (DNS rebinding defense)', () => {
     const v = await loadValidateCrawlUrl();
     await expect(v('http://nxdomain.example.com/'))
       .rejects.toThrow(/DNS lookup failed/i);
+  });
+});
+
+describe('crawlOne (direct fetch — AbortController timeout, HIGH-4 part 2)', () => {
+  // The HIGH-4 acceptance criteria require that a slow target be
+  // aborted within the configured timeout (default 10s, overridable
+  // via PAGEVAULT_FETCH_TIMEOUT_MS). crawlOne is not exported from
+  // the production module, so we re-import via the same import the
+  // production code uses and the test file already exercises.
+  //
+  // We mock globalThis.fetch because crawlOne uses the global
+  // fetch() (Next.js runtime). vi.useRealTimers + a real setTimeout
+  // gives us a deterministic wall-clock bound.
+  let originalFetch: typeof globalThis.fetch;
+  let originalTimeoutEnv: string | undefined;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    originalTimeoutEnv = process.env.PAGEVAULT_FETCH_TIMEOUT_MS;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (originalTimeoutEnv === undefined) {
+      delete process.env.PAGEVAULT_FETCH_TIMEOUT_MS;
+    } else {
+      process.env.PAGEVAULT_FETCH_TIMEOUT_MS = originalTimeoutEnv;
+    }
+  });
+
+  it('aborts a slow target within the configured timeout (50ms test budget)', async () => {
+    // 50ms is well under the 10s default — guarantees this test
+    // fails loudly if the abort plumbing is removed.
+    process.env.PAGEVAULT_FETCH_TIMEOUT_MS = '50';
+    dnsBehavior.responses.set('slow.example.com', ['93.184.216.34']);
+
+    // Fetch that never resolves — simulates a slowloris target /
+    // captive portal. The AbortController signal passed in by
+    // crawlOne should fire within 50ms and reject the promise.
+    const fetchSpy = vi.fn((_input: unknown, _init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        // Use the signal so we mirror the real fetch() contract —
+        // when the caller aborts, this promise rejects with the
+        // same AbortError the production fetch would throw.
+        const init = _init as RequestInit | undefined;
+        const signal = init?.signal;
+        if (signal) {
+          if (signal.aborted) {
+            const e = new Error('aborted');
+            e.name = 'AbortError';
+            reject(e);
+            return;
+          }
+          signal.addEventListener('abort', () => {
+            const e = new Error('aborted');
+            e.name = 'AbortError';
+            reject(e);
+          });
+        }
+      }),
+    );
+    globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+
+    const { crawlOne } = await import('./scan');
+    const start = Date.now();
+    let err: unknown;
+    try {
+      await crawlOne('https://slow.example.com/');
+    } catch (e) {
+      err = e;
+    }
+    const elapsed = Date.now() - start;
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).name).toBe('FetchTimeoutError');
+    expect((err as Error).message).toMatch(/aborted after 50ms/);
+    // The signal is the only mechanism that can produce this
+    // rejection, so the fetch must have been called with a signal
+    // (defense: catches regressions where someone removes signal:).
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const initArg = fetchSpy.mock.calls[0][1] as RequestInit | undefined;
+    expect(initArg?.signal).toBeDefined();
+    // Wall-clock bound: must be close to the 50ms budget (allow
+    // generous slack for test env jitter, but not 10s).
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  it('does not abort a fast target (a normal 200 OK still parses)', async () => {
+    process.env.PAGEVAULT_FETCH_TIMEOUT_MS = '5000';
+    dnsBehavior.responses.set('fast.example.com', ['93.184.216.34']);
+
+    // Normal HTML response — no hang, no abort.
+    const html =
+      '<!doctype html><html><head><title>Hello</title></head>' +
+      '<body><p>World</p></body></html>';
+    const response = new Response(html, {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    });
+    const fetchSpy = vi.fn((_input: unknown, _init?: RequestInit) =>
+      Promise.resolve(response),
+    );
+    globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+
+    const { crawlOne } = await import('./scan');
+    const result = await crawlOne('https://fast.example.com/');
+    expect(result.title).toBe('Hello');
+    expect(result.markdown).toContain('World');
+    expect(result.apifyRunId).toBeNull();
+  });
+
+  it('falls back to the 10s default when PAGEVAULT_FETCH_TIMEOUT_MS is invalid (negative / non-numeric)', async () => {
+    // The first test above already verifies the abort path with a
+    // tiny 50ms budget. This test verifies the env-var parsing
+    // path: an invalid value should be ignored and the 10s default
+    // used. We assert this indirectly by reading the value off the
+    // FetchTimeoutError message (the message includes the effective
+    // timeoutMs). We trigger the abort by calling the signal abort
+    // ourselves to avoid waiting 10s.
+    process.env.PAGEVAULT_FETCH_TIMEOUT_MS = 'not-a-number';
+    dnsBehavior.responses.set('medium.example.com', ['93.184.216.34']);
+
+    const fetchSpy = vi.fn((_input: unknown, _init?: RequestInit) => {
+      const init = _init as RequestInit | undefined;
+      const signal = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        if (signal) {
+          signal.addEventListener('abort', () => {
+            const e = new Error('aborted');
+            e.name = 'AbortError';
+            reject(e);
+          });
+        }
+      });
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+
+    const { crawlOne } = await import('./scan');
+    // Force the abort immediately (don't wait for the 10s default)
+    // so the test doesn't run for 10 seconds.
+    const pending = crawlOne('https://medium.example.com/');
+    await new Promise((r) => setTimeout(r, 5));
+    const initArg = fetchSpy.mock.calls[0]?.[1] as RequestInit | undefined;
+    const signal = initArg?.signal as AbortSignal | undefined;
+    expect(signal).toBeDefined();
+    // Calling .abort() on a vi-cloned AbortSignal can fail under
+    // jsdom-vitest, so dispatch the abort event directly. The
+    // production code listens for the event via addEventListener
+    // (matching the fetch() contract), so this is equivalent.
+    signal?.dispatchEvent(new Event('abort'));
+    await expect(pending).rejects.toThrow(/aborted after 10000ms/);
   });
 });
