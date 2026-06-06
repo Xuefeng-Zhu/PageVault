@@ -1,36 +1,20 @@
 // Live scan orchestration for PageVault.
 //
-// Pipeline (per watched URL — HIGH-5: one snapshot_jobs row per URL, not per
-// room):
-//   1. Load the room's active watched URLs from InsForge Postgres (no cap —
-//      a room with 51+ URLs scans all of them; HIGH-5)
-//   2. For each URL, create one snapshot_jobs row parented to that URL's
-//      tracked_page_id (HIGH-5: was previously reused across URLs and
-//      parented to watchedUrls[0].id, which broke the FK when the first
-//      page was removed)
-//   3. Fetch the page (direct HTTP fetch, or Apify if creds set)
-//   4. SHA-256 hash the fetched markdown; if unchanged from previous snapshot,
+// Pipeline:
+//   1. Load the room's watched URLs from InsForge Postgres
+//   2. For each URL, fetch the page (direct HTTP fetch, or Apify if creds set)
+//   3. SHA-256 hash the fetched markdown; if unchanged from previous snapshot,
 //      skip LLM call (cost-saver per design §3.3)
-//   5. Call the LLM via OpenAI-compatible API (InsForge AI gateway → OpenRouter
+//   4. Call the LLM via OpenAI-compatible API (InsForge AI gateway → OpenRouter
 //      when OPENAI_BASE_URL is set)
-//   6. Insert snapshot, ai_explanations; mark the per-page job succeeded
-//   7. Upload raw markdown to InsForge Storage for evidence chain
+//   5. Insert snapshot_job (running → succeeded), snapshot, ai_explanations
+//   6. Upload raw markdown to InsForge Storage for evidence chain
 //
 // Idempotency: snapshot_jobs uses `trigger_type` + `apify_run_id` semantics; we
-// generate a unique `jobId` per (run, page) so re-running won't double-insert.
-// The previous-snapshot lookup is by (tracked_page_id, observed_at desc).
-//
-// Synthetic scanRunId: the API caller (POST /api/rooms/[id]/scan) gets a
-// single ScanSummary.scanRunId back. We mint a synthetic run-level UUID and
-// return it, but the per-page DB rows each get their own snapshot_jobs.id
-// (snapshots.job_id references the per-page job, not the synthetic id). The
-// synthetic id is a UI handle only — it does not appear in any DB column.
+// generate a unique `jobId` per run. The previous-snapshot lookup is by
+// (tracked_page_id, observed_at desc) so re-running won't double-insert.
 import { createHash } from 'node:crypto';
-import dns from 'node:dns/promises';
-import http from 'node:http';
-import https from 'node:https';
 import { enqueueNotification } from './notifications';
-import { sanitizeMarkdown, sanitizeTitle } from './sanitize';
 import { newId } from './ids';
 import type {
   MemoryRoom,
@@ -44,14 +28,7 @@ import type {
 // Lightweight HTML→Markdown-ish extractor. We avoid pulling in a heavy
 // readability library — for the Apify-equivalent baseline this is enough:
 // strip tags, drop scripts/styles/nav, collapse whitespace, preserve line breaks.
-//
-// Exported for HIGH-1 regression tests: lib/scan.test.ts exercises the
-// full HTML→sanitized-text flow on adversarial inputs. Callers in
-// production should keep applying `sanitizeTitle` and `sanitizeMarkdown`
-// (lib/sanitize.ts) to the output — `htmlToMarkdown` does most of the
-// HTML-tag stripping already, but the sanitizer is the persistence-
-// layer guarantee and the one the HIGH-1 tests pin.
-export function htmlToMarkdown(html: string): { title: string; markdown: string; text: string } {
+function htmlToMarkdown(html: string): { title: string; markdown: string; text: string } {
   // Extract <title>
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = titleMatch ? titleMatch[1].trim() : '';
@@ -88,293 +65,6 @@ export function htmlToMarkdown(html: string): { title: string; markdown: string;
   return { title, markdown: body, text };
 }
 
-// SSRF guard: validateCrawlUrl rejects URLs that point at internal,
-// private, loopback, link-local, or cloud-metadata addresses before any
-// fetch() is issued. crawlOne() always goes through this first.
-//
-// We block by inspecting the parsed hostname, and (for hostnames that
-// aren't literal IPs) we DNS-resolve and block if *any* returned address
-// is in a denied range. The DNS step defeats classic DNS-rebinding where
-// a public hostname resolves to an internal IP at fetch time.
-//
-// Exported helpers (isBlockedAddress, validateCrawlUrl) are covered by
-// lib/scan.test.ts. They are the public security boundary.
-
-/** True if the address is in any range we refuse to crawl. */
-export function isBlockedAddress(addr: string): boolean {
-  if (!addr) return false;
-  // Normalize IPv4-mapped IPv6 to their v4 form so the v4 blocklist
-  // catches them. Accepts all three common forms:
-  //   ::ffff:127.0.0.1   (dotted-quad; the form new URL() emits for
-  //                       many resolvers)
-  //   ::ffff:7f00:1      (compressed hex; what new URL() emits for
-  //                       the dotted-quad form when the trailing bytes
-  //                       contain leading zeros)
-  //   ::ffff:0:0:7f00:1  (fully expanded)
-  // node's `dns.lookup` returns these in mixed form depending on the
-  // resolver, so we expand the address to its full 8-group form first
-  // (via expandIPv6ForMapping), then detect the ::ffff: prefix and
-  // pull the 32-bit v4 address out of the trailing groups. The dotted-
-  // quad form is handled in a separate case from the hex form.
-  if (addr.includes(':')) {
-    const expanded = expandIPv6ForMapping(addr);
-    // Case 1: trailing dotted-quad in the last group, e.g.
-    //   "0000:0000:0000:0000:0000:0000:ffff:127.0.0.1" (6 leading zeros)
-    //   "0000:0000:0000:0000:0000:ffff:127.0.0.1"     (5 leading zeros,
-    //                                                   the canonical
-    //                                                   "::ffff:127.0.0.1" form)
-    // The `(?:0+:)+` pattern is non-capturing (so the dotted-quad in
-    // group 1 is the only captured group) and matches one or more
-    // `0xxx:` groups (the leading zero run), then requires the literal
-    // `ffff:`. (A plain `^0+:` won't work because regex quantifiers
-    // don't backtrack across colons — each `0+` greedily consumes the
-    // trailing colon of its group, so the next match attempt starts
-    // at the next group's `0`, never at the `f` of `ffff:`.)
-    const dottedMatch = /^(?:0+:)+ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(expanded);
-    if (dottedMatch) {
-      return isBlockedAddress(dottedMatch[1]);
-    }
-    // Case 2: trailing hex form (two 16-bit groups, e.g.
-    //   "0000:0000:0000:0000:0000:ffff:7f00:1"     (compressed)
-    //   "0000:0000:0000:0000:0000:ffff:0:7f00:1"   (expanded with one
-    //                                                     leading zero)
-    // The v4 address is split as `7f00` / `1` = (a, b) where the
-    // dotted form is a.b.c.d and a = 7f, b = 00, c = 00, d = 01.
-    // Both `7f00` and `1` (or `0` / `7f00` in the expanded form) are
-    // captured as non-capturing groups so group 1 / group 2 are
-    // unambiguous.
-    const hexMatch = /^(?:0+:)+ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(expanded);
-    if (hexMatch) {
-      const a = parseInt(hexMatch[1], 16);
-      const b = parseInt(hexMatch[2], 16);
-      const dot = `${(a >> 8) & 0xff}.${a & 0xff}.${(b >> 8) & 0xff}.${b & 0xff}`;
-      return isBlockedAddress(dot);
-    }
-  }
-
-  // IPv6
-  if (addr.includes(':')) {
-    const lc = addr.toLowerCase();
-    if (lc === '::' || lc === '::1') return true;          // unspecified + loopback
-    if (lc.startsWith('fc') || lc.startsWith('fd')) return true; // unique-local fc00::/7
-    if (lc.startsWith('fe8') || lc.startsWith('fe9') ||
-        lc.startsWith('fea') || lc.startsWith('feb')) return true; // link-local fe80::/10
-    if (lc.startsWith('ff')) return true;                  // multicast ff00::/8
-    return false;
-  }
-
-  // IPv4
-  const parts = addr.split('.').map(Number);
-  if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) {
-    return false; // not a parseable IPv4 — let the URL-level validator reject
-  }
-  const [a, b] = parts;
-  if (a === 0) return true;                              // 0.0.0.0/8
-  if (a === 10) return true;                             // 10.0.0.0/8
-  if (a === 127) return true;                            // 127.0.0.0/8 loopback
-  if (a === 169 && b === 254) return true;               // 169.254.0.0/16 link-local (incl. 169.254.169.254)
-  if (a === 172 && b >= 16 && b <= 31) return true;      // 172.16.0.0/12 RFC1918
-  if (a === 192 && b === 168) return true;               // 192.168.0.0/16
-  if (a === 100 && b >= 64 && b <= 127) return true;     // 100.64.0.0/10 CGNAT
-  if (a >= 224 && a <= 239) return true;                 // 224.0.0.0/4 multicast
-  if (a >= 240) return true;                             // 240.0.0.0/4 reserved + 255.255.255.255
-  return false;
-}
-
-/**
- * Validate a URL before we crawl it. Throws on any blocked / malformed URL.
- * The error message intentionally includes the offending host so that
- * operators can debug "why was this URL rejected?" from a single stack
- * line.
- */
-type ValidatedCrawlTarget = {
-  url: string;
-  ips: Array<{ address: string; family: 4 | 6 }>;
-};
-
-export async function validateCrawlUrl(input: string): Promise<string> {
-  return (await resolveAndValidateCrawlUrl(input)).url;
-}
-
-export async function resolveAndValidateCrawlUrl(input: string): Promise<ValidatedCrawlTarget> {
-  let parsed: URL;
-  try {
-    parsed = new URL(input);
-  } catch {
-    throw new Error(`Refusing to crawl: invalid URL "${input}"`);
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error(
-      `Refusing to crawl "${input}": protocol "${parsed.protocol}" is not http(s)`,
-    );
-  }
-  const hostname = parsed.hostname; // URL.hostname is the lowercased, bracket-stripped host
-  if (!hostname) {
-    throw new Error(`Refusing to crawl "${input}": missing hostname`);
-  }
-
-  // URL.hostname returns literal IPv6 hostnames with surrounding brackets
-  // (e.g. "[::1]") but lowercased. Strip them so the literal-IP probe
-  // and the blocklist see the bare address.
-  const bareHost = hostname.startsWith('[') && hostname.endsWith(']')
-    ? hostname.slice(1, -1)
-    : hostname;
-
-  // Treat `localhost` and other well-known hostnames that should never be
-  // reached from the server's network as blocked without a DNS lookup.
-  const lcHost = bareHost.toLowerCase();
-  if (
-    lcHost === 'localhost' ||
-    lcHost.endsWith('.localhost') ||
-    lcHost.endsWith('.local') ||
-    lcHost.endsWith('.internal') ||
-    lcHost.endsWith('.intranet')
-  ) {
-    throw new Error(
-      `Refusing to crawl "${input}": hostname "${bareHost}" points at loopback / internal namespace`,
-    );
-  }
-
-  // If the hostname is a literal IP, the blocklist is sufficient — no DNS
-  // is needed and a malicious client can't rebind a literal IP.
-  if (isLiteralIPv4(bareHost) || isLiteralIPv6(bareHost)) {
-    if (isBlockedAddress(bareHost)) {
-      throw new Error(
-        `Refusing to crawl "${input}": hostname "${bareHost}" is a blocked private/internal address`,
-      );
-    }
-    return {
-      url: input,
-      ips: [{ address: bareHost, family: isLiteralIPv6(bareHost) ? 6 : 4 }],
-    };
-  }
-
-  // Hostname is a DNS name — resolve it and check every returned address.
-  // dns.lookup with { all: true } returns all A + AAAA records.
-  let addrs: Array<{ address: string; family?: number }>;
-  try {
-    addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
-  } catch (err) {
-    throw new Error(
-      `Refusing to crawl "${input}": DNS lookup failed for "${bareHost}" — ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
-  if (addrs.length === 0) {
-    throw new Error(`Refusing to crawl "${input}": DNS lookup returned no addresses for "${bareHost}"`);
-  }
-  for (const { address } of addrs) {
-    if (isBlockedAddress(address)) {
-      throw new Error(
-        `Refusing to crawl "${input}": hostname "${bareHost}" resolves to blocked private/internal address "${address}"`,
-      );
-    }
-  }
-  return {
-    url: input,
-    ips: addrs.map((a) => ({
-      address: a.address,
-      family: a.family === 6 || a.address.includes(':') ? 6 : 4,
-    })),
-  };
-}
-
-/**
- * Expand an IPv6 address to its full 8-group colon-hex form. Returns
- * the input unchanged if it doesn't look like an IPv6 address. Handles
- * the `::` shorthand by computing the missing zero groups. Used by
- * isBlockedAddress() to normalize ::ffff: mappings before checking
- * the v4 blocklist. (new URL() sometimes normalizes the dotted-quad
- * form ::ffff:127.0.0.1 to the compressed hex form ::ffff:7f00:1,
- * and the uncompressed form ::ffff:0:0:7f00:1 is also seen in the
- * wild; we accept all three.)
- */
-function expandIPv6ForMapping(addr: string): string {
-  if (!addr.includes(':')) return addr;
-  const lc = addr.toLowerCase();
-  // The `::` shorthand: split on the first `::` and pad to 8 groups.
-  const dci = lc.indexOf('::');
-  if (dci !== -1) {
-    const head = lc.slice(0, dci);
-    const tail = lc.slice(dci + 2);
-    const headParts = head === '' ? [] : head.split(':');
-    const tailParts = tail === '' ? [] : tail.split(':');
-    const missing = 8 - headParts.length - tailParts.length;
-    if (missing < 0) return addr; // malformed; let downstream reject
-    const full = [...headParts, ...Array(missing).fill('0'), ...tailParts];
-    return full.map((g) => g.padStart(4, '0')).join(':');
-  }
-  // No `::` shorthand: just zero-pad each group.
-  return lc.split(':').map((g) => g.padStart(4, '0')).join(':');
-}
-
-function isLiteralIPv4(host: string): boolean {
-  const parts = host.split('.');
-  if (parts.length !== 4) return false;
-  return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
-}
-
-function isLiteralIPv6(host: string): boolean {
-  // A literal IPv6 (after URL.hostname strip-bracket normalization) must
-  // contain at least one colon and consist of hex / colon / dot-quad chars.
-  if (!host.includes(':')) return false;
-  return /^[0-9a-fA-F:.]{2,}$/.test(host);
-}
-
-type CrawlResponse = {
-  ok: boolean;
-  status: number;
-  statusText: string;
-  headers: { get(name: string): string | null };
-  text(): Promise<string>;
-};
-
-function fetchPinnedCrawlUrl(
-  url: string,
-  pin: { address: string; family: 4 | 6 },
-): Promise<CrawlResponse> {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const client = parsed.protocol === 'https:' ? https : http;
-    const chunks: Buffer[] = [];
-    const req = client.request(parsed, {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-      lookup: (_hostname, _options, callback) => {
-        if (isBlockedAddress(pin.address)) {
-          callback(new Error(`Refusing to crawl: pinned address "${pin.address}" is blocked`), '', 0);
-          return;
-        }
-        callback(null, pin.address, pin.family);
-      },
-    }, (res) => {
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
-      res.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8');
-        resolve({
-          ok: Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 300),
-          status: res.statusCode ?? 0,
-          statusText: res.statusMessage ?? '',
-          headers: {
-            get(name: string) {
-              const value = res.headers[name.toLowerCase()];
-              if (Array.isArray(value)) return value[0] ?? null;
-              return value ?? null;
-            },
-          },
-          text: async () => body,
-        });
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
 // Direct HTTP fetch as a baseline crawler. Tries the Apify run-sync API
 // directly if creds are present, otherwise falls back to a plain fetch()
 // with HTML→Markdown extraction.
@@ -382,21 +72,13 @@ async function crawlOne(url: string): Promise<{
   url: string; title: string; markdown: string; text: string; capturedAt: string;
   apifyRunId: string | null;
 }> {
-  // HIGH-4: SSRF guard. The URL is user-supplied (lives in
-  // tracked_pages.source_url) and any fetch() in this function is from
-  // the Next.js server's network. Reject private / loopback / link-local /
-  // cloud-metadata targets before issuing a single byte of outbound
-  // traffic, and follow DNS resolution to defeat DNS-rebinding.
-  await validateCrawlUrl(url);
-
   const apifyToken = process.env.APIFY_API_TOKEN;
   const apifyActorId = process.env.APIFY_ACTOR_ID;
 
   if (apifyToken && apifyActorId) {
     // Real Apify path
-    const actorIdForApi = encodeURIComponent(apifyActorId.replace(/\//g, '~'));
     const r = await fetch(
-      `https://api.apify.com/v2/acts/${actorIdForApi}/run-sync-get-dataset-items?token=${apifyToken}`,
+      `https://api.apify.com/v2/acts/${apifyActorId}/run-sync-get-dataset-items?token=${apifyToken}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -421,43 +103,14 @@ async function crawlOne(url: string): Promise<{
     console.warn(`[scan] Apify call failed for ${url}, falling back to direct fetch`);
   }
 
-  // Direct fetch path. We use redirect: 'manual' so we can
-  // re-validate every Location header against the SSRF blocklist;
-  // the default 'follow' would silently redirect a public URL
-  // to http://169.254.169.254/ (cloud metadata) or http://127.0.0.1/
-  // (loopback) without re-running the private-address checks.
-  //
-  // DNS-rebinding defense: resolveAndValidateCrawlUrl returns the
-  // validated IPs, and fetchPinnedCrawlUrl passes the selected IP
-  // through Node's lookup hook for the actual socket connection.
-  // The request URL stays as the original hostname, so HTTPS SNI,
-  // certificate validation, Host headers, and relative redirects all
-  // continue to use the public hostname instead of an IP literal.
-  const MAX_REDIRECTS = 5;
-  let currentUrl = url;
-  let r: CrawlResponse | null = null;
-  for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const resolved = await resolveAndValidateCrawlUrl(currentUrl);
-    currentUrl = resolved.url;
-    const res = await fetchPinnedCrawlUrl(currentUrl, resolved.ips[0]);
-    // Non-redirect: we have the final response.
-    if (res.status < 300 || res.status >= 400) {
-      r = res;
-      break;
-    }
-    // 3xx: read Location, resolve against the hostname URL we just
-    // requested, and revalidate/re-pin on the next iteration.
-    const location = res.headers.get('location');
-    if (!location) {
-      // 3xx with no Location is malformed; treat as terminal.
-      r = res;
-      break;
-    }
-    currentUrl = new URL(location, currentUrl).toString();
-  }
-  if (!r) {
-    throw new Error(`Failed to fetch ${url}: too many redirects (limit ${MAX_REDIRECTS})`);
-  }
+  // Direct fetch path
+  const r = await fetch(url, {
+    headers: {
+      'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
+    redirect: 'follow',
+  });
   if (!r.ok) throw new Error(`Failed to fetch ${url}: ${r.status} ${r.statusText}`);
   const html = await r.text();
   const { title, markdown, text } = htmlToMarkdown(html);
@@ -632,8 +285,8 @@ const BASE_URL = process.env.INSFORGE_API_URL;
 if (!BASE_URL) {
   throw new Error('INSFORGE_API_URL is not set. Refusing to run scans against an unknown InsForge tenant.');
 }
-const SRK = process.env.INSFORGE_SERVICE_ROLE_KEY || process.env.INSFORGE_ANON_KEY || process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
-const ANON = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || process.env.INSFORGE_ANON_KEY || '';
+const SRK = process.env.INSFORGE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
+const ANON = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
 
 // NOTE: scan-row ids (snapshot_jobs.id, snapshots.id, ai_explanations.id)
 // are generated by `newId()` in lib/ids.ts — see that file for the
@@ -726,154 +379,77 @@ export async function runScan(
   room: MemoryRoom,
   options: { triggerType?: 'manual' | 'schedule' | 'box_webhook' | 'retry' } = {},
 ): Promise<ScanSummary> {
-  // HIGH-5: per-page job ownership.
-  //
-  // The previous implementation created exactly one snapshot_jobs row and
-  // parented it to `watchedUrls[0].id`. Two problems followed:
-  //   (1) FK violation when the first page was removed — the new run's
-  //       job insert referenced a tracked_page_id that no longer existed,
-  //       and the entire scan was lost.
-  //   (2) Snapshots of every other page in the room shared a single job
-  //       row, so per-page audit history (the existing dashboard
-  //       lastScanAt-per-page query at lib/insforge.ts:303-315) only ever
-  //       reflected the first page's timestamps.
-  //
-  // The fix is to delete the global "one job per scan" insert and let
-  // `scanOne` own its own job row, parented to the URL it is scanning.
-  // `runScan` still returns a single `scanRunId` because the API
-  // contract exposes ScanSummary.scanRunId to the UI; the value is a
-  // synthetic UUID we mint here and pass to each scanOne call so the UI
-  // can correlate the per-page jobs from a single user action. The
-  // synthetic id is NOT stored in any DB column — the per-page job ids
-  // are the real FK targets.
-  //
-  // HIGH-5: drop the `&limit=50` cap on the tracked_pages query. It was
-  // an undocumented soft cap that silently truncated rooms with 51+
-  // URLs. The PostgREST `tracked_pages` table is small per room
-  // (validated 1-100 per add-URLs call at lib/validation.ts:120) so a
-  // flat fetch with no limit is fine.
   const triggerType = options.triggerType ?? 'manual';
-  const scanRunId = newId();
+  const jobId = newId();
+  const startedAt = new Date().toISOString();
 
-  // 1. Load watched URLs (no cap — HIGH-5)
+  // 1. Load watched URLs
   const watchedUrls = (await dbGet(
-    `tracked_pages?project_id=eq.${room.id}&active=eq.1&select=id,source_url`,
+    `tracked_pages?project_id=eq.${room.id}&active=eq.1&select=id,source_url&limit=50`,
   )) as Array<{ id: string; source_url: string }>;
   if (watchedUrls.length === 0) {
     return {
-      scanRunId,
+      scanRunId: jobId,
       status: 'completed',
       snapshotsCaptured: 0,
       changesCreated: 0,
     };
   }
 
+  // 2. Insert the scan_job as running
+  await dbInsert('snapshot_jobs', {
+    id: jobId,
+    tracked_page_id: watchedUrls[0].id, // one job per scan; pages are linked via snapshots
+    trigger_type: triggerType,
+    status: 'running',
+    requested_at: startedAt,
+  });
+
   let snapshotsCaptured = 0;
   let changesCreated = 0;
 
-  // 2. Per-page scan. Each call to scanOne now creates its own
-  // snapshot_jobs row, parented to wp.id (the page being scanned).
-  // A failure in one page is logged and counted but does NOT abort the
-  // rest of the scan — the existing "one bad page shouldn't fail the
-  // whole scan" behaviour is preserved.
-  for (const wp of watchedUrls) {
-    try {
-      const result = await scanOne(room, wp, { triggerType, scanRunId });
-      if (result.snapshot) snapshotsCaptured += 1;
-      if (result.change) changesCreated += 1;
-    } catch (err) {
-      console.error(`[scan] failed for ${wp.source_url}:`, err);
-      // Continue with the next URL — one bad page shouldn't fail the whole scan
+  try {
+    for (const wp of watchedUrls) {
+      try {
+        const result = await scanOne(room, wp, jobId);
+        if (result.snapshot) snapshotsCaptured += 1;
+        if (result.change) changesCreated += 1;
+      } catch (err) {
+        console.error(`[scan] failed for ${wp.source_url}:`, err);
+        // Continue with the next URL — one bad page shouldn't fail the whole scan
+      }
     }
-  }
 
-  return {
-    scanRunId,
-    status: 'completed',
-    snapshotsCaptured,
-    changesCreated,
-  };
+    // 3. Mark job succeeded
+    await dbUpdate('snapshot_jobs', jobId, {
+      status: 'succeeded',
+      finished_at: new Date().toISOString(),
+    });
+
+    return {
+      scanRunId: jobId,
+      status: 'completed',
+      snapshotsCaptured,
+      changesCreated,
+    };
+  } catch (err) {
+    await dbUpdate('snapshot_jobs', jobId, {
+      status: 'failed',
+      finished_at: new Date().toISOString(),
+      error_message: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
 }
 
 async function scanOne(
   room: MemoryRoom,
   wp: { id: string; source_url: string },
-  ctx: { triggerType: 'manual' | 'schedule' | 'box_webhook' | 'retry'; scanRunId: string },
-): Promise<{ snapshot: PageSnapshot | null; change: NewChangeAnalysis | null }> {
-  const { triggerType, scanRunId } = ctx;
-  // HIGH-5: per-page snapshot_jobs ownership.
-  //
-  // Each call mints a per-page jobId, inserts the row parented to
-  // `wp.id` (the page being scanned — not the room's first page), and
-  // marks the row succeeded/failed at the end of this function. The
-  // snapshot's `job_id` references this per-page job, so per-page
-  // audit history in `snapshot_jobs` is now correctly 1:1 with the
-  // page rather than N:1 on the room's first page.
-  //
-  // `scanRunId` is a synthetic run-level UUID minted by runScan(); it
-  // is NOT stored in any DB column. We persist it on the per-page job
-  // row via the `apify_run_id` column as a stable correlation tag
-  // (`run:<uuid>`), which gives the dashboard / debug query a way to
-  // group all per-page jobs from a single user action without
-  // requiring a schema change. The column name is a legacy alias; the
-  // value is opaque to the schema and not validated, so a
-  // `run:<uuid>` tag is safe.
-  const jobId = newId();
-  const startedAt = new Date().toISOString();
-  await dbInsert('snapshot_jobs', {
-    id: jobId,
-    tracked_page_id: wp.id,
-    trigger_type: triggerType,
-    status: 'running',
-    apify_run_id: `run:${scanRunId}`,
-    requested_at: startedAt,
-  });
-
-  try {
-    const result = await scanOneInner(room, wp, jobId, scanRunId);
-    // Mark per-page job succeeded.
-    await dbUpdate('snapshot_jobs', jobId, {
-      status: 'succeeded',
-      finished_at: new Date().toISOString(),
-    });
-    return result;
-  } catch (err) {
-    // Mark per-page job failed but re-throw so runScan logs and continues.
-    try {
-      await dbUpdate('snapshot_jobs', jobId, {
-        status: 'failed',
-        finished_at: new Date().toISOString(),
-        error_message: err instanceof Error ? err.message : String(err),
-      });
-    } catch (markErr) {
-      console.error(`[scan] failed to mark job ${jobId} as failed:`, markErr);
-    }
-    throw err;
-  }
-}
-
-async function scanOneInner(
-  room: MemoryRoom,
-  wp: { id: string; source_url: string },
   jobId: string,
-  scanRunId: string,
 ): Promise<{ snapshot: PageSnapshot | null; change: NewChangeAnalysis | null }> {
   // 1. Crawl the URL
   const crawled = await crawlOne(wp.source_url);
-  // HIGH-1: sanitize the crawl output before we hash it or persist it.
-  // The crawler fetches arbitrary user-supplied URLs, so a malicious
-  // page can put `<script>alert(1)</script>` in its `<title>` or in
-  // the body. We strip script blocks, HTML comments, stray HTML tags,
-  // and control characters here, and apply the length caps the schema
-  // expects (TITLE_MAX_CHARS=500, MARKDOWN_MAX_CHARS=50_000 — see
-  // lib/sanitize.ts). Hashing the *sanitized* markdown means two
-  // crawls that differ only in scripts / whitespace hash the same —
-  // that's a feature, not a bug: the stored snapshot is what
-  // changes, not the raw HTML.
-  const cleanTitle = sanitizeTitle(crawled.title);
-  const cleanMarkdown = sanitizeMarkdown(crawled.markdown);
-  const cleanText = sanitizeMarkdown(crawled.text);
-  const mdHash = createHash('sha256').update(cleanMarkdown).digest('hex');
+  const mdHash = createHash('sha256').update(crawled.markdown).digest('hex');
 
   // 2. Look up the previous snapshot for this page
   const prevRows = (await dbGet(
@@ -886,14 +462,12 @@ async function scanOneInner(
     return { snapshot: null, change: null };
   }
 
-  // 4. Upload evidence to InsForge Storage (best-effort). Use the
-  // sanitized markdown so an attacker-controlled page cannot put a
-  // <script> in the long-term evidence blob either.
+  // 4. Upload evidence to InsForge Storage (best-effort)
   const safeFileName = `snapshot-${Date.now()}.md`;
   const uploaded = await uploadEvidence(
     room.storageFolderPath ?? room.boxFolderId ?? '',
     safeFileName,
-    cleanMarkdown,
+    crawled.markdown,
   );
 
   // 5. Insert the new snapshot
@@ -906,18 +480,10 @@ async function scanOneInner(
     observed_at: observedAt,
     final_url: crawled.url,
     canonical_url: crawled.url,
-    // HIGH-1: cleanTitle is the sanitizer-capped, tag-stripped title.
-    // The legacy `|| crawled.url` fallback still applies for a page
-    // whose title is empty even after sanitization (e.g. server
-    // returns <title></title>).
-    page_title: cleanTitle || crawled.url,
+    page_title: crawled.title || crawled.url,
     http_status: 200,
     markdown_hash: mdHash,
-    // HIGH-1: cleanMarkdown is already capped at MARKDOWN_MAX_CHARS
-    // (50_000) inside sanitizeMarkdown, so no further slice is
-    // needed. We keep it as `cleanMarkdown` (not `crawled.markdown`)
-    // so the stored text is the sanitized version.
-    markdown_text: cleanMarkdown,
+    markdown_text: crawled.markdown.slice(0, 50000), // cap at 50KB to keep rows small
     change_type: prev ? 'textual' : 'none', // refined by AI if change detected
     box_snapshot_folder_id: uploaded
       ? `pagevault/${(room.storageFolderPath || room.boxFolderId || '').replace(/^pagevault\//, '')}/snapshots/${observedAt.slice(0, 10)}/`
@@ -932,14 +498,10 @@ async function scanOneInner(
         id: snapId,
         roomId: room.id,
         watchedUrlId: wp.id,
-        scanRunId,
+        scanRunId: jobId,
         url: crawled.url,
-        // HIGH-1: return the sanitized title/text so anything that
-        // surfaces this PageSnapshot downstream (the API response,
-        // the change-detail page, the LLM evidence render) gets
-        // scrubbed HTML, not raw attacker input.
-        title: cleanTitle,
-        textContent: cleanText,
+        title: crawled.title,
+        textContent: crawled.text,
         contentHash: mdHash,
         storageKey: uploaded?.key ?? null,
         storageUrl: uploaded?.url ?? null,
@@ -952,11 +514,9 @@ async function scanOneInner(
 
   // 7. Call the LLM
   const prevExcerpt = extractExcerpt(prev.markdown_text || '', 800);
-  // HIGH-1: feed the LLM the sanitized markdown + title so the
-  // "evidence" it quotes back to us cannot carry <script> tags.
-  const liveExcerpt = extractExcerpt(cleanMarkdown, 1200);
+  const liveExcerpt = extractExcerpt(crawled.markdown, 1200);
   const userPrompt = `Tracked page: ${crawled.url}
-Title: ${cleanTitle || crawled.url}
+Title: ${crawled.title || crawled.url}
 
 === PREVIOUS ===
 ${prevExcerpt || '(no previous text excerpt available)'}
@@ -977,8 +537,8 @@ Analyze the change. Return JSON only.`;
     // Record the snapshot but no change analysis
     return {
       snapshot: {
-        id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId,
-        url: crawled.url, title: cleanTitle, textContent: cleanText,
+        id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId: jobId,
+        url: crawled.url, title: crawled.title, textContent: crawled.text,
         contentHash: mdHash, storageKey: uploaded?.key ?? null,
         storageUrl: uploaded?.url ?? null, boxFileId: uploaded?.key ?? null,
         capturedAt: observedAt,
@@ -1045,8 +605,8 @@ Analyze the change. Return JSON only.`;
 
   return {
     snapshot: {
-      id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId,
-      url: crawled.url, title: cleanTitle, textContent: cleanText,
+      id: snapId, roomId: room.id, watchedUrlId: wp.id, scanRunId: jobId,
+      url: crawled.url, title: crawled.title, textContent: crawled.text,
       contentHash: mdHash, storageKey: uploaded?.key ?? null,
       storageUrl: uploaded?.url ?? null, boxFileId: uploaded?.key ?? null,
       capturedAt: observedAt,

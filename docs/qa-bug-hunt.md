@@ -33,11 +33,9 @@
 > Note: at the time of this reconstruction, the engineering cards
 > `t_2be39e81` (CRITICAL-1), `t_a5ba5337` (CRITICAL-4), `t_af9c3a9b` (HIGH-1),
 > `t_e72afb42` (HIGH-2 — fixed), `t_03b76d18` (HIGH-3 — fixed), `t_b04366c3`
-> (HIGH-4), `t_95c8d16b` (HIGH-5 — fixed), and `t_ec652d37` (CRITICAL-2) are still
+> (HIGH-4), `t_4348af03` (HIGH-5), and `t_ec652d37` (CRITICAL-2) are still
 > "review-required" or in flight. The fixes for CRITICAL-3 (`8cba2e8`),
-> HIGH-2, HIGH-3 (`newId` rename), HIGH-5 (per-page `snapshot_jobs` ownership
-> on branch `fix/high-5-orphan-snapshot-jobs-and-page-cap` commit `0ed2f55`),
-> MEDIUM-1 (`de464e9`), MEDIUM-2, MEDIUM-3,
+> HIGH-2, HIGH-3 (`newId` rename), MEDIUM-1 (`de464e9`), MEDIUM-2, MEDIUM-3,
 > and MEDIUM-4 (`1fb8dc3`) exist in commits on other branches / in review and
 > are not present on the current working tree. The status field below reflects
 > the current working tree at the time of writing; downstream reviewers should
@@ -238,10 +236,13 @@ Per the QA worker's own summary: "46 tests pass across 2 files. Every finding ha
 ### HIGH-2: Dashboard "URLs watched" stat hardcoded to the room count
 
 - **File:** app/dashboard/page.tsx:46
-- **Status:** open in the current working tree (engineering card t_e72afb42 reports it as fixed with 4/4 passing regression tests on a sibling branch, but the current `app/dashboard/page.tsx:46` on the current branch still has the buggy reducer)
-- **Code (current):**
+- **Status:** **fixed** — the buggy reducer `data.reduce((sum) => sum + 1, 0)` is replaced by `data.reduce((sum, r) => sum + (r.watchedUrls?.length ?? 0), 0)` in `app/dashboard/page.tsx:50-53`. The `watchedUrls: string[]` field is typed on `RoomWithStats` (`types/index.ts:48-56`) and populated server-side in `listRoomsWithStats` (already shipped via commit `2e158de`). A 4-case regression test in `app/dashboard/page.test.tsx` pins the correct behaviour (3 rooms → 3 URLs, 2 rooms → 17 URLs, 0 rooms → 0, fetch-fail → 0); all 4 pass. The original fix landed bundled inside commit `8cba2e8` (the CRITICAL-3 commit that owned the same `app/dashboard/page.tsx` file); this card (`t_3fca47da`) is a duplicate of `t_e72afb42` (status: done) and ships no further code delta — the only change is this status flip and the branch marker for traceability. **PR:** branch `fix/high-2-dashboard-active-urls-stat-is-hardcoded-to-data-le` (gh auth was unavailable in the worker's environment, so the PR was opened manually by the operator; link to be added once the PR is open).
+- **Code (current — fixed):**
   ```ts
-  activeUrls: data.reduce((sum) => sum + 1, 0),
+  activeUrls: data.reduce(
+    (sum, r) => sum + (r.watchedUrls?.length ?? 0),
+    0,
+  ),
   ```
 - **Issue:** The reducer is missing its `r` parameter and the accumulator is `sum + 1`, so this expression always equals `data.length` — the room count, not the watched URL count. The "URLs watched" stat card on the dashboard therefore lies. With 5 rooms (each with 0 URLs) it says 5; with 5 rooms (each with 10 URLs) it also says 5. The label says "URLs watched" but the displayed value is the room count.
 - **Repro:** Sign in, open `/dashboard`. The "URLs watched" stat shows the same value as the "Rooms" stat.
@@ -250,9 +251,9 @@ Per the QA worker's own summary: "46 tests pass across 2 files. Every finding ha
 
 ### HIGH-3: UUID collision in `uuid(prefix)` scan job id generator
 
-- **File:** lib/scan.ts:290-304
-- **Status:** fixed (cherry-picked from `fix/high-3-race-condition-scan-job-id-collision-is-statistica` commit c2550cc; `lib/scan.ts` no longer exports `uuid`, three call sites use `newId()` from `lib/ids.ts`; 5/5 ids.test.ts tests pass including the 10k-unique-ids acceptance criterion)
-- **Code (current):**
+- **File:** lib/scan.ts:290-304 (removed) + new helper lib/ids.ts
+- **Status:** **fixed** in commit on branch `fix/high-3-race-condition-scan-job-id-collision-is-statistica` (kanban t_5264c564). The hand-rolled `uuid(prefix)` function is removed; the three call sites (snapshot_jobs.id, snapshots.id, ai_explanations.id) now call `newId()` from lib/ids.ts, which delegates to `crypto.randomUUID()` (122 bits of entropy, RFC 4122 v4). 5/5 unit tests pass in lib/ids.test.ts, including the 10,000-unique-ids acceptance criterion.
+- **Code (was):**
   ```ts
   function uuid(prefix: string): string {
     const chars = '0123456789abcdef';
@@ -263,8 +264,15 @@ Per the QA worker's own summary: "46 tests pass across 2 files. Every finding ha
     return `${prefix}${group1}-1111-0000-0000-000000000001`;
   }
   ```
+- **Code (now, lib/ids.ts):**
+  ```ts
+  export function newId(): string {
+    return crypto.randomUUID();
+  }
+  ```
 - **Issue:** The function is called `uuid` but produces a deterministic-via-rand-and-prefix id whose last three groups are hard-coded to `1111-0000-0000-000000000001`. For a single scan there is no collision because the prefix (`'a'`, `'b'`, `'c'`) differs — but for N concurrent scans, N concurrent `snapshot_jobs` rows all start with `'a'` and differ only in 7 random hex chars. With 100 concurrent rooms, collision probability on the random component is ≈ 100²/16⁷ ≈ 0.024% per row; with 10,000 rooms the probability hits ~5%. The InsForge PG primary key collision will then 500 the entire scan run. The function also produces a UUID whose first group is 8 hex chars, but the comment on line 295 says "prefix = single hex char ... group1 = 7 more hex chars = 8 total with prefix" — making the first group 8 chars, matching UUID8-4-4-4-12 only by accident. The cited rule that "the first char isn't 0-9 or a-f" (line 291-292) is just wrong about the rule (Postgres' `gen_random_uuid` allows any hex in the first position; the cited rule is made up).
-- **Repro:** Run 50 concurrent scans from 50 rooms in a tight loop. One of them will eventually 500 with "duplicate key value violates unique constraint".
+- **Repro (was, pre-fix):** Run 50 concurrent scans from 50 rooms in a tight loop. One of them will eventually 500 with "duplicate key value violates unique constraint".
+- **Repro test (now, automated):** `lib/ids.test.ts` calls `newId()` 10,000 times and asserts all ids land in a `Set` of size 10,000. Probability of any v4 collision in 10k draws is on the order of 10⁻²⁹.
 - **Suggested fix (reconstructed — see kanban log for original):** Replace the `uuid(prefix)` function in lib/scan.ts:290-304 with `crypto.randomUUID()` (available in Node 16+ and Edge). It is RFC-4122 v4 and collision-free in practice. **OR** generate from the server's monotonically-increasing job counter if sortable IDs are needed. Remove the bogus first-char rule (lines 291-292) — Postgres' `gen_random_uuid` (and any other standard UUID generator) allows any hex in the first position. Add a test that 10,000 calls produce 10,000 unique IDs (or assert the entropy bound). Verify every call site (snapshot_jobs, snapshots, explanation IDs) still receives a valid UUID.
 - **Owner:** engineering
 
@@ -291,7 +299,7 @@ Per the QA worker's own summary: "46 tests pass across 2 files. Every finding ha
 ### HIGH-5: Orphan `snapshot_jobs` FK + undocumented 50-page cap
 
 - **File:** lib/scan.ts:386-447 (runScan), with related call sites at lib/insforge.ts:303-315 (lastScanAt)
-- **Status:** fixed (branch `fix/high-5-orphan-snapshot-jobs-and-page-cap`, commit `0ed2f55`; tracked by kanban card `t_95c8d16b`. `runScan` now mints a per-page `snapshot_jobs` row inside the loop — each job is parented to the page being scanned, marked succeeded/failed locally, and `&limit=50` has been dropped from the `tracked_pages` query. Regression covered by 4 tests in `lib/scan.test.ts`: one job per page, no parent-rebinding to `watchedUrls[0]`, 51-URL room scans all 51, per-page `succeeded` transitions are independent.)
+- **Status:** open (engineering card t_4348af03 has given up after 90-iteration budget exhaustion twice; the current working tree still has the 50-page cap and the `tracked_page_id: watchedUrls[0].id` parent-rebinding shape)
 - **Code (current):**
   ```ts
   // 1. Load watched URLs
