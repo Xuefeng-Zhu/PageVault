@@ -15,7 +15,7 @@
 // `page_title`. We test this by piping the HTML through
 // `htmlToMarkdown` and then `sanitizeTitle` / `sanitizeMarkdown` — the
 // same two calls `scanOne()` makes before `dbInsert`.
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import { isBlockedAddress } from './scan';
 import { sanitizeMarkdown, sanitizeTitle } from './sanitize';
 
@@ -330,5 +330,378 @@ describe('HIGH-1: snapshot text is sanitized before dbInsert (lib/scan.ts:scanOn
     expect(safeMarkdown.toLowerCase()).not.toContain('script');
     expect(safeMarkdown).not.toContain('alert(1)');
     expect(safeMarkdown).not.toContain('steal');
+  });
+});
+
+// =============================================================================
+// HIGH-5 regression: runScan parents one snapshot_jobs row per watched page
+// =============================================================================
+//
+// Bug summary (docs/qa-bug-hunt.md HIGH-5): runScan used to create exactly
+// one snapshot_jobs row, parented to watchedUrls[0].id. Two failure modes:
+//   (a) The PostgREST `tracked_pages` query had `&limit=50`, silently
+//       dropping any 51st+ URL from the scan.
+//   (b) The job was parented to the first URL's tracked_page_id, so a
+//       removed/deactivated first URL would FK-fail the next run's job
+//       insert and lose the entire scan.
+//
+// The fix:
+//   - runScan fetches tracked_pages with no limit.
+//   - scanOne creates its own snapshot_jobs row parented to wp.id.
+//   - runScan mints a synthetic scanRunId (UI handle, not a DB column)
+//     that scanOne stamps into the per-page job's apify_run_id as
+//     `run:<uuid>` for correlation.
+//
+// These tests pin both behaviours against the live network using a
+// stubbed `fetch` — we do not need a real InsForge tenant to assert
+// the call shapes.
+
+import { runScan } from './scan';
+import type { MemoryRoom } from '@/types';
+
+// Shared fetch stub. We use vi.hoisted so the test bodies can mutate
+// the same Map/Array the factory captured.
+const network = vi.hoisted(() => {
+  return {
+    // tracked_pages rows the test will inject (one per watched URL).
+    pages: [] as Array<{ id: string; source_url: string }>,
+    // dbInsert('snapshot_jobs', body) calls captured.
+    jobInserts: [] as Array<Record<string, unknown>>,
+    // dbInsert('snapshots', body) calls captured.
+    snapshotInserts: [] as Array<Record<string, unknown>>,
+    // dbUpdate('snapshot_jobs', id, body) calls captured.
+    jobUpdates: [] as Array<{ id: string; body: Record<string, unknown> }>,
+    // Body returned by the previous-snapshot lookup for a given
+    // tracked_page_id. Empty array by default = "no previous snapshot".
+    previousSnapshots: new Map<string, Array<Record<string, unknown>>>(),
+  };
+});
+
+// HIGH-5 mocks the same `node:dns/promises` module that HIGH-4
+// already mocks above. vi.mock factories are file-scoped and the
+// second registration wins, which would clobber the HIGH-4
+// `dnsBehavior` map and break the SSRF tests. To keep both
+// describe-blocks green we route the HIGH-5 factory through the same
+// `dnsBehavior` hoist: the SSRF tests populate `responses` per host,
+// the HIGH-5 tests leave it empty and we fall back to a public IP.
+vi.mock('node:dns/promises', () => ({
+  default: {
+    async lookup(host: string, _opts: unknown) {
+      dnsBehavior.looked.push(host);
+      const r = dnsBehavior.responses.get(host);
+      if (r !== undefined) {
+        return r.map((address) => ({ address, family: 4 }));
+      }
+      if (dnsBehavior.responses.size > 0) {
+        // HIGH-4 SSRF tests are active — preserve the ENOTFOUND
+        // semantics for hosts they did not register.
+        const err = new Error(`getaddrinfo ENOTFOUND ${host}`) as Error & { code: string };
+        err.code = 'ENOTFOUND';
+        throw err;
+      }
+      // HIGH-5 path: any host resolves to a public IP so
+      // validateCrawlUrl lets it through. Keeps the test focused on
+      // the scan pipeline, not the SSRF guard.
+      return [{ address: '93.184.216.34', family: 4 }];
+    },
+  },
+}));
+
+vi.mock('@insforge/sdk', () => ({
+  // uploadEvidence uses the SDK to push the snapshot blob. Return a
+  // successful upload so the snapshot insert proceeds.
+  createClient: () => ({
+    storage: {
+      from: () => ({
+        upload: async () => ({
+          data: { key: 'pagevault/test/snapshots/x.md', url: 'https://example.invalid/x.md' },
+          error: null,
+        }),
+      }),
+    },
+  }),
+}));
+
+function makeRoom(id = 'room-1'): MemoryRoom {
+  return {
+    id,
+    userId: 'user-1',
+    name: 'Test room',
+    targetName: 'Test target',
+    category: 'custom',
+    storageFolderPath: 'pagevault/test',
+    boxFolderId: 'pagevault/test',
+    createdAt: new Date().toISOString(),
+  };
+}
+
+// Build a single page's HTML body with a unique marker so each page
+// produces a unique markdown hash. Without the marker, all 51 pages
+// would hash the same and the dedup early-return would skip the
+// snapshot insert for all but the first.
+function pageHtml(marker: string): string {
+  return `<!doctype html><html><head><title>Page ${marker}</title></head>
+<body><h1>Page ${marker}</h1><p>body-${marker}</p></body></html>`;
+}
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function htmlResponse(html: string): Response {
+  return new Response(html, {
+    status: 200,
+    headers: { 'content-type': 'text/html; charset=utf-8' },
+  });
+}
+
+// Install the global fetch stub. Behaviour:
+//   - GET  ${BASE_URL}/api/database/records/tracked_pages?… → network.pages
+//   - GET  ${BASE_URL}/api/database/records/snapshots?…     → empty / per-page previous
+//   - POST ${BASE_URL}/api/database/records/snapshot_jobs   → capture body
+//   - PATCH ${BASE_URL}/api/database/records/snapshot_jobs?id=… → capture body
+//   - POST ${BASE_URL}/api/database/records/snapshots       → capture body
+//   - POST ${BASE_URL}/api/database/records/ai_explanations → 200
+//   - GET  <user URL>                                       → per-page HTML
+//
+// We must reset captured arrays between tests (call this in beforeEach).
+function installFetchStub() {
+  network.jobInserts = [];
+  network.snapshotInserts = [];
+  network.jobUpdates = [];
+  network.previousSnapshots = new Map();
+
+  // The base URL scan.ts uses is whatever INSFORGE_API_URL is set to
+  // at module-load time. The test runner may have it set to the real
+  // InsForge tenant via `.env.local`, or to the placeholder
+  // `https://test.invalid` from the file-level beforeAll. Match
+  // *any* `/api/database/records/...` path so the stub works for
+  // either case.
+  const fetchMock = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input.toString();
+    const method = (init?.method ?? 'GET').toUpperCase();
+
+    // 1. tracked_pages query (runScan step 1)
+    if (url.includes('/api/database/records/tracked_pages?')) {
+      return jsonResponse(200, network.pages);
+    }
+
+    // 2. previous-snapshot lookup (scanOneInner step 2)
+    if (url.includes('/api/database/records/snapshots?')) {
+      // Extract tracked_page_id from the URL — the pattern is
+      // `tracked_page_id=eq.<uuid>`. We pick the first match.
+      const m = /tracked_page_id=eq\.([^&]+)/.exec(url);
+      if (m && network.previousSnapshots.has(m[1])) {
+        return jsonResponse(200, network.previousSnapshots.get(m[1]));
+      }
+      return jsonResponse(200, []);
+    }
+
+    // 3. snapshot_jobs insert
+    if (method === 'POST' && url.includes('/api/database/records/snapshot_jobs') && !url.includes('?')) {
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      network.jobInserts.push(body);
+      return jsonResponse(200, []);
+    }
+
+    // 4. snapshot_jobs update
+    if (method === 'PATCH' && /\/api\/database\/records\/snapshot_jobs\?/.test(url)) {
+      const idMatch = /[?&]id=eq\.([^&]+)/.exec(url);
+      const id = idMatch ? idMatch[1] : '?';
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      network.jobUpdates.push({ id, body });
+      return jsonResponse(200, []);
+    }
+
+    // 5. snapshots insert
+    if (method === 'POST' && url.includes('/api/database/records/snapshots') && !url.includes('?')) {
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      network.snapshotInserts.push(body);
+      return jsonResponse(200, []);
+    }
+
+    // 6. ai_explanations insert (we do not assert on it — the LLM
+    // path is short-circuited because no previous snapshot exists)
+    if (method === 'POST' && url.includes('/api/database/records/ai_explanations')) {
+      return jsonResponse(200, []);
+    }
+
+    // 7. Crawl fetch. Return per-page HTML for each watched URL.
+    if (method === 'GET' && (url.startsWith('http://') || url.startsWith('https://'))) {
+      // The page is a stable URL — the test sets `network.pages` with
+      // distinct source_urls and we map them back to a marker.
+      const page = network.pages.find((p) => p.source_url === url);
+      if (page) {
+        // Marker is the trailing numeric chunk of the source_url.
+        const m = /\/p(\d+)$/.exec(url);
+        const marker = m ? m[1] : 'x';
+        return htmlResponse(pageHtml(marker));
+      }
+      // Fall back to a generic body for any URL we don't track.
+      return htmlResponse(pageHtml('x'));
+    }
+
+    // Default: 200 OK with empty body so the scanner keeps going.
+    return jsonResponse(200, []);
+  };
+
+  // Replace the global fetch.
+  globalThis.fetch = fetchMock as unknown as typeof fetch;
+}
+
+describe('HIGH-5: runScan parents one snapshot_jobs row per watched page', () => {
+  beforeEach(() => {
+    installFetchStub();
+  });
+
+  it('scans all 51 URLs (no silent 50-page cap)', async () => {
+    // Build a 51-URL room. The pre-fix code's `&limit=50` would have
+    // dropped URL #51, so we'd see only 50 job inserts and 50 snapshot
+    // inserts. The fix must produce 51 of each.
+    network.pages = Array.from({ length: 51 }, (_, i) => ({
+      id: `page-${String(i).padStart(2, '0')}`,
+      source_url: `https://example.com/p${i}`,
+    }));
+
+    const room = makeRoom('room-51');
+    const summary = await runScan(room);
+
+    // All 51 pages must have been scanned: 51 per-page jobs, 51
+    // snapshots (no previous snapshots so the dedup early-return does
+    // not apply, every page gets a snapshot row).
+    expect(network.jobInserts).toHaveLength(51);
+    expect(network.snapshotInserts).toHaveLength(51);
+    // Every job insert must be parented to a *distinct* tracked_page_id
+    // matching one of the 51 URLs (not all 51 to `page-00`).
+    const trackedIds = new Set(network.jobInserts.map((b) => b.tracked_page_id));
+    expect(trackedIds.size).toBe(51);
+    for (const b of network.jobInserts) {
+      expect(b.tracked_page_id).toMatch(/^page-\d{2}$/);
+    }
+    // The summary scanRunId is the synthetic room-level UUID — not the
+    // same as any per-page jobId.
+    expect(summary.scanRunId).toMatch(/^[0-9a-f-]{36}$/);
+    for (const b of network.jobInserts) {
+      expect(b.id).not.toBe(summary.scanRunId);
+    }
+  });
+
+  it('scans 200 URLs without error or truncation', async () => {
+    // Stress test: 200 URLs is the documented per-page fetch cap in
+    // listRoomsWithStats. Pre-fix the loop silently dropped 150 of
+    // them. The fix should complete all 200 in-band (note: this is a
+    // sync mocked test, so we are not measuring real latency).
+    network.pages = Array.from({ length: 200 }, (_, i) => ({
+      id: `page-${String(i).padStart(3, '0')}`,
+      source_url: `https://example.com/p${i}`,
+    }));
+    const summary = await runScan(makeRoom('room-200'));
+    expect(summary.snapshotsCaptured).toBe(200);
+    expect(network.jobInserts).toHaveLength(200);
+    expect(network.snapshotInserts).toHaveLength(200);
+  });
+
+  it('does NOT use watchedUrls[0] as the parent (orphan-FK fix)', async () => {
+    // The pre-fix code parented every scan's job to `watchedUrls[0].id`.
+    // If the first page is removed between scans, the next run's job
+    // insert would FK-fail and the whole scan would be lost. The fix
+    // parents each per-page job to the page that is being scanned.
+    network.pages = [
+      { id: 'page-a', source_url: 'https://example.com/a' },
+      { id: 'page-b', source_url: 'https://example.com/b' },
+      { id: 'page-c', source_url: 'https://example.com/c' },
+    ];
+    await runScan(makeRoom('room-3'));
+
+    expect(network.jobInserts).toHaveLength(3);
+    // Every per-page job insert has a tracked_page_id that equals the
+    // id of the page being scanned. page-a does NOT appear on all
+    // three jobs.
+    const parentByJob = Object.fromEntries(
+      network.jobInserts.map((b) => [b.id as string, b.tracked_page_id as string])
+    );
+    const distinctParents = new Set(Object.values(parentByJob));
+    expect(distinctParents).toEqual(new Set(['page-a', 'page-b', 'page-c']));
+    // No job is parented to all three URLs.
+    for (const b of network.jobInserts) {
+      const all = ['page-a', 'page-b', 'page-c'];
+      expect(all).toContain(b.tracked_page_id);
+    }
+  });
+
+  it('stamps a stable `run:<uuid>` correlation tag onto every per-page job', async () => {
+    network.pages = [
+      { id: 'page-x', source_url: 'https://example.com/x' },
+      { id: 'page-y', source_url: 'https://example.com/y' },
+    ];
+    const summary = await runScan(makeRoom('room-2'));
+    const tags = network.jobInserts
+      .map((b) => b.apify_run_id as string | undefined)
+      .filter((t): t is string => typeof t === 'string');
+    // Both jobs share the same `run:<uuid>` tag equal to scanRunId.
+    // This is the operator-visible correlation handle for a single
+    // user action ("what URLs were scanned in this manual run?").
+    expect(tags).toHaveLength(2);
+    for (const t of tags) {
+      expect(t).toBe(`run:${summary.scanRunId}`);
+    }
+  });
+
+  it('marks each per-page job succeeded at the end of a clean run', async () => {
+    network.pages = [
+      { id: 'page-a', source_url: 'https://example.com/a' },
+      { id: 'page-b', source_url: 'https://example.com/b' },
+    ];
+    await runScan(makeRoom('room-ok'));
+    // Two jobs inserted (per-page), two updates marking them succeeded.
+    expect(network.jobInserts).toHaveLength(2);
+    const updatesByJobId = new Map(network.jobUpdates.map((u) => [u.id, u.body]));
+    // Every inserted job has a corresponding succeeded update.
+    for (const job of network.jobInserts) {
+      const u = updatesByJobId.get(job.id as string);
+      expect(u).toBeDefined();
+      expect(u!.status).toBe('succeeded');
+    }
+  });
+
+  it('continues scanning remaining URLs when one page fails (per-page job isolation)', async () => {
+    // Make page-b's crawl fail. The pre-fix code propagated the
+    // failure up the loop and the remaining URLs' snapshots were
+    // not inserted against a valid job. With the fix, page-b's job is
+    // marked failed, the loop logs and continues, and page-c still
+    // gets its own per-page job + snapshot.
+    network.pages = [
+      { id: 'page-a', source_url: 'https://example.com/a' },
+      { id: 'page-b', source_url: 'https://example.com/FAIL' },
+      { id: 'page-c', source_url: 'https://example.com/c' },
+    ];
+    // Override the fetch stub just for this test so /FAIL returns 500.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === 'https://example.com/FAIL') {
+        return new Response('boom', { status: 500, statusText: 'Internal Server Error' });
+      }
+      return originalFetch(input, init);
+    }) as unknown as typeof fetch;
+
+    try {
+      await runScan(makeRoom('room-mixed'));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    // 3 per-page job inserts (one per URL).
+    expect(network.jobInserts).toHaveLength(3);
+    // 2 snapshot inserts (page-a, page-c succeeded; page-b failed
+    // before the snapshot row could be written).
+    expect(network.snapshotInserts).toHaveLength(2);
+    // page-b's job is the only one marked failed.
+    const failed = network.jobUpdates.filter((u) => u.body.status === 'failed');
+    expect(failed).toHaveLength(1);
+    const succeeded = network.jobUpdates.filter((u) => u.body.status === 'succeeded');
+    expect(succeeded).toHaveLength(2);
   });
 });
