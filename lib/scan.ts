@@ -14,8 +14,8 @@
 // generate a unique `jobId` per run. The previous-snapshot lookup is by
 // (tracked_page_id, observed_at desc) so re-running won't double-insert.
 import { createHash } from 'node:crypto';
+import dns from 'node:dns/promises';
 import { enqueueNotification } from './notifications';
-import { newId } from './ids';
 import type {
   MemoryRoom,
   PageSnapshot,
@@ -65,13 +65,288 @@ function htmlToMarkdown(html: string): { title: string; markdown: string; text: 
   return { title, markdown: body, text };
 }
 
+// SSRF guard: validateCrawlUrl rejects URLs that point at internal,
+// private, loopback, link-local, or cloud-metadata addresses before any
+// fetch() is issued. crawlOne() always goes through this first.
+//
+// We block by inspecting the parsed hostname, and (for hostnames that
+// aren't literal IPs) we DNS-resolve and block if *any* returned address
+// is in a denied range. The DNS step defeats classic DNS-rebinding where
+// a public hostname resolves to an internal IP at fetch time.
+//
+// Exported helpers (isBlockedAddress, validateCrawlUrl) are covered by
+// lib/scan.test.ts. They are the public security boundary.
+
+/** True if the address is in any range we refuse to crawl. */
+export function isBlockedAddress(addr: string): boolean {
+  if (!addr) return false;
+  // Normalize IPv4-mapped IPv6 to their v4 form so the v4 blocklist
+  // catches them. Accepts all three common forms:
+  //   ::ffff:127.0.0.1   (dotted-quad; the form new URL() emits for
+  //                       many resolvers)
+  //   ::ffff:7f00:1      (compressed hex; what new URL() emits for
+  //                       the dotted-quad form when the trailing bytes
+  //                       contain leading zeros)
+  //   ::ffff:0:0:7f00:1  (fully expanded)
+  // node's `dns.lookup` returns these in mixed form depending on the
+  // resolver, so we expand the address to its full 8-group form first
+  // (via expandIPv6ForMapping), then detect the ::ffff: prefix and
+  // pull the 32-bit v4 address out of the trailing groups. The dotted-
+  // quad form is handled in a separate case from the hex form.
+  if (addr.includes(':')) {
+    const expanded = expandIPv6ForMapping(addr);
+    // Case 1: trailing dotted-quad in the last group, e.g.
+    //   "0000:0000:0000:0000:0000:0000:ffff:127.0.0.1" (6 leading zeros)
+    //   "0000:0000:0000:0000:0000:ffff:127.0.0.1"     (5 leading zeros,
+    //                                                   the canonical
+    //                                                   "::ffff:127.0.0.1" form)
+    // The `(?:0+:)+` pattern is non-capturing (so the dotted-quad in
+    // group 1 is the only captured group) and matches one or more
+    // `0xxx:` groups (the leading zero run), then requires the literal
+    // `ffff:`. (A plain `^0+:` won't work because regex quantifiers
+    // don't backtrack across colons — each `0+` greedily consumes the
+    // trailing colon of its group, so the next match attempt starts
+    // at the next group's `0`, never at the `f` of `ffff:`.)
+    const dottedMatch = /^(?:0+:)+ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(expanded);
+    if (dottedMatch) {
+      return isBlockedAddress(dottedMatch[1]);
+    }
+    // Case 2: trailing hex form (two 16-bit groups, e.g.
+    //   "0000:0000:0000:0000:0000:ffff:7f00:1"     (compressed)
+    //   "0000:0000:0000:0000:0000:ffff:0:7f00:1"   (expanded with one
+    //                                                     leading zero)
+    // The v4 address is split as `7f00` / `1` = (a, b) where the
+    // dotted form is a.b.c.d and a = 7f, b = 00, c = 00, d = 01.
+    // Both `7f00` and `1` (or `0` / `7f00` in the expanded form) are
+    // captured as non-capturing groups so group 1 / group 2 are
+    // unambiguous.
+    const hexMatch = /^(?:0+:)+ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(expanded);
+    if (hexMatch) {
+      const a = parseInt(hexMatch[1], 16);
+      const b = parseInt(hexMatch[2], 16);
+      const dot = `${(a >> 8) & 0xff}.${a & 0xff}.${(b >> 8) & 0xff}.${b & 0xff}`;
+      return isBlockedAddress(dot);
+    }
+  }
+
+  // IPv6
+  if (addr.includes(':')) {
+    const lc = addr.toLowerCase();
+    if (lc === '::' || lc === '::1') return true;          // unspecified + loopback
+    if (lc.startsWith('fc') || lc.startsWith('fd')) return true; // unique-local fc00::/7
+    if (lc.startsWith('fe8') || lc.startsWith('fe9') ||
+        lc.startsWith('fea') || lc.startsWith('feb')) return true; // link-local fe80::/10
+    if (lc.startsWith('ff')) return true;                  // multicast ff00::/8
+    return false;
+  }
+
+  // IPv4
+  const parts = addr.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) {
+    return false; // not a parseable IPv4 — let the URL-level validator reject
+  }
+  const [a, b] = parts;
+  if (a === 0) return true;                              // 0.0.0.0/8
+  if (a === 10) return true;                             // 10.0.0.0/8
+  if (a === 127) return true;                            // 127.0.0.0/8 loopback
+  if (a === 169 && b === 254) return true;               // 169.254.0.0/16 link-local (incl. 169.254.169.254)
+  if (a === 172 && b >= 16 && b <= 31) return true;      // 172.16.0.0/12 RFC1918
+  if (a === 192 && b === 168) return true;               // 192.168.0.0/16
+  if (a === 100 && b >= 64 && b <= 127) return true;     // 100.64.0.0/10 CGNAT
+  if (a >= 224 && a <= 239) return true;                 // 224.0.0.0/4 multicast
+  if (a >= 240) return true;                             // 240.0.0.0/4 reserved + 255.255.255.255
+  return false;
+}
+
+/**
+ * Validate a URL before we crawl it. Throws on any blocked / malformed URL.
+ * The error message intentionally includes the offending host so that
+ * operators can debug "why was this URL rejected?" from a single stack
+ * line.
+ */
+export async function validateCrawlUrl(input: string): Promise<string> {
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    throw new Error(`Refusing to crawl: invalid URL "${input}"`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      `Refusing to crawl "${input}": protocol "${parsed.protocol}" is not http(s)`,
+    );
+  }
+  const hostname = parsed.hostname; // URL.hostname is the lowercased, bracket-stripped host
+  if (!hostname) {
+    throw new Error(`Refusing to crawl "${input}": missing hostname`);
+  }
+
+  // URL.hostname returns literal IPv6 hostnames with surrounding brackets
+  // (e.g. "[::1]") but lowercased. Strip them so the literal-IP probe
+  // and the blocklist see the bare address.
+  const bareHost = hostname.startsWith('[') && hostname.endsWith(']')
+    ? hostname.slice(1, -1)
+    : hostname;
+
+  // Treat `localhost` and other well-known hostnames that should never be
+  // reached from the server's network as blocked without a DNS lookup.
+  const lcHost = bareHost.toLowerCase();
+  if (
+    lcHost === 'localhost' ||
+    lcHost.endsWith('.localhost') ||
+    lcHost.endsWith('.local') ||
+    lcHost.endsWith('.internal') ||
+    lcHost.endsWith('.intranet')
+  ) {
+    throw new Error(
+      `Refusing to crawl "${input}": hostname "${bareHost}" points at loopback / internal namespace`,
+    );
+  }
+
+  // If the hostname is a literal IP, the blocklist is sufficient — no DNS
+  // is needed and a malicious client can't rebind a literal IP.
+  if (isLiteralIPv4(bareHost) || isLiteralIPv6(bareHost)) {
+    if (isBlockedAddress(bareHost)) {
+      throw new Error(
+        `Refusing to crawl "${input}": hostname "${bareHost}" is a blocked private/internal address`,
+      );
+    }
+    return input;
+  }
+
+  // Hostname is a DNS name — resolve it and check every returned address.
+  // dns.lookup with { all: true } returns all A + AAAA records.
+  let addrs: Array<{ address: string }>;
+  try {
+    addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
+  } catch (err) {
+    throw new Error(
+      `Refusing to crawl "${input}": DNS lookup failed for "${bareHost}" — ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  if (addrs.length === 0) {
+    throw new Error(`Refusing to crawl "${input}": DNS lookup returned no addresses for "${bareHost}"`);
+  }
+  for (const { address } of addrs) {
+    if (isBlockedAddress(address)) {
+      throw new Error(
+        `Refusing to crawl "${input}": hostname "${bareHost}" resolves to blocked private/internal address "${address}"`,
+      );
+    }
+  }
+  return input;
+}
+
+/**
+ * Like validateCrawlUrl, but also returns the IP address(es) the
+ * hostname resolves to at validation time. Callers MUST use the
+ * returned IP for the outbound request (e.g. via the URL trick below
+ * or an https.Agent with a fixed localAddress) to prevent DNS
+ * rebinding — if the request is sent by hostname, the second
+ * resolution can land on a different (attacker-controlled) IP than
+ * the one the guard validated.
+ *
+ * For literal-IP hostnames, returns the literal IP as a single-entry
+ * array (the caller can pin to it).
+ *
+ * Returns a structured object { url, ips } so the caller has both
+ * the canonical URL and the pinned addresses to use in the fetch.
+ */
+export async function resolveAndValidateCrawlUrl(input: string): Promise<{ url: string; ips: string[] }> {
+  const validated = await validateCrawlUrl(input);
+  const parsed = new URL(validated);
+  const bareHost = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname;
+  if (isLiteralIPv4(bareHost) || isLiteralIPv6(bareHost)) {
+    return { url: validated, ips: [bareHost] };
+  }
+  // Already validated by validateCrawlUrl above; lookup again to get
+  // the IPs (validateCrawlUrl only checked them, didn't return them).
+  const addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
+  return { url: validated, ips: addrs.map((a) => a.address) };
+}
+
+/**
+ * Expand an IPv6 address to its full 8-group colon-hex form. Returns
+ * the input unchanged if it doesn't look like an IPv6 address. Handles
+ * the `::` shorthand by computing the missing zero groups. Used by
+ * isBlockedAddress() to normalize ::ffff: mappings before checking
+ * the v4 blocklist. (new URL() sometimes normalizes the dotted-quad
+ * form ::ffff:127.0.0.1 to the compressed hex form ::ffff:7f00:1,
+ * and the uncompressed form ::ffff:0:0:7f00:1 is also seen in the
+ * wild; we accept all three.)
+ */
+function expandIPv6ForMapping(addr: string): string {
+  if (!addr.includes(':')) return addr;
+  const lc = addr.toLowerCase();
+  // The `::` shorthand: split on the first `::` and pad to 8 groups.
+  const dci = lc.indexOf('::');
+  if (dci !== -1) {
+    const head = lc.slice(0, dci);
+    const tail = lc.slice(dci + 2);
+    const headParts = head === '' ? [] : head.split(':');
+    const tailParts = tail === '' ? [] : tail.split(':');
+    const missing = 8 - headParts.length - tailParts.length;
+    if (missing < 0) return addr; // malformed; let downstream reject
+    const full = [...headParts, ...Array(missing).fill('0'), ...tailParts];
+    return full.map((g) => g.padStart(4, '0')).join(':');
+  }
+  // No `::` shorthand: just zero-pad each group.
+  return lc.split(':').map((g) => g.padStart(4, '0')).join(':');
+}
+
+function isLiteralIPv4(host: string): boolean {
+  const parts = host.split('.');
+  if (parts.length !== 4) return false;
+  return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+}
+
+function isLiteralIPv6(host: string): boolean {
+  // A literal IPv6 (after URL.hostname strip-bracket normalization) must
+  // contain at least one colon and consist of hex / colon / dot-quad chars.
+  if (!host.includes(':')) return false;
+  return /^[0-9a-fA-F:.]{2,}$/.test(host);
+}
+
+// Direct HTTP fetch timeout. A user-supplied tracked page could point at
+// a server that accepts the TCP connection but never sends a response
+// (a "slowloris" target, an IP that's actually a captive portal holding
+// the socket open, etc.). Without a timeout, the next.js worker would be
+// pinned indefinitely — the scan queue would fill up and never drain.
+// Default is 10s; operators can override per-environment with the
+// PAGEVAULT_FETCH_TIMEOUT_MS env var (e.g. 2000 in tests, 30000 over a
+// slow WAN). The same abort signal applies to every hop in the
+// redirect chain so the total wall-clock for one crawl is bounded.
+const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+function getFetchTimeoutMs(): number {
+  const raw = process.env.PAGEVAULT_FETCH_TIMEOUT_MS;
+  if (!raw) return DEFAULT_FETCH_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_FETCH_TIMEOUT_MS;
+  return parsed;
+}
+
 // Direct HTTP fetch as a baseline crawler. Tries the Apify run-sync API
 // directly if creds are present, otherwise falls back to a plain fetch()
 // with HTML→Markdown extraction.
-async function crawlOne(url: string): Promise<{
+//
+// Exported (not just module-local) so unit tests in lib/scan.test.ts
+// can drive the timeout / abort path with a controlled fetch mock
+// without standing up the full runScan() / DB / Apify stack.
+export async function crawlOne(url: string): Promise<{
   url: string; title: string; markdown: string; text: string; capturedAt: string;
   apifyRunId: string | null;
 }> {
+  // HIGH-4: SSRF guard. The URL is user-supplied (lives in
+  // tracked_pages.source_url) and any fetch() in this function is from
+  // the Next.js server's network. Reject private / loopback / link-local /
+  // cloud-metadata targets before issuing a single byte of outbound
+  // traffic, and follow DNS resolution to defeat DNS-rebinding.
+  await validateCrawlUrl(url);
+
   const apifyToken = process.env.APIFY_API_TOKEN;
   const apifyActorId = process.env.APIFY_ACTOR_ID;
 
@@ -103,14 +378,110 @@ async function crawlOne(url: string): Promise<{
     console.warn(`[scan] Apify call failed for ${url}, falling back to direct fetch`);
   }
 
-  // Direct fetch path
-  const r = await fetch(url, {
-    headers: {
-      'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    },
-    redirect: 'follow',
-  });
+  // Direct fetch path. We use redirect: 'manual' so we can
+  // re-validate every Location header against the SSRF blocklist;
+  // the default 'follow' would silently redirect a public URL
+  // to http://169.254.169.254/ (cloud metadata) or http://127.0.0.1/
+  // (loopback) without re-running the private-address checks.
+  //
+  // DNS-rebinding defense: the SSRF guard above resolves the
+  // hostname and checks every returned IP, but the next fetch() does
+  // its own DNS lookup. Between the guard and the fetch, a malicious
+  // authoritative DNS server (or a TOCTOU in node's resolver) can
+  // flip the answer to a private IP. To prevent that, we pin the
+  // request to the IP we already validated by rewriting the URL to
+  // `http://ip/` and passing the original hostname in the `Host`
+  // header. TLS SNI / virtual-host handling then sees the right
+  // hostname. This is the standard "host-header pinning" pattern
+  // for SSRF defenses.
+  const MAX_REDIRECTS = 5;
+  const timeoutMs = getFetchTimeoutMs();
+  // Single AbortController covers the entire redirect chain — a target
+  // that hangs on hop 1 OR a chain of slow redirects that together
+  // exceed the budget both get cut off at timeoutMs. The timer is
+  // unref'd so a still-pending abort can't keep the event loop alive
+  // past the caller's await.
+  const abortController = new AbortController();
+  const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
+  timeoutHandle.unref?.();
+  let currentUrl = url;
+  let currentHostHeader: string | null = null;
+  let r: Response | null = null;
+  try {
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    // SSRF guard + DNS-rebinding pin. resolveAndValidateCrawlUrl
+    // returns the validated URL and the IP(s) the hostname resolves
+    // to; we use the first IP for the request URL and the original
+    // hostname for the Host header.
+    const resolved = await resolveAndValidateCrawlUrl(currentUrl);
+    currentUrl = resolved.url;
+    if (resolved.ips.length > 0) {
+      const parsed = new URL(currentUrl);
+      const ipForHost = resolved.ips[0];
+      currentHostHeader = parsed.host;
+      // Rewrite the URL to use the IP. For IPv6, wrap in brackets.
+      const ipForUrl = ipForHost.includes(':') ? `[${ipForHost}]` : ipForHost;
+      parsed.host = `${ipForUrl}:${parsed.port}`;
+      currentUrl = parsed.toString();
+    }
+    const res = await fetch(currentUrl, {
+      headers: {
+        'User-Agent': 'PageVault/1.0 (https://pagevault.app; +contact@pagevault.app)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        // Pin the original hostname (so the server's SNI / virtual
+        // host routing sees the right name even though we connected
+        // to the IP).
+        ...(currentHostHeader ? { Host: currentHostHeader } : {}),
+      },
+      // HIGH-4: AbortController timeout. A target that accepts the
+      // connection but never sends a response (slowloris, captive
+      // portal, etc.) used to pin a scan worker forever. The same
+      // signal applies to every hop in the redirect chain.
+      signal: abortController.signal,
+      redirect: 'manual',
+    });
+    // Non-redirect: we have the final response.
+    if (res.status < 300 || res.status >= 400) {
+      r = res;
+      break;
+    }
+    // 3xx: read Location, loop. After a redirect, the next URL
+    // is a hostname (parsed from the Location header) and we
+    // re-pin on the next iteration. Reset the Host header so the
+    // next resolveAndValidateCrawlUrl call repopulates it.
+    const location = res.headers.get('location');
+    if (!location) {
+      // 3xx with no Location is malformed; treat as terminal.
+      r = res;
+      break;
+    }
+    // Resolve relative to the previous URL (which was the pinned
+    // IP-based URL). The next iteration re-resolves and re-pins
+    // for the new hostname.
+    currentUrl = new URL(location, currentUrl).toString();
+    currentHostHeader = null;
+  }
+  } catch (err) {
+    // Convert the AbortError from the timeout into a deterministic,
+    // greppable error message. The original DOMException is preserved
+    // on .cause for callers that want to inspect it.
+    if (err instanceof Error && (err.name === 'AbortError' || abortController.signal.aborted)) {
+      const e = new Error(`Fetch of ${url} aborted after ${timeoutMs}ms (PAGEVAULT_FETCH_TIMEOUT_MS)`);
+      e.name = 'FetchTimeoutError';
+      (e as Error & { cause?: unknown }).cause = err;
+      throw e;
+    }
+    throw err;
+  } finally {
+    // Clear the timeout in every exit path — success, error, or
+    // abort. Without this, the timer would keep the event loop
+    // alive until it fires, and on success it would still call
+    // abort() on a controller that's no longer in use.
+    clearTimeout(timeoutHandle);
+  }
+  if (!r) {
+    throw new Error(`Failed to fetch ${url}: too many redirects (limit ${MAX_REDIRECTS})`);
+  }
   if (!r.ok) throw new Error(`Failed to fetch ${url}: ${r.status} ${r.statusText}`);
   const html = await r.text();
   const { title, markdown, text } = htmlToMarkdown(html);
@@ -288,12 +659,21 @@ if (!BASE_URL) {
 const SRK = process.env.INSFORGE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
 const ANON = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || '';
 
-// NOTE: scan-row ids (snapshot_jobs.id, snapshots.id, ai_explanations.id)
-// are generated by `newId()` in lib/ids.ts — see that file for the
-// collision-resistance rationale. The previous hand-rolled
-// `uuid(prefix)` helper used 7 random hex chars (28 bits of entropy) plus
-// a fixed suffix, which made 5%-probability collisions reachable at
-// ~10,000 concurrent scans. crypto.randomUUID() has 122 bits of entropy.
+function uuid(prefix: string): string {
+  // InsForge rejects UUIDs whose first char isn't 0-9 or a-f.
+  // The body of the UUID must be exactly 32 hex chars: 8-4-4-4-12.
+  // Format: <prefix><8 hex>-1111-0000-0000-000000000001
+  //   prefix = single hex char (we use 'a' which is valid)
+  //   group1 = 7 more hex chars = 8 total with prefix
+  //   group2-4 = '1111', '0000', '0000' (the "v1-like" fake variant)
+  //   group5 = 12 chars of zeros
+  const chars = '0123456789abcdef';
+  let group1 = '';
+  for (let i = 0; i < 7; i++) {
+    group1 += chars[Math.floor(Math.random() * 16)];
+  }
+  return `${prefix}${group1}-1111-0000-0000-000000000001`;
+}
 
 async function dbGet(path: string): Promise<unknown> {
   const r = await fetch(`${BASE_URL}/api/database/records/${path}`, {
@@ -380,7 +760,7 @@ export async function runScan(
   options: { triggerType?: 'manual' | 'schedule' | 'box_webhook' | 'retry' } = {},
 ): Promise<ScanSummary> {
   const triggerType = options.triggerType ?? 'manual';
-  const jobId = newId();
+  const jobId = uuid('a');
   const startedAt = new Date().toISOString();
 
   // 1. Load watched URLs
@@ -471,7 +851,7 @@ async function scanOne(
   );
 
   // 5. Insert the new snapshot
-  const snapId = newId();
+  const snapId = uuid('b');
   const observedAt = crawled.capturedAt;
   await dbInsert('snapshots', {
     id: snapId,
@@ -551,7 +931,7 @@ Analyze the change. Return JSON only.`;
   // output_json (severity, changeType, summary, business_interpretation,
   // recommended_actions, evidence, confidence) so the existing listChanges
   // query in lib/insforge.ts can read it back.
-  const explId = newId();
+  const explId = uuid('c');
   const outputJson = {
     changed: true,
     severity: analysis.severity,
