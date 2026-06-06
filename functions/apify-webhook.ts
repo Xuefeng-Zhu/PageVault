@@ -3,23 +3,86 @@
 // Shared secret auth via X-Shared-Secret header
 // Request: { runId, status, defaultDatasetId, ... }
 // Response: { jobId, snapshotId, changeType, boxFolderId, explanationId }
+//
+// CRITICAL-1 fix (docs/qa-bug-hunt.md):
+//   The shared secret is no longer a hardcoded string literal. It is
+//   read from APIFY_WEBHOOK_SECRET at request time. In InsForge Edge
+//   Functions this comes from Deno.env; local tests may use process.env.
+//   If the env var is missing, the function fails closed with a 503
+//   "service_unconfigured" response — the same posture lib/cron-auth.ts
+//   uses for CRON_SHARED_SECRET — so a misconfigured deployment is
+//   obvious to operators (vs. silently accepting the wrong secret).
+//
+//   The compare is constant-time with respect to the expected length
+//   to avoid leaking the secret length via timing. See
+//   lib/cron-auth.ts:requireCronSecret for the original rationale.
 
-interface ApifyWebhookPayload {
+export interface ApifyWebhookPayload {
   runId: string;
   status: 'SUCCEEDED' | 'FAILED' | 'ABORTED' | 'TIMED_OUT';
   defaultDatasetId?: string;
   statusMessage?: string;
 }
 
-function verifySharedSecret(req: Request, secret: string): boolean {
-  const header = req.headers.get('X-Shared-Secret');
-  return header === secret;
+export type ApifyWebhookSecretCheck =
+  | { ok: true }
+  | { ok: false; reason: 'unconfigured' }
+  | { ok: false; reason: 'mismatch' };
+
+function getEdgeEnv(name: string): string | undefined {
+  const deno = (globalThis as unknown as {
+    Deno?: { env?: { get?: (key: string) => string | undefined } };
+  }).Deno;
+  const denoValue = deno?.env?.get?.(name);
+  if (denoValue !== undefined) return denoValue;
+
+  const nodeProcess = (globalThis as unknown as {
+    process?: { env?: Record<string, string | undefined> };
+  }).process;
+  return nodeProcess?.env?.[name];
+}
+
+/**
+ * Verify the X-Shared-Secret header against APIFY_WEBHOOK_SECRET.
+ *
+ * Returns a discriminated result so callers can distinguish:
+ *  - { ok: true }                            — header matches
+ *  - { ok: false, reason: 'mismatch' }       — wrong / missing header
+ *  - { ok: false, reason: 'unconfigured' }   — server env var is unset
+ *
+ * Constant-time over `expected.length` to prevent a timing oracle on
+ * the secret length.
+ */
+export function verifyApifyWebhookSecret(req: Request): ApifyWebhookSecretCheck {
+  const expected = getEdgeEnv('APIFY_WEBHOOK_SECRET');
+  if (!expected || expected.length === 0) {
+    return { ok: false, reason: 'unconfigured' };
+  }
+  const raw = req.headers.get('X-Shared-Secret');
+  const got = raw ?? '';
+
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i++) {
+    const expectedCode = expected.charCodeAt(i);
+    const gotCode = i < got.length ? got.charCodeAt(i) : 0;
+    mismatch |= expectedCode ^ gotCode;
+  }
+  for (let i = expected.length; i < got.length; i++) {
+    mismatch |= got.charCodeAt(i);
+  }
+  return mismatch === 0 ? { ok: true } : { ok: false, reason: 'mismatch' };
 }
 
 export default async function handler(req: Request): Promise<Response> {
-  // Verify shared secret
-  const webhookSecret = 'your-secret'; // Would come from env.APIFY_WEBHOOK_SECRET
-  if (!verifySharedSecret(req, webhookSecret)) {
+  // CRITICAL-1: read the secret from env, fail closed if unset.
+  const check = verifyApifyWebhookSecret(req);
+  if (!check.ok && check.reason === 'unconfigured') {
+    return Response.json(
+      { error: 'SERVICE_UNCONFIGURED' },
+      { status: 503 }
+    );
+  }
+  if (!check.ok) {
     return Response.json({ error: 'UNAUTHORIZED' }, { status: 401 });
   }
 

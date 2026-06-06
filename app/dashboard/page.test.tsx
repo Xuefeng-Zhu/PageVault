@@ -59,6 +59,11 @@ function getStatValue(labelText: string): string {
   return valueSpan.textContent?.trim() ?? '';
 }
 
+async function waitForStatsRendered(): Promise<void> {
+  await screen.findByText('Rooms');
+  await screen.findByText('URLs watched');
+}
+
 describe('DashboardPage — URLs watched stat (HIGH-2 regression)', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -87,6 +92,7 @@ describe('DashboardPage — URLs watched stat (HIGH-2 regression)', () => {
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith('/api/rooms', { cache: 'no-store' });
     });
+    await waitForStatsRendered();
 
     // Both happen to be 3 in this fixture — but for the right reason:
     // Rooms=3 (room count) and URLs watched=3 (2+1+0 URL sum).
@@ -112,6 +118,7 @@ describe('DashboardPage — URLs watched stat (HIGH-2 regression)', () => {
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
+    await waitForStatsRendered();
 
     // Rooms stat → 2; URLs watched stat → 17. This is the regression
     // assertion: before the fix, "URLs watched" would have shown 2.
@@ -130,6 +137,7 @@ describe('DashboardPage — URLs watched stat (HIGH-2 regression)', () => {
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
+    await waitForStatsRendered();
 
     expect(getStatValue('Rooms')).toBe('0');
     expect(getStatValue('URLs watched')).toBe('0');
@@ -149,9 +157,7 @@ describe('DashboardPage — URLs watched stat (HIGH-2 regression)', () => {
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
-    // findBy polls until the label appears (up to 1s default).
-    expect(await screen.findByText('Rooms')).toBeTruthy();
-    expect(await screen.findByText('URLs watched')).toBeTruthy();
+    await waitForStatsRendered();
 
     // Spinner is no longer showing (loading=false in finally), so the
     // stats row renders. Default values are 0/0/0.

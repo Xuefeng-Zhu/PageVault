@@ -1,15 +1,25 @@
 // API route: GET/POST/DELETE /api/rooms/[roomId]/schedule
+//
+// CRITICAL-4 fix (docs/qa-bug-hunt.md): the previous version of this
+// route shell-out to `npx @insforge/cli ...` with string interpolation,
+// which was a command-injection sink for the `roomId` URL path
+// parameter (a `'; touch /tmp/pwn; '` style payload escapes the
+// single-quote rewrap and runs on the host). The fix has two parts:
+//
+// 1. The `roomId` path parameter is validated as a UUID before any
+//    downstream logic runs. Non-UUID values get a 400 and never reach
+//    the schedule API.
+//
+// 2. All InsForge schedule operations are direct HTTP calls against
+//    `${INSFORGE_API_URL}/api/schedules[/{id}]` using the service-role
+//    key for auth. We never invoke the `npx @insforge/cli` binary from
+//    this file, so there is no shell, no string interpolation, and no
+//    supply-chain surface from `npx` package fetches.
 import { NextRequest, NextResponse } from 'next/server';
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { getInsforgeBaseUrl } from '@/lib/env';
 import { getRoom } from '@/lib/insforge';
-
-const execAsync = promisify(exec);
-const SRK = () => process.env.INSFORGE_SERVICE_ROLE_KEY!;
-const DB = () => `${getInsforgeBaseUrl()}/api/database/records`;
 
 interface ScheduleRequestBody {
   cronExpression?: string;
@@ -17,9 +27,14 @@ interface ScheduleRequestBody {
 }
 
 const CRON_REGEX = /^(\S+\s+){4}\S+$/;  // basic 5-field check
+const UUID_REGEX = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 
 function isValidCron(expr: string): boolean {
   return CRON_REGEX.test(expr.trim());
+}
+
+function isValidRoomId(roomId: string): boolean {
+  return UUID_REGEX.test(roomId);
 }
 
 function isLocalhostUrl(value: string): boolean {
@@ -31,57 +46,141 @@ function isLocalhostUrl(value: string): boolean {
   }
 }
 
-async function sh(cmd: string): Promise<string> {
-  const { stdout } = await execAsync(cmd, { cwd: process.cwd(), timeout: 30_000 });
-  return stdout;
+const SRK = () => process.env.INSFORGE_SERVICE_ROLE_KEY!;
+const DB = () => `${getInsforgeBaseUrl()}/api/database/records`;
+
+// Build the InsForge Schedules endpoint. The CLI is just a thin wrapper
+// around these — see @insforge/cli/dist/index.js `ossFetch` for the
+// canonical pattern. We replicate it here so we never spawn a child
+// process from a Next.js request handler.
+function schedulesBaseUrl(): string {
+  return `${getInsforgeBaseUrl()}/api/schedules`;
+}
+
+function scheduleAuthHeaders(): Record<string, string> {
+  return {
+    'Authorization': `Bearer ${SRK()}`,
+    'Content-Type': 'application/json',
+  };
+}
+
+type Schedule = {
+  id?: string;
+  name?: string;
+  cronSchedule?: string;
+  functionUrl?: string;
+  httpMethod?: string;
+  headers?: Record<string, string>;
+  body?: unknown;
+  isActive?: boolean;
+};
+
+async function scheduleApiError(res: Response, action: string): Promise<Error> {
+  const body = await res.text().catch(() => '');
+  return new Error(
+    `InsForge schedule ${action} failed: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ''}`,
+  );
+}
+
+function readScheduleId(value: unknown): string | null {
+  if (value && typeof value === 'object') {
+    const direct = (value as { id?: unknown }).id;
+    if (typeof direct === 'string') return direct;
+    const data = (value as { data?: unknown }).data;
+    if (data && typeof data === 'object') {
+      const nested = (data as { id?: unknown }).id;
+      if (typeof nested === 'string') return nested;
+    }
+  }
+  return null;
 }
 
 async function findExistingScheduleId(name: string): Promise<string | null> {
+  // GET /api/schedules — returns the full list, which we filter by
+  // name on our side. This is the same shape the CLI's
+  // `schedules list --json` parses. We do not use shell.
+  const res = await fetch(schedulesBaseUrl(), {
+    method: 'GET',
+    headers: scheduleAuthHeaders(),
+  });
+  if (!res.ok) return null;
+  // The InsForge REST endpoint returns either an array directly or an
+  // object with a `data` field. Accept both — see MEDIUM-1 scan-room
+  // test comments for the same robustness.
+  let parsed: unknown = null;
   try {
-    // The CLI emits JSON in --json mode. The output is the JSON array
-    // (possibly surrounded by other text in --no-pretty mode), so we
-    // take the LAST line that starts with '[' or '{' and parse it.
-    // We don't try to grep-out individual objects because nested
-    // braces in metadata break naive '{...}' regexes.
-    const out = await sh(`npx @insforge/cli schedules list --json 2>&1`);
-    const lines = out.split('\n').reverse();
-    let parsed: unknown = null;
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      if (!(trimmed.startsWith('[') || trimmed.startsWith('{'))) continue;
-      try {
-        parsed = JSON.parse(trimmed);
-        break;
-      } catch {
-        // try the next line
-      }
-    }
-    if (parsed === null) return null;
-    const arr = Array.isArray(parsed) ? parsed : [parsed];
-    const found = arr.find((s: { name?: string }) => s.name === name);
-    return found?.id ?? null;
+    parsed = await res.json();
   } catch {
     return null;
   }
+  const arr: Schedule[] = Array.isArray(parsed)
+    ? (parsed as Schedule[])
+    : Array.isArray((parsed as { data?: unknown[] })?.data)
+      ? ((parsed as { data: Schedule[] }).data)
+      : [];
+  const found = arr.find((s) => s.name === name);
+  return found?.id ?? null;
 }
 
 async function createOrUpdateInsforgeSchedule(
-  existingId: string | null, name: string, cron: string, appUrl: string, secret: string, roomId: string,
-): Promise<string | null> {
+  existingId: string | null,
+  name: string,
+  cron: string,
+  appUrl: string,
+  secret: string,
+  roomId: string,
+): Promise<string> {
   const url = `${appUrl}/api/cron/scan-room/${roomId}`;
-  const headers = JSON.stringify({ 'x-cron-secret': secret });
-  // The update branch must retarget --url as well as --cron/--headers.
-  // Otherwise schedules that were created before scan-room existed
-  // (and thus point at /api/cron/scan-all) keep firing the all-room
-  // worker even after the user changes the cadence through this route.
-  const args: string[] = existingId
-    ? ['schedules', 'update', existingId, '--cron', cron, '--url', url, '--headers', headers]
-    : ['schedules', 'create', '--name', name, '--cron', cron, '--url', url, '--method', 'POST', '--headers', headers];
-  const cmd = `npx @insforge/cli ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`;
-  const out = await sh(cmd);
-  const m = out.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
-  return m ? m[0] : existingId;
+  const headers = { 'x-cron-secret': secret };
+  let res: Response;
+  if (existingId) {
+    // PATCH /api/schedules/{id} — the update branch must retarget
+    // --url as well as --cron/--headers. Otherwise schedules that
+    // were created before scan-room existed (and thus point at
+    // /api/cron/scan-all) keep firing the all-room worker even after
+    // the user changes the cadence through this route.
+    res = await fetch(`${schedulesBaseUrl()}/${encodeURIComponent(existingId)}`, {
+      method: 'PATCH',
+      headers: scheduleAuthHeaders(),
+      body: JSON.stringify({
+        cronSchedule: cron,
+        functionUrl: url,
+        headers,
+      }),
+    });
+  } else {
+    res = await fetch(schedulesBaseUrl(), {
+      method: 'POST',
+      headers: scheduleAuthHeaders(),
+      body: JSON.stringify({
+        name,
+        cronSchedule: cron,
+        functionUrl: url,
+        httpMethod: 'POST',
+        headers,
+      }),
+    });
+  }
+  if (!res.ok) throw await scheduleApiError(res, existingId ? 'update' : 'create');
+  let data: unknown = null;
+  try {
+    data = await res.json();
+  } catch {
+    if (existingId) return existingId;
+    throw new Error('InsForge schedule create failed: response did not include a schedule id');
+  }
+  const id = readScheduleId(data);
+  if (id) return id;
+  // Fallback: the response didn't echo an id — return whatever we had.
+  if (existingId) return existingId;
+  throw new Error('InsForge schedule create failed: response did not include a schedule id');
+}
+
+async function deleteInsforgeSchedule(id: string): Promise<void> {
+  await fetch(`${schedulesBaseUrl()}/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: scheduleAuthHeaders(),
+  });
 }
 
 async function authorizeRoom(roomId: string, sessionUserId: string): Promise<NextResponse | null> {
@@ -104,6 +203,16 @@ export async function GET(
   const session = await getServerSession(authOptions);
   if (!session?.user) return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
   const { roomId } = await params;
+  // CRITICAL-4: validate the path parameter before it flows into any
+  // downstream code (DB query, InsForge call, or shell). A 400 here
+  // stops a malicious or malformed roomId from reaching the rest of
+  // the handler.
+  if (!isValidRoomId(roomId)) {
+    return NextResponse.json(
+      { error: { code: 'INVALID_ROOM_ID', message: 'roomId must be a UUID' } },
+      { status: 400 },
+    );
+  }
   const deny = await authorizeRoom(roomId, session.user.id);
   if (deny) return deny;
   const r = await fetch(`${DB()}/scan_schedules?project_id=eq.${roomId}&limit=1`, {
@@ -133,6 +242,16 @@ export async function POST(
       return NextResponse.json({ error: { code: 'UNAUTHORIZED', message: 'Sign in required' } }, { status: 401 });
     }
     const { roomId } = await params;
+    // CRITICAL-4: validate the path parameter BEFORE authorizeRoom or
+    // any InsForge call. The previous version interpolated `roomId`
+    // into a shell command — accepting only UUIDs here means a
+    // payload like `'; id; '` is rejected at the front door.
+    if (!isValidRoomId(roomId)) {
+      return NextResponse.json(
+        { error: { code: 'INVALID_ROOM_ID', message: 'roomId must be a UUID' } },
+        { status: 400 },
+      );
+    }
     const deny = await authorizeRoom(roomId, session.user.id);
     if (deny) return deny;
     const body = (await request.json()) as ScheduleRequestBody;
@@ -176,7 +295,7 @@ export async function POST(
       );
     } else if (existingId) {
       try {
-        await sh(`npx @insforge/cli schedules delete '${existingId}'`);
+        await deleteInsforgeSchedule(existingId);
       } catch (e) {
         console.error('Failed to delete existing schedule:', e);
       }
@@ -225,6 +344,13 @@ export async function DELETE(
       return NextResponse.json({ error: { code: 'UNAUTHORIZED' } }, { status: 401 });
     }
     const { roomId } = await params;
+    // CRITICAL-4: same front-door UUID check.
+    if (!isValidRoomId(roomId)) {
+      return NextResponse.json(
+        { error: { code: 'INVALID_ROOM_ID', message: 'roomId must be a UUID' } },
+        { status: 400 },
+      );
+    }
     const deny = await authorizeRoom(roomId, session.user.id);
     if (deny) return deny;
     // Delete the DB row
@@ -236,7 +362,7 @@ export async function DELETE(
     const existing = await findExistingScheduleId(`pagevault-room-${roomId}`);
     if (existing) {
       try {
-        await sh(`npx @insforge/cli schedules delete '${existing}'`);
+        await deleteInsforgeSchedule(existing);
       } catch (e) {
         console.error('Failed to delete existing schedule:', e);
       }

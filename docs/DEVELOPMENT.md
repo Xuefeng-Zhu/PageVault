@@ -43,10 +43,15 @@ npm run dev
 # → http://localhost:3000
 
 # 6. Sign in
-# The login page (visible at /login) accepts demo creds:
+# The login page (visible at /login) does NOT advertise any demo creds
+# by default. To authenticate without a real InsForge backend, set BOTH
+# `INSFORGE_DEV_DEMO_AUTH=*** AND `NODE_ENV=development` in `.env.local`,
+# then sign in with:
 #   admin@example.com / demo123
-# These only work when INSFORGE_* is unset OR when the real InsForge
-# /api/auth/sessions endpoint is unreachable. See lib/auth.ts.
+# Both conditions are required (a stray "1" in NODE_ENV=production is a
+# P0 auth bypass — module load throws if you try). Every successful
+# demo auth logs a console.warn so the path is impossible to miss.
+# See lib/auth.ts and the CRITICAL-2 section of docs/qa-bug-hunt.md.
 ```
 
 ## Day-to-day commands
